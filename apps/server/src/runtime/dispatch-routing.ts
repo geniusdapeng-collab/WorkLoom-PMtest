@@ -61,13 +61,13 @@ const RULES: RoutingRule[] = [
   {
     id: "ai-pm-evaluation",
     industries: ["ai-pm"],
-    match: /\beval(?:uation)?\b|评测集|评测官|分类验证报告|独立再评测|badcase|坏例|微调|judge|混淆矩阵|评测回归/i,
+    match: /\beval(?:uation)?\b|评测集|评测官|回归用例|分类验证报告|独立再评测|badcase|坏例|微调|judge|混淆矩阵|评测回归/i,
     presets: ["eval-master"],
   },
   {
     id: "ai-pm-knowledge",
     industries: ["ai-pm"],
-    match: /知识库|知识保鲜|知识裁决|学习周刊|学习飞轮|过期条目|冲突知识|来源优先级|术语表|经验固化|归档建议/i,
+    match: /知识库|知识条目|知识保鲜|知识裁决|学习周刊|学习飞轮|过期条目|冲突知识|来源优先级|术语表|经验固化|归档建议/i,
     presets: ["knowledge-curator"],
   },
   {
@@ -165,25 +165,36 @@ const RULES: RoutingRule[] = [
  * Choose the first requested artifact; other matched roles remain collaborators.
  */
 const PM_DELIVERABLES: Array<{ preset: string; match: RegExp }> = [
-  { preset: "doc-writer", match: /(?:写|撰写|起草|编写|生成|输出|整理)[^。！？；\n]{0,24}(?:PRD|产品文档|会议纪要|决策纪要|版本说明|用户手册|FAQ)/i },
-  { preset: "release-guardian", match: /(?:制作|编写|生成|输出|准备|写)[^。！？；\n]{0,16}(?:发布检查单|发布检查|发布卡|回滚预案|上线检查)|(?:审核|审阅)[^。！？；\n]{0,24}发布包|(?:给出|判断)[^。！？；\n]{0,12}发布\s*Go\/No-Go/i },
-  { preset: "chief-pm", match: /(?:制定|规划|输出|编排|调整|整理)[^。！？；\n]{0,24}(?:项目排期|团队计划|路线图|优先级|资源分配|迭代建议|决策卡)/i },
-  { preset: "requirement-analyst", match: /(?:完成|开展|进行|输出|整理)[^。！？；\n]{0,16}(?:需求分析|需求分诊|需求池|字段约束)|(?:设计|定义|梳理|细化)[^。！？；\n]{0,32}(?:需求|功能)/i },
-  { preset: "eval-master", match: /(?:设计|构建|编写|生成|输出)[^。！？；\n]{0,24}(?:评测集|评测用例|评测方案|回归用例)|(?:审计|评审)[^。！？；\n]{0,24}(?:分类验证报告|评测报告)/i },
-  { preset: "competitor-scout", match: /(?:对比|比较)[^。！？；\n]{0,24}(?:产品|竞品|厂商|套餐)|(?:产品|协作工具)[^。！？；\n]{0,16}(?:采购对比|选型对比)/i },
-  { preset: "industry-radar", match: /(?:写|撰写|编写|做|输出|汇总)[^。！？；\n]{0,20}(?:行业简报|行业情报|行业动态|技术动态)/i },
-  { preset: "dev-orchestrator", match: /(?:设计|编制|编写|生成|拆解|输出)[^。！？；\n]{0,24}(?:研发任务|研发分工|开发任务)|(?:写|输出)[^。！？；\n]{0,16}返修任务书/i },
-  { preset: "red-teamer", match: /(?:设计|编写|开展|进行)[^。！？；\n]{0,16}(?:防御性(?:授权)?测试|对抗测试|红队测试)/i },
-  { preset: "data-insight", match: /(?:分析|复算|计算)[^。！？；\n]{0,24}(?:注册转化|漏斗|转化率|经营指标)|(?:评审|分析)[^。！？；\n]{0,16}实验报告/i },
-  { preset: "user-listener", match: /(?:整理|汇总|聚类)[^。！？；\n]{0,24}(?:用户反馈|受访者|用户原话)|(?:生成|输出)[^。！？；\n]{0,16}(?:用户问题摘要|待审回复)/i },
-  { preset: "prompt-curator", match: /(?:设计|改进|产出|编写|版本化)[^。！？；\n]{0,24}(?:提示词|提示改动|prompt)/i },
-  { preset: "model-scout", match: /(?:判断|评审|审查)[^。！？；\n]{0,20}换型提案|(?:做|提供|输出|给出)[^。！？；\n]{0,12}选型建议(?=[\s\S]{0,100}模型)|(?:比较|选择|评估)[^。！？；\n]{0,16}(?:候选模型|文本模型|语言模型)/i },
-  { preset: "knowledge-curator", match: /(?:整理|盘点|做|输出)[^。！？；\n]{0,16}(?:知识库|知识裁决|知识保鲜)/i },
+  { preset: "doc-writer", match: /(?:写|撰写|起草|编写|生成|输出|整理)[^，,。！？；;\n]{0,24}(?:PRD|产品文档|会议纪要|决策纪要|版本说明|用户手册|FAQ)/i },
+  { preset: "release-guardian", match: /(?:制作|编写|撰写|生成|输出|准备|写)[^，,。！？；;\n]{0,16}(?:发布检查单|发布检查|发布卡|回滚预案|上线检查)|(?:审核|审阅)[^，,。！？；;\n]{0,24}发布包|(?:给出|判断)[^，,。！？；;\n]{0,12}发布\s*Go\/No-Go/i },
+  { preset: "chief-pm", match: /(?:制定|规划|输出|编排|调整|整理)[^，,。！？；;\n]{0,24}(?:项目排期|团队计划|路线图|优先级|资源分配|迭代建议|决策卡)/i },
+  { preset: "requirement-analyst", match: /(?:完成|开展|进行|输出|整理)[^，,。！？；;\n]{0,16}(?:需求分析|需求分诊|需求池|字段约束)|(?:设计|定义|梳理|细化)[^，,。！？；;\n]{0,32}(?:需求|功能)/i },
+  { preset: "eval-master", match: /(?:设计|构建|编写|生成|输出)[^，,。！？；;\n]{0,24}(?:评测集|评测用例|评测方案|回归用例)|(?:审计|评审)[^，,。！？；;\n]{0,24}(?:分类验证报告|评测报告)/i },
+  { preset: "competitor-scout", match: /(?:对比|比较)[^，,。！？；;\n]{0,24}(?:产品|竞品|厂商|套餐)|(?:产品|协作工具)[^，,。！？；;\n]{0,16}(?:采购对比|选型对比)/i },
+  { preset: "industry-radar", match: /(?:写|撰写|编写|做|输出|汇总)[^，,。！？；;\n]{0,20}(?:行业简报|行业情报|行业动态|技术动态)/i },
+  { preset: "dev-orchestrator", match: /(?:设计|编制|编写|生成|拆解|输出)[^，,。！？；;\n]{0,24}(?:研发任务|研发分工|开发任务)|(?:写|输出)[^，,。！？；;\n]{0,16}返修任务书/i },
+  { preset: "red-teamer", match: /(?:设计|编写|开展|进行)[^，,。！？；;\n]{0,16}(?:防御性(?:授权)?测试|对抗测试|红队测试)/i },
+  { preset: "data-insight", match: /(?:分析|复算|计算)[^，,。！？；;\n]{0,24}(?:注册转化|漏斗|转化率|经营指标)|(?:评审|分析)[^，,。！？；;\n]{0,16}实验报告/i },
+  { preset: "user-listener", match: /(?:整理|汇总|聚类)[^，,。！？；;\n]{0,24}(?:用户反馈|受访者|用户原话)|(?:生成|输出)[^，,。！？；;\n]{0,16}(?:用户问题摘要|待审回复)/i },
+  { preset: "prompt-curator", match: /(?:设计|改进|产出|编写|版本化)[^，,。！？；;\n]{0,24}(?:提示词|提示改动|prompt)/i },
+  { preset: "model-scout", match: /(?:判断|评审|审查)[^，,。！？；;\n]{0,20}换型提案|(?:做|提供|输出|给出)[^，,。！？；;\n]{0,12}选型建议(?=[\s\S]{0,100}模型)|(?:比较|选择|评估)[^，,。！？；;\n]{0,16}(?:候选模型|文本模型|语言模型)/i },
+  { preset: "knowledge-curator", match: /(?:整理|盘点|做|输出)[^，,。！？；;\n]{0,16}(?:知识库|知识裁决|知识保鲜)/i },
 ];
+
+/** Excluding a work item is not a request for that item's owner. Bound the
+ * exclusion to its clause; contrast and double negation can require work again.
+ * This affects routing hints only and never removes source text from the task.
+ */
+function isExcludedPmWork(goal: string, index: number): boolean {
+  const prefix = goal.slice(Math.max(0, index - 80), index)
+    .split(/[，,。！？；;\n]|(?:但是|但|而是|而要|只需|改为|转为|仍需)/u).at(-1) ?? "";
+  if (/(?:不得不|不能不|不可不)[^，,。！？；;\n]{0,36}$/u.test(prefix)) return false;
+  return /(?:无需|无须|不必|不要|禁止|不得|别|不)(?:再|实际|直接|现在|去)?(?:(?:做|进行|开展|生成|编写|撰写|输出|制作|整理|分析|讨论|考虑|涉及|处理|评估|设计|实现|写|修改|改|比较|核验)[^，,。！？；;\n]{0,36})?$/u.test(prefix);
+}
 
 function requestedPmDeliverable(goal: string): string | undefined {
   const candidates = PM_DELIVERABLES.flatMap((rule) => [...goal.matchAll(new RegExp(rule.match.source, `${rule.match.flags}g`))]
-    .filter((match) => !/(?:不|无需|不必|不要|禁止|不得|别)(?:再|实际|直接|现在|去)?$/u.test(goal.slice(Math.max(0, match.index - 10), match.index)))
+    .filter((match) => !isExcludedPmWork(goal, match.index))
     .map((match) => ({ preset: rule.preset, index: match.index })));
   return candidates.sort((a, b) => a.index - b.index)[0]?.preset;
 }
@@ -208,7 +219,10 @@ export function preferredDispatchRulePresets(input: DispatchRoutingInput): strin
   const push = (key: string) => { if (key && !out.includes(key)) out.push(key); };
   for (const rule of RULES) {
     if (rule.industries && !rule.industries.includes(input.industry ?? "")) continue;
-    if (rule.match.test(goal)) rule.presets.forEach(push);
+    const matched = input.industry === "ai-pm"
+      ? [...goal.matchAll(new RegExp(rule.match.source, `${rule.match.flags}g`))].some((match) => !isExcludedPmWork(goal, match.index))
+      : rule.match.test(goal);
+    if (matched) rule.presets.forEach(push);
   }
   return out;
 }

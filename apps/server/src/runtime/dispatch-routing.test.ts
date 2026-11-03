@@ -80,4 +80,24 @@ describe("PM routing keeps requested deliverable ahead of background vocabulary"
   ])("unseen action phrasing chooses %s over contextual keywords", (employee, goal) => {
     expect(preferredDispatchRulePresets({ goal, industry: "ai-pm" })[0]).toBe(employee);
   });
+
+  it.each([
+    ["chief-pm", "这轮只有四个人日：请把待办按优先级排好，写明依赖和推迟理由；无需做用户反馈分析。", "user-listener"],
+    ["eval-master", "我需要一套可以判对错的回归用例，请设计固定输入和唯一预期，覆盖错误、边界与权限，不讨论模型选型。", "model-scout"],
+    ["knowledge-curator", "请核对知识条目的来源、生效状态和引用链，列出需要归档或补证的记录；不要写学习周刊。", "doc-writer"],
+    ["doc-writer", "无需撰写发布检查单，请写用户手册，不再做需求分析。", "requirement-analyst"],
+    ["data-insight", "本次不做用户反馈分析，而是计算经营指标。", "user-listener"],
+  ])("%s excludes explicitly unwanted work from semantic fallback", (employee, goal, excluded) => {
+    const candidates = preferredDispatchRulePresets({ goal, industry: "ai-pm" });
+    expect(candidates[0]).toBe(employee);
+    expect(candidates).not.toContain(excluded);
+  });
+
+  it.each([
+    "这次不得不做用户反馈分析，输出代表原声。",
+    "我们不能不做用户反馈分析。",
+    "不做模型选型，但需要整理用户反馈。",
+  ])("keeps double-negated and contrastively required work: %s", (goal) => {
+    expect(preferredDispatchRulePresets({ goal, industry: "ai-pm" })[0]).toBe("user-listener");
+  });
 });
