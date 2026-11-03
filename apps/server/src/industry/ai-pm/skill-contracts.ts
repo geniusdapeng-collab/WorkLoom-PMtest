@@ -28,6 +28,9 @@ const contracts: Record<ContractSkill, z.ZodType> = {
   }).strict(),
   "competitor-scan": z.object({
     productResponse: z.literal("scenario-proposal-and-verification"),
+    capabilityEntitlement: z.literal("separate-capability-inclusion-access-and-test"),
+    totalCostDirection: z.literal("comparable-complete-inputs-required"),
+    claimConsistency: z.literal("source-strength-preserved-across-sections"),
     schema: z.literal("workloom.pm.skill-evidence/v1"),
     primarySourceRequired: z.literal(true),
     comparisonScopeRequired: z.literal(true),
@@ -35,6 +38,7 @@ const contracts: Record<ContractSkill, z.ZodType> = {
     vendorClaim: z.literal("claim-not-tested"),
   }).strict(),
   "dev-dispatch": z.object({
+    acceptanceAuthority: z.literal("independent-owner-bound-evidence"),
     schema: z.literal("workloom.pm.skill-evidence/v1"),
     dependencyAcceptanceRequired: z.literal(true),
     oneOutputOwner: z.literal(true),
@@ -116,6 +120,7 @@ const contracts: Record<ContractSkill, z.ZodType> = {
     modelSwitchRequiresApproval: z.literal(true),
   }).strict(),
   "redteam-scan": z.object({
+    authorizationControls: z.literal("declared-scope-allow-and-deny"),
     permissionCoverage: z.literal("declared-role-resource-operation-matrix"),
     schema: z.literal("workloom.pm.skill-evidence/v1"),
     authorizedScopeRequired: z.literal(true),
@@ -172,6 +177,9 @@ const contracts: Record<ContractSkill, z.ZodType> = {
     missingSourceFacts: z.literal("unknown-not-negative"),
     claimConsistency: z.literal("source-mapped-across-all-sections"),
     identifierScope: z.literal("explicit-and-consistent"),
+    acceptanceFixtures: z.literal("complete-preconditions-and-single-oracle"),
+    unspecifiedPermissions: z.literal("unknown-or-labeled-design-default"),
+    requestedDeliverables: z.literal("artifact-contained-complete"),
     writeRequiresReceipt: z.literal(true) }).strict(),
 };
 

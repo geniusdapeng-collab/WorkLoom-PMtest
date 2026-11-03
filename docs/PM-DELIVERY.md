@@ -56,8 +56,10 @@ flowchart TD
   R --> S[逐员工重新装配岗位与SKILL]
   S --> O[普通员工: 真实Completion产物]
   S --> D[dev-orchestrator: 真实DSH进程]
-  O --> F[不可覆盖文件、SHA256与WorkData回执]
-  D --> F
+  O --> J[同模型独立审稿与有证据的定向修正]
+  D --> K[沙箱执行代码测试；失败停在代码节点]
+  J --> F[不可覆盖文件、SHA256与WorkData回执]
+  K --> F
   F --> N[已完成上游内容与摘要传给后续员工]
   N --> R
   F --> Q[全图完成后重新读文件并验摘要]
