@@ -84,7 +84,11 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
     owner = new pg.Pool({ connectionString: database.ownerUrl, max: 5 });
     app = new pg.Pool({ connectionString: database.appUrl, max: 20 });
     const migration = await readFile(new URL("../../../../../packages/db/migrations/0043_pm_team.sql", import.meta.url), "utf8");
-    await owner.query(migration);
+    // Migration setup must finish before parallel PG suites start. Reapplying
+    // its ALTER TABLE / policy DDL here can deadlock another suite's run update.
+    const applied = await owner.query<{ checksum: string }>("SELECT checksum FROM _migrations WHERE name=$1", ["0043_pm_team.sql"]);
+    expect(applied.rows[0]?.checksum, "run pnpm db:migrate before PG tests; the PM migration must already match this source")
+      .toBe(createHash("sha256").update(migration).digest("hex"));
     for (const scope of [scopeA, scopeB]) {
       await owner.query("INSERT INTO tenants(id,name,plan) VALUES($1,$2,'pro')", [scope.tenantId, "PM test fixture"]);
       await owner.query("INSERT INTO workspaces(id,tenant_id,name,slug,industry,stage) VALUES($1,$2,'PM test fixture',$1,'ai-pm','delivery')", [scope.workspaceId, scope.tenantId]);
