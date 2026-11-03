@@ -67,6 +67,19 @@ describe("semantic review evidence contract", () => {
       expect(() => parsePmSemanticReview(JSON.stringify(changed), source, [{ path: "result.md", content: "合计7" }])).toThrow();
     }
   });
+  it("rebinds a verbatim quote from a known mislabelled source and rejects ambiguous matches", () => {
+    const decision = JSON.stringify(review("repair"));
+    const files = [{ path: "result.md", content: "合计7" }];
+    const sources = [{ id: "task-goal", content: "仅提供一份计算报告。" },
+      { id: "original-goal", content: source[0]!.content }];
+    expect(parsePmSemanticReview(decision, sources, files).issues[0]).toMatchObject({
+      sourceId: "original-goal", reportedSourceId: "task-goal",
+    });
+    expect(parsePmSemanticReview(decision, [...sources, { id: "dependency-1", content: source[0]!.content }], files)
+      .issues[0]!.sourceId).toBe("original-goal");
+    expect(() => parsePmSemanticReview(decision, [...sources, { id: "dependency-1", content: "反例：两个金额为2和4。" }], files))
+      .toThrow("引文");
+  });
   it("counts Unicode code points and rejects forged text in a length proof", () => {
     const proof = { ...review("repair"), issues: [{ ...review("repair").issues[0], sourceQuote: "两个金额为2和4。", outputQuote: "🙂甲 长度3",
       calculation: { operator: "codepoints", operands: [], text: "🙂甲", expected: 2, actual: 3 } }] };

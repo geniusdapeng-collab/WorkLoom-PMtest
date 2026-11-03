@@ -71,6 +71,13 @@ describe("all declared PM skills have enforceable professional evidence contract
 
 describe("independent real-output regressions remain in the source contracts", () => {
   const requiredTerms: Array<[string, string, unknown]> = [
+    ["competitor-scan", "productResponse", "scenario-proposal-and-verification"],
+    ["metric-digest", "analysisScope", "requested-descriptive-before-optional-experiment"],
+    ["metric-digest", "conditionConsistency", "one-exhaustive-decision-rule"],
+    ["eval-forge", "comparatorMutation", "boundary-truth-table"],
+    ["model-scout", "eligibilityStatus", "satisfied-violated-unknown"],
+    ["model-scout", "currentModelSource", "explicit-evidence-only"],
+    ["redteam-scan", "permissionCoverage", "declared-role-resource-operation-matrix"],
     ["prd-forge", "roleStatePermissionMatrix", true],
     ["prd-forge", "permissionMatrixScope", "declared-domain-only"],
     ["prd-forge", "administratorException", "explicit-per-state"],
@@ -96,6 +103,7 @@ describe("independent real-output regressions remain in the source contracts", (
     ["eval-forge", "leakageEffect", "independence-lost-direction-unidentified"],
     ["prompt-regression", "inputBoundary", "server-assigned-roles-and-serialized-data"],
     ["prompt-regression", "tagsAreSecurityBoundary", false],
+    ["prompt-regression", "lengthBoundaries", "exact-unit-below-equal-above"],
     ["kb-fresh", "inScopeValidStatus", "active-with-scope"],
     ["kb-fresh", "crossScopeReplacement", false],
     ["industry-radar", "reportDate", "separate-from-source-times"],

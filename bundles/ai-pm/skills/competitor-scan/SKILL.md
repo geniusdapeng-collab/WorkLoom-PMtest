@@ -1,9 +1,10 @@
 ---
 name: competitor-scan
-version: 1.0.1
+version: 1.0.2
 description: 竞品侦察。真实联网抓取竞品站点/更新日志，LLM 对比摘要与威胁评级。
 delivery_contract:
   schema: workloom.pm.skill-evidence/v1
+  productResponse: scenario-proposal-and-verification
   primarySourceRequired: true
   comparisonScopeRequired: true
   missingSnapshot: "unknown-not-unchanged"
@@ -25,6 +26,8 @@ delivery_contract:
 
 4. 先列竞品、产品版本/套餐、目标用户、比较维度与截止日期；用官方原文、访问时间和证据摘录逐项建立对比矩阵，厂商宣称与亲测能力分列。
 5. 上一版快照缺失只建立基线，抓取失败记未知，不能写无变化；不同地区/套餐/发布时间不直接比较。威胁评级写明受影响用户、差异、替代成本与可验证行动，不能按新闻热度自动判高威胁。
+
+6. 用户要求应对建议时，单列“本产品应对”：按受影响用户场景提出至少一个产品行为/方案/原型建议、代价、适用前提和可核查验收；补资料或继续调研只是证据计划，不能替代产品方案。当前产品能力未知时明确写为待评审提案，不声称已具备或已执行；无充分证据先做隔离原型/访谈验证，不编上线承诺。
 
 ## 四、边界与围栏
 - 权限面：联网只读；报告写库（L1）。

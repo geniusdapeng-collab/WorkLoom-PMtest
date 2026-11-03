@@ -27,6 +27,7 @@ const contracts: Record<ContractSkill, z.ZodType> = {
     regressionRunRequiresReceipt: z.literal(true),
   }).strict(),
   "competitor-scan": z.object({
+    productResponse: z.literal("scenario-proposal-and-verification"),
     schema: z.literal("workloom.pm.skill-evidence/v1"),
     primarySourceRequired: z.literal(true),
     comparisonScopeRequired: z.literal(true),
@@ -41,6 +42,7 @@ const contracts: Record<ContractSkill, z.ZodType> = {
     dispatchRequiresReceipt: z.literal(true),
   }).strict(),
   "eval-forge": z.object({
+    comparatorMutation: z.literal("boundary-truth-table"),
     schema: z.literal("workloom.pm.skill-evidence/v1"),
     caseFields: exactSet(["precondition", "input", "steps", "expected", "oracle"] as const),
     coverage: exactSet(["normal", "boundary", "error", "permission", "regression"] as const),
@@ -105,6 +107,8 @@ const contracts: Record<ContractSkill, z.ZodType> = {
     relativeDateNeedsAnchor: z.literal(true),
   }).strict(),
   "model-scout": z.object({
+    eligibilityStatus: z.literal("satisfied-violated-unknown"),
+    currentModelSource: z.literal("explicit-evidence-only"),
     schema: z.literal("workloom.pm.skill-evidence/v1"),
     sameEvaluationContext: z.literal(true),
     observedAndAdvertisedSeparate: z.literal(true),
@@ -112,6 +116,7 @@ const contracts: Record<ContractSkill, z.ZodType> = {
     modelSwitchRequiresApproval: z.literal(true),
   }).strict(),
   "redteam-scan": z.object({
+    permissionCoverage: z.literal("declared-role-resource-operation-matrix"),
     schema: z.literal("workloom.pm.skill-evidence/v1"),
     authorizedScopeRequired: z.literal(true),
     caseFields: exactSet(["precondition", "steps", "expected", "actual", "evidence"] as const),
@@ -144,8 +149,11 @@ const contracts: Record<ContractSkill, z.ZodType> = {
   "prompt-regression": z.object({ schema: z.literal("workloom.pm.skill-evidence/v1"),
     rollbackEvidence: z.literal("independently-passed-same-red-lines"), knownBadVersionEligible: z.literal(false),
     noSafeVersion: z.literal("disable-and-human-review"), identicalRegressionContext: z.literal(true),
-    inputBoundary: z.literal("server-assigned-roles-and-serialized-data"), tagsAreSecurityBoundary: z.literal(false) }).strict(),
+    inputBoundary: z.literal("server-assigned-roles-and-serialized-data"), tagsAreSecurityBoundary: z.literal(false),
+    lengthBoundaries: z.literal("exact-unit-below-equal-above") }).strict(),
   "metric-digest": z.object({ schema: z.literal("workloom.pm.skill-evidence/v1"),
+    analysisScope: z.literal("requested-descriptive-before-optional-experiment"),
+    conditionConsistency: z.literal("one-exhaustive-decision-rule"),
     claimTypes: exactSet(["calculation", "observation", "hypothesis"] as const),
     denominatorAndWindowRequired: z.literal(true), zeroDenominator: z.literal("undefined"),
     pointThresholdAloneFalsifies: z.literal(false),

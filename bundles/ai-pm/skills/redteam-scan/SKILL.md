@@ -1,9 +1,10 @@
 ---
 name: redteam-scan
-version: 3.0.1
+version: 3.0.2
 description: 对上线候选执行对抗测试集（prompt 注入/越权诱导/边界输入/jailbreak 回归），P0/P1/P2 分级报告；P0 必审且未过审不得合入。
 delivery_contract:
   schema: workloom.pm.skill-evidence/v1
+  permissionCoverage: declared-role-resource-operation-matrix
   authorizedScopeRequired: true
   caseFields: ["precondition", "steps", "expected", "actual", "evidence"]
   notRun: "unverified"
@@ -29,6 +30,8 @@ delivery_contract:
 
 6. 先界定授权目标、隔离环境、版本与禁止触达资产；逐例给前置条件、输入步骤、预期阻断、实际行为和证据引用。仅写攻击方案或防护文案时实际结果为未验证，不能写已扫描通过。
 7. 严重度按可利用性、影响与暴露面评定；审批不能消除漏洞，P0/P1 修复须在同版本边界实际回归并证明历史攻击被阻断。敏感载荷用脱敏引用，保留可复现条件而非泄露真实秘密。
+
+8. 从题内已声明的主体角色、资源租户/所有者和操作建立权限矩阵；逐条授权边界至少对应一个允许或拒绝案例，给认证身份、角色作用域和目标资源。高权限角色也必须测试错误租户/他人资源的拒绝，不能用普通用户跨租户或未登录案例替代。逐项核对规则与案例ID映射，缺口补入同一总表；纯函数或无该权限维度时标不适用，不凭空新增角色。
 
 ## 四、边界与围栏
 - 权限面：测试在隔离环境执行，绝不触达生产数据与真实用户；报告写库。
