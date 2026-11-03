@@ -46,7 +46,9 @@ export function createPmEmployeeCatalog(store: Pick<PmStore, "employees">): PmEm
       if (!asset) throw new PmError("EMPLOYEE_NOT_READY", "该员工不属于当前已验证的AI产品经理行业包", 409);
       const preset = await assemblePreset(getAppPool(), scope, { workspaceId: scope.workspaceId, presetKey, goal });
       const declared = new Map(asset.tools.map((tool) => [tool.name, tool.access]));
-      if (asset.readonly || preset.version !== asset.version || preset.tools.length !== declared.size
+      if (asset.readonly || preset.presetKey !== asset.preset_key || preset.version !== asset.version
+        || preset.highRisk !== asset.high_risk || asset.fence_bindings.some((binding) => !preset.fenceBindings.includes(binding))
+        || preset.tools.length !== declared.size || new Set(preset.tools.map((tool) => tool.name)).size !== declared.size
         || preset.tools.some((tool) => declared.get(tool.name) !== tool.access)) {
         throw new PmError("EMPLOYEE_ASSET_DRIFT", "员工运行态与已验证的岗位工具资产不一致，请重新装配", 409);
       }

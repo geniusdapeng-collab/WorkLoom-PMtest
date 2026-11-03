@@ -1,6 +1,6 @@
 ---
 name: prd-forge
-version: 1.0.1
+version: 1.0.5
 description: 需求锻造。按「背景/目标/方案/边界/验收」骨架起草 PRD 初稿，可导出 MD。
 delivery_contract:
   schema: workloom.pm.skill-evidence/v1
@@ -8,6 +8,12 @@ delivery_contract:
   functionalPriorityTiers: [P0, P1, P2]
   fieldStateConsistency: true
   contradictionOutcome: revise-before-delivery
+  roleStatePermissionMatrix: true
+  permissionMatrixScope: declared-domain-only
+  administratorException: explicit-per-state
+  missingSourceFacts: unknown-not-negative
+  claimConsistency: source-mapped-across-all-sections
+  identifierScope: explicit-and-consistent
   writeRequiresReceipt: true
 ---
 
@@ -26,6 +32,10 @@ delivery_contract:
 4. 交付前做一致性自检：场景、字段表、状态机、权限和验收必须使用同一规则。例如“创建即100%有负责人”不能与“创建可空、分诊后必填”同时成立；发现矛盾先改为一个明确合同，再输出，不把互相冲突的方案当已完成需求。
 5. 范围、日期、工期和性能阈值没有材料依据时标设计假设或待确认，不把会议中的未知事项扩写成已定事实。验收结果未执行时写待验证。
 6. 生成完整 Markdown 产物；只有实际文档库写入工具返回可核对回执后才称“已入库”。仅在隔离目录生成文件时如实写“已生成文件，未写真实知识库/文档库”。
+7. 权限矩阵仅覆盖目标实际存在的“状态 × 角色 × 操作”，从题设/已有系统提取，不凭空添加草稿、提交、关闭、管理员等未声明概念；无状态或无角色的纯函数任务明确该维度不适用。对实际存在的读取、修改、删除和流转给出一致规则。若目标存在私有资源及管理员，管理员是否例外必须明示；允许管理员访问时同步修改“仅所有者可读”，不允许时“可查看全部”必须排除该私有范围。场景/接口/验收复用同一矩阵，不交付互斥规则。
+8. 需求排序和范围判断中，材料未给风险、依赖、成本或负责人时写“未知/待核实”，不能把“未提及”写成“无风险/无依赖”。为继续设计选择的规则明确标为设计假设，不冒充原始需求。
+9. 交付采用单一事实台账：先给每条原材料事实一个来源 ID，把已知依赖与未知项列清，再据此填优先级表、理由及摘要；同一属性不得在不同章节出现不同状态。交付前逐句查找“无/均/全部/仅/不会”等绝对判断，若无法映射原材料或明确设计假设，直接改写该句为未知，而不是另加一个免责声明。没有依赖资料的事项，其优先级表“依赖/风险”单元格也必须写未知，不能表格说不存在、正文再说未知。
+10. 字段规范表是后续实现和验收的唯一规范来源，其他章节引用规则 ID，避免重新改述而改变含义。唯一性、计数、长度、时间、权限必须显式写作用域/单位；例如标识符是实例内、租户内还是跨实例唯一，以及重启/新实例/删除后是否重置。编号策略若在每个实例重置，就不能同时承诺跨实例全局唯一。材料未指定时先选定并标明设计假设，再让示例、状态机与验收一致。
 
 ## 四、边界与围栏
 - 权限面：写文档库（L1）。

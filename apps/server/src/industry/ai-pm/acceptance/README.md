@@ -6,6 +6,7 @@
 
 ```sh
 pnpm test:pm-dsh
+pnpm test:pm-evaluation-state
 pnpm pm:eval
 ```
 
@@ -20,3 +21,13 @@ pnpm -C apps/server exec vitest run src/industry/ai-pm/aipm-integrity.test.ts
 ```
 
 `PM_DSH_EVIDENCE_ROOT` 可显式保留真实 DSH 夹具证据；`PM_DSH_PACKAGE_ROOT` 仅用于明确选择正式 npm-ci desktop stage。两者都没有设置时，DSH 入口使用服务端自己的声明依赖，临时目录仍位于本任务仓库父目录，完成后按原规则清理。
+
+评测记录追加规则：首次运行使用新的 `PM_EVAL_OUT` 和固定的 `PM_EVAL_RUN_ID`；已存在 `evaluation.json` 时 `initial` 阶段拒绝覆盖。后续分段或修复使用相同 session，并显式设置非 `initial` 的 `PM_EVAL_PHASE` 与 `PM_EVAL_ONLY`。失败任务修复继续原服务端 run/DAG，保留已付费规划和完成的祖先；目标、员工或 checks 漂移时拒绝复用。每次尝试使用不同证据目录，初次失败仍在分母中。预算代理沿用同一个持久化 run；修改阶段名不会扩大费用额度。
+
+恢复时 checks 按深层值比较：对象键顺序不影响合同（兼容 PostgreSQL jsonb 回读），数组顺序、字段和值仍严格一致。恢复身份从该逻辑 case 的全部尝试中追溯唯一原 run，不因一次前置校验失败缺少 runId 而创建新 run；若同 case 出现不同 runId，则拒绝猜测。HTTP 响应丢失、尚未记录 runId 时也复用首次 case 的幂等键，不把尝试目录后缀用于新收费任务。
+
+`PM_EVAL_CASE_TIMEOUT_MS` 控制单例结果捕获时限，必须为正安全整数毫秒；默认保留 9 分钟，长任务可显式设置 `2700000`（45 分钟）。捕获到时只追加 `captureStatus: pending` 与原 runId、已读状态和产物，**不自动取消或重试收费运行**；后续用相同 session 的显式阶段继续读取原 run。单次 HTTP 传输仍为 30 秒，模型容量和硬预算不受该捕获时限影响。
+
+14 个单岗目标包含负责人冲突、状态约束、计费口径未知、零分母、反馈去重、提议与决议区分、转载来源独立性、已知漏洞版本回滚、文件所有权、单样本统计、独立评测 oracle、提示注入及知识版本范围。文件 marker 通过只证明对应有限断言；交付报告还须逐份审阅正文，不能将 marker 成绩写成完整职业能力达标。
+
+意图分类的默认端到端时限为 10 秒，包含预算代理、tokenizer 前置及模型往返；调用者仍可显式覆盖，同步交互常量保持 3 秒、正式派遣入口保持 12 秒。超时会取消底层请求，并以 `timeout_fallback` 明示规则回退；规则答对也不算 LLM 分类成功。评测行记录本次 `routeTimeoutMs`，修复重测使用新的尝试 ID、保留逻辑 `caseId` 与原 3 秒失败/回退样本，不覆盖旧成绩。

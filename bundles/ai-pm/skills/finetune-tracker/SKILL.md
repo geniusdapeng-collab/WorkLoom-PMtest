@@ -1,7 +1,13 @@
 ---
 name: finetune-tracker
-version: 3.0.0
+version: 3.0.1
 description: 微调全生命周期跟踪——四问前置评估（微调 vs RAG）、数据集版本登记、训练跟踪、训后 eval 对比、上线裁决包。
+delivery_contract:
+  schema: workloom.pm.skill-evidence/v1
+  holdoutIsolation: true
+  dataAuthorizationRequired: true
+  baselineRequired: true
+  trainingClaimRequiresReceipt: true
 ---
 
 # 微调全生命周期跟踪
@@ -20,6 +26,9 @@ description: 微调全生命周期跟踪——四问前置评估（微调 vs RAG
 4. 训练状态跟踪：轮次、损失曲线、中间检查点留痕；
 5. 训后自动 eval 对比基线（同一 eval 集：基座模型 vs 微调模型）；
 6. 产出上线裁决包（对比报告+成本测算+回滚预案）进审批流。
+
+7. 训练/验证/保留测试集按用户或来源隔离并去重，记录数据版本、授权和泄漏检查；测试集不得回灌训练。缺数据或预算时明确缺口，不虚构训练曲线。
+8. 比较同一场景的原模型、prompt/RAG 基线与候选，写清样本、质量、时延、成本口径、风险与停用/回退条件。训练与上线状态只按真实任务回执，方案不等于已开训。
 
 ## 四、边界与围栏
 - 权限面：finetune_run/dataset 写操作一律 R-PM11 block，仅人工白名单放行；数据外发一律 block。

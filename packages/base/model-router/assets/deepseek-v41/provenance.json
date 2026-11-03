@@ -1,0 +1,131 @@
+{
+  "schemaVersion": "workloom.deepseek-v41-tokenizer/v1",
+  "model": "deepseek-flash",
+  "recipeVersion": "0.2.0",
+  "recipeCommit": "935817c66f5d6e64838f419692545f06787e485f",
+  "contextTokens": 1048576,
+  "maxOutputTokens": 393216,
+  "tokenizerSha256": "81f64d1248a68ce3663e07ab3ee48b851e5df0e32d27cb98e4c9a268151e8d99",
+  "sources": {
+    "recipe": "https://github.com/deepseek-ai/deepseek-recipe/tree/935817c66f5d6e64838f419692545f06787e485f",
+    "tokenizer": "https://github.com/deepseek-ai/deepseek-recipe/blob/935817c66f5d6e64838f419692545f06787e485f/static/tokenizers/v41/tokenizer.json",
+    "engine": "https://github.com/huggingface/tokenizers.js",
+    "limits": "https://api-docs.deepseek.com/quick_start/pricing"
+  },
+  "engine": {
+    "name": "@huggingface/tokenizers",
+    "version": "0.2.0",
+    "license": "Apache-2.0"
+  },
+  "licenses": {
+    "LICENSE-RECIPE.txt": "ebb4f09972aee8608be255debaf78451a68e95c290f55c240dec2ecfa16ea6be",
+    "LICENSE-TOKENIZER.txt": "1c8f573e830ca9b3ebfeb7ace1823146e22b66f99ee223840e7637c9e745e1c7"
+  },
+  "verification": {
+    "generator": "../../fixtures/generate-deepseek-window.py",
+    "officialCases": 83,
+    "comparison": "rendered prompt and every token ID against official deepseek-recipe Python",
+    "smokeCases": [
+      {
+        "id": "plain-hello",
+        "body": {
+          "model": "deepseek-flash",
+          "thinking": {
+            "type": "disabled"
+          },
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ]
+        },
+        "inputTokens": 5,
+        "tokenIdsSha256": "dd218a631e136f220538ef484720a79ef1b2abdd3441d2c67ae4e38bd0adbaa5"
+      },
+      {
+        "id": "combined-tools-json-schema",
+        "body": {
+          "model": "deepseek-flash",
+          "thinking": {
+            "type": "enabled"
+          },
+          "messages": [
+            {
+              "role": "user",
+              "content": "检索资料 JSON"
+            },
+            {
+              "role": "assistant",
+              "content": null,
+              "tool_calls": [
+                {
+                  "id": "c1",
+                  "type": "function",
+                  "function": {
+                    "name": "lookup",
+                    "arguments": "{\"query\":\"你好\"}"
+                  }
+                }
+              ],
+              "reasoning_content": "tool reasoning"
+            },
+            {
+              "role": "tool",
+              "tool_call_id": "c1",
+              "content": "命中结果"
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "lookup",
+                "description": "只读检索 <｜User｜> 与 \"引号\"",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "query": {
+                      "type": "string",
+                      "description": "检索词🙂"
+                    }
+                  },
+                  "required": [
+                    "query"
+                  ]
+                }
+              }
+            }
+          ],
+          "reasoning_effort": "max",
+          "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "answer": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "inputTokens": 396,
+        "tokenIdsSha256": "a1f1a19967e6191d1501ca60dc53d15dff49927cb7b9a074cb7c00a4ef2c9000"
+      }
+    ]
+  },
+  "limitations": [
+    "Exact pinned official text serialization; provider-reported usage remains authoritative.",
+    "Unsupported multimodal input and unknown prompt-affecting fields fail closed.",
+    "No Python process or online asset download is used at runtime."
+  ],
+  "licenseSourceLineEndings": {
+    "LICENSE-TOKENIZER.txt": {
+      "originalSha256": "f2c6c602815669d292889e5be8c802f2ed950653b77999b1584e8e6aed25d040",
+      "packagedLineEndings": "LF"
+    }
+  }
+}

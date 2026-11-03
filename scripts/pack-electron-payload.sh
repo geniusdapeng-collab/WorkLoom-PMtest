@@ -217,6 +217,7 @@ else
   [ -f "$OUT/pg/bin/initdb" ] || { echo "❌ 载荷自检失败：pg/bin/initdb 缺失"; exit 1; }
 fi
 node scripts/payload-policy.mjs assert-runtime "$R"
+node scripts/verify-runtime-deepseek.mjs "$R" "$R/node_modules"
 node scripts/verify-runtime-preview.mjs "$R" "$NM_STAGE/node_modules" --target-os "$TARGET_OS" --target-cpu "$TARGET_CPU"
 echo "✓ 载荷自检通过"
 

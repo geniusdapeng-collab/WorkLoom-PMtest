@@ -1,7 +1,13 @@
 ---
 name: dev-dispatch
-version: 1.0.0
+version: 1.0.1
 description: 开发任务派发——选机床、建隔离 worktree、快照、启动受管会话。
+delivery_contract:
+  schema: workloom.pm.skill-evidence/v1
+  dependencyAcceptanceRequired: true
+  oneOutputOwner: true
+  authorizationBeforeExecution: true
+  dispatchRequiresReceipt: true
 ---
 
 # 开发任务派发
@@ -18,6 +24,9 @@ description: 开发任务派发——选机床、建隔离 worktree、快照、�
 3. 快照先行：基线 commit + status 指纹（回滚锚点）
 4. 凭据 L4 注入环境变量（secret 不进事件明文），启动受管会话
 5. 返修第 2 轮起：携带打回原因，支持续跑的机床 resume 原线程
+
+6. 每个任务单必须有单一负责人、输入来源、依赖任务及其交付验收、接口约束、唯一产物所有权、完成条件与失败恢复；关键依赖未验收时不派发后继任务。
+7. 同一文件不能交给两个并行任务修改；跨模块先约定接口再并行，列关键路径与可并行项。机床不可用、授权缺失或接口冲突应阻断对应执行，保留可完成的设计产物；无会话回执不写已派发。
 
 ## 四、边界与围栏
 - 未登记目录机床一寸都进不去（白名单 + 路径钳制双重强制）

@@ -54,12 +54,30 @@ export interface PlanningReceipt {
   assetBindingSource?: "verified-catalog";
   /** Server-side corrections from output ownership back to the responsible employee. */
   ownerCorrections?: PmOwnerCorrection[];
+  modelRequest?: import("@workloom/base/model-router").CompletionRequestReceipt;
 }
 export interface FailureMetering {
-  usage: { promptTokens: number; completionTokens: number };
+  /** Absent means unknown. Never substitute zero for an unmetered sent call. */
+  usage?: { promptTokens: number; completionTokens: number };
   modelId: string;
   responseId?: string;
   receipt?: Record<string, unknown>;
+}
+
+export function requiresPmUsageReconciliation(detail: PmRunDetail): boolean {
+  if (detail.run.errorCode === "MODEL_USAGE_RECONCILIATION_REQUIRED"
+    || detail.tasks.some((task) => task.errorCode === "MODEL_USAGE_RECONCILIATION_REQUIRED")) return true;
+  const attempts = new Map<string, string>();
+  const visit = (value: unknown) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
+    const row = value as Record<string, unknown>;
+    if (typeof row.attemptId === "string" && typeof row.dispatchState === "string") attempts.set(row.attemptId, row.dispatchState);
+    if (row.requestReceipt) visit(row.requestReceipt);
+    if (row.receipt) visit(row.receipt);
+  };
+  for (const row of detail.run.planningReceipts) visit(row);
+  for (const task of detail.tasks) for (const row of task.attemptReceipts) visit(row);
+  return [...attempts.values()].some((state) => state === "possibly-sent");
 }
 export interface PmStore {
   create(scope: PmScope, input: PmCreateInput, actor: string, modelId: string, policyVersion: string): Promise<{ detail: PmRunDetail; created: boolean }>;
@@ -71,6 +89,8 @@ export interface PmStore {
   heartbeat(scope: PmScope, id: string, owner: string): Promise<boolean>;
   savePlan(scope: PmScope, id: string, owner: string, plan: PmTaskPlan[], receipt: PlanningReceipt): Promise<void>;
   claimTask(scope: PmScope, id: string, taskId: string, owner: string): Promise<boolean>;
+  recordModelAttempt(scope: PmScope, id: string, owner: string, taskId: string | undefined,
+    receipt: import("@workloom/base/model-router").CompletionDispatchReceipt): Promise<void>;
   completeTask(scope: PmScope, id: string, taskId: string, owner: string, result: EmployeeExecutionResult, artifacts: PmArtifact[], impacts: RuleImpact[], declaredCapability: string): Promise<void>;
   failRun(scope: PmScope, id: string, owner: string, status: "failed" | "blocked" | "paused", code: string, message: string, taskId?: string, impacts?: RuleImpact[], metering?: FailureMetering, verificationResults?: unknown): Promise<boolean>;
   finishRun(scope: PmScope, id: string, owner: string, checkResults: unknown): Promise<void>;
@@ -98,13 +118,17 @@ export class PgPmStore implements PmStore {
 
   private async tx<T>(scope: PmScope, fn: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
+    let releaseError: Error | undefined;
     try {
       await client.query("BEGIN");
       await client.query("SELECT set_config('app.tenant_id',$1,true)", [scope.tenantId]);
       await client.query("SELECT set_config('app.workspace_id',$1,true)", [scope.workspaceId]);
       const result = await fn(client); await client.query("COMMIT"); return result;
-    } catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; }
-    finally { client.release(); }
+    } catch (error) {
+      try { await client.query("ROLLBACK"); }
+      catch (rollbackError) { releaseError = rollbackError instanceof Error ? rollbackError : new Error("PM事务回滚失败"); }
+      throw error;
+    } finally { client.release(releaseError); }
   }
 
   private async journal(client: PoolClient, scope: PmScope, id: string, action: string, after: Record<string, unknown>,
@@ -169,6 +193,12 @@ export class PgPmStore implements PmStore {
 
   async claimRun(scope: PmScope, id: string, owner: string, resume: boolean): Promise<PmRunDetail | null> {
     return this.tx(scope, async (client) => {
+      if (resume) {
+        await client.query("SELECT id FROM pm_runs WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 FOR UPDATE", [id, scope.tenantId, scope.workspaceId]);
+        if (requiresPmUsageReconciliation(await this.detailOn(client, scope, id))) {
+          throw new PmError("MODEL_USAGE_RECONCILIATION_REQUIRED", "上次模型请求可能已经送出且尚未完成用量对账，禁止重复收费调用", 409);
+        }
+      }
       const statuses = resume ? ["paused", "failed", "blocked"] : ["created"];
       const claimed = await client.query(
         `UPDATE pm_runs SET status=CASE WHEN plan_version=0 THEN 'planning' ELSE 'running' END,
@@ -233,6 +263,45 @@ export class PgPmStore implements PmStore {
     });
   }
 
+  recordModelAttempt(scope: PmScope, id: string, owner: string, taskId: string | undefined,
+    receipt: import("@workloom/base/model-router").CompletionDispatchReceipt): Promise<void> {
+    assertNoSecrets(receipt);
+    if (Buffer.byteLength(JSON.stringify(receipt)) > 8192) throw new PmError("MODEL_RECEIPT_INVALID", "模型请求摘要超出内部回执大小限制");
+    return this.tx(scope, async (client) => {
+      const owned = await client.query<{ active: boolean }>(
+        `SELECT status IN ('planning','running') AND lease_expires_at>now() AS active
+         FROM pm_runs WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND lease_owner=$4
+         AND status IN ('planning','running','cancelled') FOR UPDATE`, [id, scope.tenantId, scope.workspaceId, owner]);
+      if (!owned.rowCount) throw new PmError("RUN_LEASE_LOST", "运行归属已变化，拒绝新的模型请求或回执", 409);
+      if (!owned.rows[0]!.active) {
+        // A cancelled/expired run may retain the original request's accounting
+        // receipt, but cannot authorize a new physical model request.
+        const previous = taskId
+          ? await client.query(
+            `SELECT 1 FROM pm_tasks,jsonb_array_elements(attempt_receipts) AS item
+             WHERE run_id=$1 AND id=$2 AND tenant_id=$3 AND workspace_id=$4
+               AND item->'requestReceipt'->>'attemptId'=$5 LIMIT 1`,
+            [id, taskId, scope.tenantId, scope.workspaceId, receipt.attemptId])
+          : await client.query(
+            `SELECT 1 FROM pm_runs,jsonb_array_elements(planning_receipts) AS item
+             WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3
+               AND item->'requestReceipt'->>'attemptId'=$4 LIMIT 1`,
+            [id, scope.tenantId, scope.workspaceId, receipt.attemptId]);
+        if (!previous.rowCount) throw new PmError("RUN_LEASE_LOST", "运行已取消或租约已过期，只允许保留原请求的计量回执", 409);
+      }
+      const row = JSON.stringify({ kind: "model-attempt", recordedAt: new Date().toISOString(), requestReceipt: receipt });
+      if (taskId) {
+        const updated = await client.query(
+          `UPDATE pm_tasks SET attempt_receipts=attempt_receipts||jsonb_build_array($5::jsonb)
+           WHERE run_id=$1 AND id=$2 AND tenant_id=$3 AND workspace_id=$4`, [id, taskId, scope.tenantId, scope.workspaceId, row]);
+        if (!updated.rowCount) throw new PmError("TASK_LEASE_LOST", "员工任务不存在，拒绝模型调用", 409);
+      } else await client.query(
+        `UPDATE pm_runs SET planning_receipts=planning_receipts||jsonb_build_array($4::jsonb)
+         WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3`, [id, scope.tenantId, scope.workspaceId, row]);
+      await this.journal(client, scope, id, "pm.model.attempt", { taskId: taskId ?? null, requestReceipt: receipt });
+    });
+  }
+
   completeTask(scope: PmScope, id: string, taskId: string, owner: string, result: EmployeeExecutionResult, artifacts: PmArtifact[], impacts: RuleImpact[], declaredCapability: string): Promise<void> {
     assertNoSecrets({ result, artifacts, declaredCapability });
     return this.tx(scope, async (client) => {
@@ -282,16 +351,16 @@ export class PgPmStore implements PmStore {
       } else if (previous.rows[0]!.planning_metered_attempt >= previous.rows[0]!.planning_attempt) addMetering = false;
       if (addMetering && metering) {
         assertNoSecrets(metering);
-        await client.query(
+        if (metering.usage) await client.query(
           `UPDATE pm_runs SET prompt_tokens=prompt_tokens+$4,completion_tokens=completion_tokens+$5
            WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3`, [id, scope.tenantId, scope.workspaceId, metering.usage.promptTokens, metering.usage.completionTokens]);
         if (taskId) await client.query(
-          `UPDATE pm_tasks SET usage=jsonb_build_object('promptTokens',COALESCE((usage->>'promptTokens')::bigint,0)+($5::jsonb->>'promptTokens')::bigint,
-            'completionTokens',COALESCE((usage->>'completionTokens')::bigint,0)+($5::jsonb->>'completionTokens')::bigint),
+          `UPDATE pm_tasks SET usage=CASE WHEN $5::jsonb IS NULL THEN usage ELSE jsonb_build_object('promptTokens',COALESCE((usage->>'promptTokens')::bigint,0)+($5::jsonb->>'promptTokens')::bigint,
+            'completionTokens',COALESCE((usage->>'completionTokens')::bigint,0)+($5::jsonb->>'completionTokens')::bigint) END,
             model_id=$6,response_id=$7,adapter_receipt=$8::jsonb,metered_attempt=attempt,
             attempt_receipts=attempt_receipts||jsonb_build_array(jsonb_build_object('attempt',attempt,'usage',$5::jsonb,'modelId',$6::text,'receipt',$8::jsonb,'final',false))
            WHERE run_id=$1 AND id=$2 AND tenant_id=$3 AND workspace_id=$4`,
-          [id, taskId, scope.tenantId, scope.workspaceId, JSON.stringify(metering.usage), metering.modelId, metering.responseId ?? null, JSON.stringify(metering.receipt ?? { final: false })]);
+          [id, taskId, scope.tenantId, scope.workspaceId, metering.usage ? JSON.stringify(metering.usage) : null, metering.modelId, metering.responseId ?? null, JSON.stringify(metering.receipt ?? { final: false })]);
         else await client.query(
           `UPDATE pm_runs SET planning_receipt=$4::jsonb,planning_metered_attempt=planning_attempt,
             planning_receipts=planning_receipts||jsonb_build_array($4::jsonb) WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3`,
@@ -304,7 +373,7 @@ export class PgPmStore implements PmStore {
         await this.journal(client, scope, id, "pm.run.cancelled_metering", {
           taskId: taskId ?? null, knownFailureMetering: addMetering ? metering ?? null : null,
           budgetAuthority: "parent-physical-request-ledger", retainedTerminalStatus: "cancelled",
-        }, { rule_impact: [], ...(addMetering && metering ? { model_trace: { model_id: metering.modelId,
+        }, { rule_impact: [], ...(addMetering && metering?.usage ? { model_trace: { model_id: metering.modelId,
           prompt_tokens: metering.usage.promptTokens, completion_tokens: metering.usage.completionTokens } } : {}) });
         return true;
       }
@@ -326,7 +395,7 @@ export class PgPmStore implements PmStore {
         code, message: message.slice(0, 1000), taskId: taskId ?? null,
         verificationResults: verificationResults ?? null,
         knownFailureMetering: addMetering ? metering ?? null : null, budgetAuthority: "parent-physical-request-ledger",
-      }, { rule_impact: impacts, ...(addMetering && metering ? { model_trace: { model_id: metering.modelId,
+      }, { rule_impact: impacts, ...(addMetering && metering?.usage ? { model_trace: { model_id: metering.modelId,
         prompt_tokens: metering.usage.promptTokens, completion_tokens: metering.usage.completionTokens } } : {}) });
       return true;
     });
@@ -379,10 +448,17 @@ export class PgPmStore implements PmStore {
           error='执行进程中断且租约已过期，已完成产物保留；需显式恢复并重新校验摘要',updated_at=now()
          WHERE tenant_id=$1 AND workspace_id=$2 AND status IN ('planning','running') AND lease_expires_at<=now() RETURNING id`, [scope.tenantId, scope.workspaceId]);
       for (const row of stale.rows) {
+        const unresolved = requiresPmUsageReconciliation(await this.detailOn(client, scope, row.id));
+        if (unresolved) await client.query(
+          `UPDATE pm_runs SET status='blocked',error_code='MODEL_USAGE_RECONCILIATION_REQUIRED',
+           error='进程中断时存在可能已送出的模型请求，必须核对原请求用量后才能恢复'
+           WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3`, [row.id, scope.tenantId, scope.workspaceId]);
         await client.query(
-          `UPDATE pm_tasks SET status='paused',lease_owner=NULL,error_code='INTERRUPTED',error='进程中断；未取得产物回执'
-           WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3 AND status='running'`, [row.id, scope.tenantId, scope.workspaceId]);
-        await this.journal(client, scope, row.id, "pm.run.paused", { code: "INTERRUPTED", requiresExplicitResume: true });
+          `UPDATE pm_tasks SET status=$4,lease_owner=NULL,error_code=$5,error='进程中断；未取得完整产物与计量回执'
+           WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3 AND status='running'`,
+          [row.id, scope.tenantId, scope.workspaceId, unresolved ? "blocked" : "paused", unresolved ? "MODEL_USAGE_RECONCILIATION_REQUIRED" : "INTERRUPTED"]);
+        await this.journal(client, scope, row.id, unresolved ? "pm.run.blocked" : "pm.run.paused",
+          { code: unresolved ? "MODEL_USAGE_RECONCILIATION_REQUIRED" : "INTERRUPTED", requiresExplicitResume: !unresolved, requiresUsageReconciliation: unresolved });
       }
       return stale.rowCount ?? 0;
     });

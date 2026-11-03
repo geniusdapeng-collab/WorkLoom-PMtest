@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const fixture = vi.hoisted(() => ({
+  failIndustryRead: false,
+  failRollback: false,
+  release: vi.fn(),
   status: "queued",
   title: "短标题索引",
   archive: { goals: { delivery: { text: "完整长目标：" + "验收条件与交付约束。".repeat(100), version: "v7" } } } as Record<string, unknown>,
@@ -26,16 +29,20 @@ const query = vi.fn(async (sql: string, params: unknown[] = []) => {
   if (/FROM biz_events/.test(sql)) return { rows: fixture.dispatch ? [{ dispatch_after: fixture.dispatch }] : [], rowCount: fixture.dispatch ? 1 : 0 };
   if (/SELECT archive FROM profiles/.test(sql)) return { rows: [{ archive: fixture.archive }], rowCount: 1 };
   if (/SELECT preset_key FROM agents/.test(sql)) return { rows: [{ preset_key: "fixture-preset" }], rowCount: 1 };
-  if (/SELECT industry FROM workspaces/.test(sql)) return { rows: [{ industry: null }], rowCount: 1 };
+  if (/SELECT industry FROM workspaces/.test(sql)) {
+    if (fixture.failIndustryRead) throw new Error("injected vocabulary query failure");
+    return { rows: [{ industry: null }], rowCount: 1 };
+  }
   if (/UPDATE threads SET status='failed'/.test(sql)) {
     const changed = fixture.status === "running";
     if (changed) fixture.status = "failed";
     return { rows: changed ? [{ id: "T-1" }] : [], rowCount: Number(changed) };
   }
+  if (sql === "ROLLBACK" && fixture.failRollback) throw new Error("injected broken connection");
   if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql) || sql.startsWith("SELECT set_config")) return { rows: [], rowCount: 0 };
   throw new Error(`fixture does not implement query: ${sql}`);
 });
-const pool = { connect: async () => ({ query, release: () => undefined }) };
+const pool = { connect: async () => ({ query, release: fixture.release }) };
 vi.mock("@workloom/db", () => ({ getAppPool: () => pool, getGatewayPool: () => pool }));
 vi.mock("@workloom/runtime", () => ({ assemblePreset: fixture.assemblePreset, runQuest: fixture.runQuest }));
 vi.mock("@workloom/base/bundles", () => ({ bundlesRoot: () => "/fixture/no-bundles" }));
@@ -48,6 +55,8 @@ import { registerIndustryQuestPlanner, runQuestForThread } from "./thread-runner
 beforeEach(() => {
   vi.clearAllMocks();
   fixture.status = "queued";
+  fixture.failIndustryRead = false;
+  fixture.failRollback = false;
   fixture.title = "短标题索引";
   fixture.archive = { goals: { delivery: { text: "完整长目标：" + "验收条件与交付约束。".repeat(100), version: "v7" } } };
   fixture.dispatch = { goal_ref: "delivery", goal_ref_version: "v7" };
@@ -156,4 +165,23 @@ describe("MC-PM-005 claimed-thread failure receipt", () => {
     expect(fixture.runQuest).not.toHaveBeenCalled();
     expect(fixture.events).toHaveLength(0);
   });
+});
+
+
+describe("routing vocabulary database recovery", () => {
+  it("rolls back an optional vocabulary query failure before releasing its connection", async () => {
+    fixture.failIndustryRead = true;
+    await runQuestForThread({ ...scope, workspaceId: "vocabulary-failure-isolated" }, { threadId: "T-1", goal: "完成内部文档", presetRef: "agt-fixture" });
+    const failed = fixture.queries.findIndex(({ sql }) => /SELECT industry FROM workspaces/.test(sql));
+    expect(failed).toBeGreaterThan(-1);
+    expect(fixture.queries[failed + 1]?.sql).toBe("ROLLBACK");
+    expect(fixture.runQuest).toHaveBeenCalledOnce();
+  });
+});
+
+it("discards a vocabulary connection if rollback itself fails", async () => {
+  fixture.failIndustryRead = true;
+  fixture.failRollback = true;
+  await runQuestForThread({ ...scope, workspaceId: "vocabulary-rollback-failure-isolated" }, { threadId: "T-1", goal: "完成内部文档", presetRef: "agt-fixture" });
+  expect(fixture.release).toHaveBeenLastCalledWith(true);
 });

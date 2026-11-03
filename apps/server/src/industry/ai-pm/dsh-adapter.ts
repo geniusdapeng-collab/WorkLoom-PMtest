@@ -8,6 +8,7 @@ import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 import type { CompletionProvider, CompletionResult, FunctionToolDefinition, ProviderMessage } from "@workloom/base/model-router";
+import { DEEPSEEK_V41_WINDOW } from "@workloom/base/model-router";
 import { PmError, type EmployeeExecutionInput, type EmployeeExecutor, type PmUsage } from "./types.js";
 import { snapshotPmAssetBinding, withPmAssetBinding } from "./asset-binding.js";
 import { TRUSTED_PM_EVIDENCE_POLICY } from "./skill-contracts.js";
@@ -36,7 +37,8 @@ export interface DshEmployeeOptions {
   maxTokens?: number;
 }
 export interface DshJsonEvent extends Record<string, unknown> { type: string }
-interface ModelReceipt { responseId?: string; model: string; usage: PmUsage; finishedAt: string }
+interface ModelReceipt { responseId?: string; model: string; usage: PmUsage; finishedAt: string; protocolRejected?: boolean;
+  finishReason?: string; request?: CompletionResult["request"]; dshRequestedMaxTokens?: unknown }
 interface ProcessEvidence { stdout: string; stderr: string; exitCode: number | null }
 
 function record(value: unknown): value is Record<string, unknown> { return !!value && typeof value === "object" && !Array.isArray(value); }
@@ -134,7 +136,9 @@ async function requestBody(request: IncomingMessage): Promise<Record<string, unk
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     bytes += buffer.length;
-    if (bytes > 2 * MAX_TOTAL_BYTES) reject("DSH_MODEL_PROTOCOL", "DSH 模型请求超出大小限制");
+    // Transport memory protection, separate from the exact token capacity check
+    // applied to the complete final request by the provider.
+    if (bytes > 24 * 1024 * 1024) reject("DSH_MODEL_PROTOCOL", "DSH 模型请求超出24MiB传输大小限制");
     chunks.push(buffer);
   }
   let parsed: unknown;
@@ -152,8 +156,9 @@ async function profilePatch(packageRoot: string, home: string, workspace: string
   const patches: Record<string, unknown>[] = ids.map((id) => ({ id, disabled: !SAFE_BASE_IDS.has(id) }));
   const set = (id: string, config: unknown) => patches.push({ id, disabled: false, config });
   set("llm-pi-ai", { providers: { "pm-loopback": { apiKeyEnv: "WORKLOOM_DSH_PROXY_KEY", displayName: "WorkLoom PM guarded model gateway", api: "openai-completions", baseURL: endpoint,
-    models: [{ id: modelId, maxTokens: limits.maxTokens }], defaultContextWindow: 131072, defaultMaxTokens: limits.maxTokens,
-    timeoutMs: 120000, streamIdleTimeoutMs: 120000, retryPolicy: { mode: "normal", maxRetries: 0 } } } });
+    models: [{ id: modelId, contextWindow: DEEPSEEK_V41_WINDOW.contextTokens, maxTokens: limits.maxTokens }],
+    defaultContextWindow: DEEPSEEK_V41_WINDOW.contextTokens, defaultMaxTokens: limits.maxTokens,
+    timeoutMs: 600000, streamIdleTimeoutMs: 600000, retryPolicy: { mode: "normal", maxRetries: 0 } } } });
   set("agent-default-model", { provider: "pm-loopback", model: modelId });
   set("session-persistence-jsonl", { root: join(home, "sessions"), compression: "none" });
   set("session-query-sqlite", { path: ":memory:", openAt: "never" });
@@ -163,7 +168,7 @@ async function profilePatch(packageRoot: string, home: string, workspace: string
   set("tools", { mode: "native" });
   set("system-prompt", { includeHarnessIdentity: false, includeRuntimeContext: true,
     personaPrefix: TRUSTED_PM_EVIDENCE_POLICY + `你是 WorkLoom PM 数字员工 ${input.preset.presetKey}。\n岗位与技能数据：${JSON.stringify({ role: input.preset.prompt, skills: input.skillText })}\n`
-      + "先读取 inputs/context.json 和任务消息中已列明路径的依赖产物。首轮可以同时调用多个 read_file，无需先 list_files 再发现已知路径。按本任务验收标准交付。只能使用列出的工具；不可调用 shell、外网、发布或修改业务数据。"
+      + "任务消息已一次附齐原始上下文和带来源摘要的依赖原文，无需重复读取已给材料。仅在核验已写文件时按需使用 read_file。按本任务验收标准交付。只能使用列出的工具；不可调用 shell、外网、发布或修改业务数据。"
       + "必须用 write_file 写齐任务给出的所有 outputRefs；写文件成功后才总结。最终回复说明实际产物与限制，不声称运行了不存在的测试或发布。" });
   patches.push({ insert: [{ id: "workloom-pm-workspace", name: fileURLToPath(new URL("./dsh-workspace.plugin.mjs", import.meta.url)), inject: ["tools"],
     config: { workspaceRoot: workspace, outputRefs: input.task.outputRefs, maxToolCalls: limits.maxToolCalls } }] });
@@ -242,10 +247,11 @@ async function runProcess(cli: string, workspace: string, home: string, proxyKey
  * budget hooks, so DSH internal retries can never bypass metering.
  */
 export function createDshEmployeeExecutor(options: DshEmployeeOptions): EmployeeExecutor {
-  const timeoutMs = positive(options.timeoutMs, 180000, 600000, "timeoutMs");
+  const timeoutMs = positive(options.timeoutMs, 600000, 600000, "timeoutMs");
   const maxModelCalls = positive(options.maxModelCalls, 8, 40, "maxModelCalls");
   const maxToolCalls = positive(options.maxToolCalls, 40, 200, "maxToolCalls");
-  const maxTokens = positive(options.maxTokens, 8192, 32768, "maxTokens");
+  const maxTokens = DEEPSEEK_V41_WINDOW.maxOutputTokens;
+  if (options.maxTokens !== undefined && options.maxTokens !== maxTokens) reject("DSH_CONFIG", "maxTokens 必须由完整模型窗口决定，不能使用历史输出常量");
   return async (input) => {
     const binding = snapshotPmAssetBinding(input.assetBinding);
     input.signal.throwIfAborted();
@@ -284,7 +290,7 @@ export function createDshEmployeeExecutor(options: DshEmployeeOptions): Employee
     await writeFile(join(workspace, "inputs/context.json"), JSON.stringify(context, null, 2), { mode: 0o400, flag: "wx" });
     await writeFile(join(profile, "package.json"), JSON.stringify({ name: "workloom-pm-employee-profile", private: true, dependencies: {}, dsh: { profile: { bundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless"] } } }), { mode: 0o600 });
     const proxyKey = randomUUID();
-    let modelCalls = 0; let proxyRequests = 0; let proxyError: unknown;
+    let modelCalls = 0; let blockedBeforeSendCalls = 0; let proxyRequests = 0; let proxyError: unknown;
     const receipts: ModelReceipt[] = [];
     const usage: PmUsage = { promptTokens: 0, completionTokens: 0 };
     const controller = new AbortController();
@@ -309,13 +315,42 @@ export function createDshEmployeeExecutor(options: DshEmployeeOptions): Employee
         if (proxyError) throw proxyError;
         if (modelCalls >= maxModelCalls) reject("DSH_MODEL_BUDGET", "DSH 员工模型请求预算已耗尽");
         modelCalls += 1;
-        const completion = await options.provider.complete(messages, { tools, thinking: "disabled", maxTokens, signal: requestSignal, requireUsage: true });
+        let completion: CompletionResult;
+        try { completion = await options.provider.complete(messages, { tools, thinking: "disabled", signal: requestSignal, requireUsage: true }); }
+        catch (error) {
+          if (record(error) && error.dispatchState === "blocked-before-send") blockedBeforeSendCalls += 1;
+          // Protocol parsing may reject an empty/truncated paid response. The
+          // provider exposes only validated accounting metadata on that error;
+          // keep it before the adapter's own failure receipt replaces the cause.
+          if (record(error) && record(error.usage) && record(error.receipt) && error.receipt.usageComplete === true
+            && Number.isSafeInteger(error.usage.promptTokens) && (error.usage.promptTokens as number) >= 0
+            && Number.isSafeInteger(error.usage.completionTokens) && (error.usage.completionTokens as number) >= 0
+            && Number.isSafeInteger((error.usage.promptTokens as number) + (error.usage.completionTokens as number))
+            && typeof error.modelId === "string" && error.modelId.length > 0 && error.modelId.length <= 150) {
+            const paid = { promptTokens: error.usage.promptTokens as number, completionTokens: error.usage.completionTokens as number };
+            usage.promptTokens += paid.promptTokens; usage.completionTokens += paid.completionTokens;
+            receipts.push({ model: error.modelId, usage: paid, finishedAt: new Date().toISOString(), protocolRejected: true,
+              ...(record(error.request) ? { request: error.request as unknown as CompletionResult["request"] } : {}),
+              ...(typeof error.responseId === "string" && error.responseId.length <= 200 ? { responseId: error.responseId } : {}) });
+          }
+          throw error;
+        }
         const measured = completion.usage;
         if (!measured || !Number.isSafeInteger(measured.prompt_tokens) || !Number.isSafeInteger(measured.completion_tokens)
           || measured.prompt_tokens < 0 || measured.completion_tokens < 0 || measured.total_tokens !== measured.prompt_tokens + measured.completion_tokens) reject("DSH_USAGE", "DSH 模型缺少可信 usage 回执");
         const measuredUsage = { promptTokens: measured.prompt_tokens, completionTokens: measured.completion_tokens };
         usage.promptTokens += measuredUsage.promptTokens; usage.completionTokens += measuredUsage.completionTokens;
-        receipts.push({ responseId: completion.responseId, model: completion.model, usage: measuredUsage, finishedAt: new Date().toISOString() });
+        receipts.push({ responseId: completion.responseId, model: completion.model, usage: measuredUsage, finishedAt: new Date().toISOString(),
+          finishReason: completion.finishReason, ...(completion.request ? { request: completion.request } : {}), dshRequestedMaxTokens: body.max_tokens });
+        // Meter a paid reply before checking its quality. A later correct reply
+        // must never hide an earlier model drift or truncated tool instruction.
+        if (completion.model !== options.provider.modelId) reject("MODEL_DRIFT", "DSH 返回模型与固定模型不一致");
+        if (!completion.responseId?.trim() || !["stop", "tool_calls"].includes(completion.finishReason ?? "")) {
+          reject("MODEL_RECEIPT_MISSING", "DSH 模型响应缺少完整结束或请求回执");
+        }
+        if ((measured.completion_tokens_details?.reasoning_tokens ?? 0) > 0) {
+          reject("MODEL_MODE_MISMATCH", "DSH 模型回执与明确禁用思考的策略不一致");
+        }
         writeCompletion(response, completion, body.stream === true);
       })().catch((error: unknown) => {
         proxyError ??= error;
@@ -329,7 +364,8 @@ export function createDshEmployeeExecutor(options: DshEmployeeOptions): Employee
       if (!address || typeof address === "string") reject("DSH_PROXY", "无法绑定本地受控模型代理");
       const endpoint = `http://127.0.0.1:${address.port}/v1`;
       await writeFile(join(profile, "cordis.patch.yml"), await profilePatch(packageRoot, home, workspace, input, endpoint, options.provider.modelId, { maxTokens, maxToolCalls }), { mode: 0o600 });
-      const task = `完成员工任务 ${input.task.id}：${input.task.goal}\n必须读取的上下文：inputs/context.json。依赖文件路径已给出：${JSON.stringify(dependencies)}。可以首轮同时read_file这些文件，不需list_files探索；可以同一轮用多个write_file写齐全部文件。写齐并核对工具成功回执后直接结束，不请求shell或声称测试已运行。严格写齐 outputRefs：${JSON.stringify(input.task.outputRefs)}。\n验收标准：${JSON.stringify(input.task.acceptance)}。`;
+      const task = `完成员工任务 ${input.task.id}：${input.task.goal}\n完整输入数据：${JSON.stringify({ context,
+        dependencyArtifacts: input.dependencyArtifacts.map(({ taskId, path, sha256, content }) => ({ taskId, path, sha256, content })) })}。\n来源可回查：inputs/context.json，${JSON.stringify(dependencies)}。可以同一轮用多个write_file写齐全部文件；不要重新读取已经附齐的输入。写齐并核对工具成功回执后直接结束，不请求shell或声称测试已运行。严格写齐 outputRefs：${JSON.stringify(input.task.outputRefs)}。\n验收标准：${JSON.stringify(input.task.acceptance)}。`;
       const processResult = await runProcess(join(packageRoot, "lib/bin.js"), workspace, home, proxyKey, task, signal, timeoutMs);
       await writeFile(join(home, "stdout.jsonl"), processResult.stdout, { mode: 0o600 });
       await writeFile(join(home, "stderr.log"), processResult.stderr, { mode: 0o600 });
@@ -354,7 +390,7 @@ export function createDshEmployeeExecutor(options: DshEmployeeOptions): Employee
       }
       const sessionEvidence = await durableSessionEvidence(home);
       const receipt = withPmAssetBinding({ adapter: "deepseek-harness-headless", dshVersion: PINNED_DSH_VERSION, sessionId: parsed.sessionId,
-        exitCode: processResult.exitCode, turnEnd: "completed", final: true, modelCalls, proxyRequests, usage, usageComplete: receipts.length === modelCalls,
+        exitCode: processResult.exitCode, turnEnd: "completed", final: true, modelCalls, blockedBeforeSendCalls, proxyRequests, usage, usageComplete: receipts.length + blockedBeforeSendCalls === modelCalls,
         tools: [...DSH_EMPLOYEE_TOOLS], toolCalls: parsed.events.filter((event) => event.type === "tool_call").length,
         toolResults: parsed.events.filter((event) => event.type === "tool_result").map((event) => ({ callId: event.callId, status: event.status })),
         stdoutSha256: createHash("sha256").update(processResult.stdout).digest("hex"), sessionEvidence, modelReceipts: receipts }, binding);
@@ -364,7 +400,8 @@ export function createDshEmployeeExecutor(options: DshEmployeeOptions): Employee
       const failure = dshExecutionFailure(error);
       const interrupted = (error as { dshProcess?: ProcessEvidence } | null)?.dshProcess;
       const receipt: Record<string, unknown> = withPmAssetBinding({ adapter: "deepseek-harness-headless", dshVersion: PINNED_DSH_VERSION, final: false,
-        modelCalls, proxyRequests, usage, usageComplete: receipts.length === modelCalls, modelReceipts: receipts,
+        modelCalls, blockedBeforeSendCalls, proxyRequests, usage, usageComplete: receipts.length + blockedBeforeSendCalls === modelCalls, modelReceipts: receipts,
+        ...(record(proxyError) && record(proxyError.requestReceipt) ? { requestReceipt: proxyError.requestReceipt } : {}),
         ...(interrupted ? { exitCode: interrupted.exitCode, stdoutSha256: createHash("sha256").update(interrupted.stdout).digest("hex") } : {}) }, binding);
       Object.assign(failure, { usage, receipt, modelId: receipts.at(-1)?.model ?? options.provider.modelId, responseId: receipts.at(-1)?.responseId });
       try {

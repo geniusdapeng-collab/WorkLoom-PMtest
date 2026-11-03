@@ -5,6 +5,7 @@
  * VPC 本地模型（F6.7）：policy/adapter 按工作区配置，机制位已留（VPC 版能力门禁 B5 已落）
  */
 export * from "./providers.js";
+export * from "./deepseek-window.js";
 export * from "./router.js";
 export * from "./sink.js";
 export * from "./policy.js";

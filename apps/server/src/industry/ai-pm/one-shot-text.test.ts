@@ -26,16 +26,17 @@ describe("MC-PM-006 default single-file text transport", () => {
     expect(result.receipt).toMatchObject({ transport: "single-file-text", outputPathSource: "server-task-outputRefs",
       rawResponseSha256: createHash("sha256").update(body).digest("hex"), normalization: { attempted: false } });
     expect(result.summary).toContain("evaluation.md"); expect(result.summary).not.toContain("测试通过");
-    expect(complete).toHaveBeenCalledExactlyOnceWith(expect.any(Array), expect.objectContaining({ responseFormat: { type: "text" }, maxTokens: 8192, requireUsage: true }));
-    expect(complete.mock.calls[0]![0][0]!.content).toContain("8192");
-    expect(complete.mock.calls[0]![0][0]!.content).toContain("6");
+    expect(complete).toHaveBeenCalledExactlyOnceWith(expect.any(Array), expect.objectContaining({ responseFormat: { type: "text" }, requireUsage: true }));
+    expect(complete.mock.calls[0]![1]!.maxTokens).toBeUndefined();
+    expect(complete.mock.calls[0]![0][0]!.content).not.toMatch(/8192|3072|4096/);
+    expect(complete.mock.calls[0]![0][0]!.content).toContain("任务要求");
   });
-  it("keeps the smaller single-file budget for employees other than eval-master", async () => {
+  it("uses the complete model window for every employee without role-based output constants", async () => {
     const { provider, complete } = fixture("# 完整需求\n含可测验收项");
     await createOneShotEmployeeExecutor(provider)({ ...input, task: { ...input.task, presetKey: "doc-writer" },
       preset: { ...input.preset, presetKey: "doc-writer" } });
-    expect(complete).toHaveBeenCalledExactlyOnceWith(expect.any(Array), expect.objectContaining({ maxTokens: 3072, responseFormat: { type: "text" } }));
-    expect(complete.mock.calls[0]![0][0]!.content).toContain("3072");
+    expect(complete).toHaveBeenCalledExactlyOnceWith(expect.any(Array), expect.objectContaining({ responseFormat: { type: "text" } }));
+    expect(complete.mock.calls[0]![1]!.maxTokens).toBeUndefined();
   });
   it("never interprets model-reported paths or a JSON-looking body as controller instructions", async () => {
     const body = '{"path":"../../host-file","files":[{"path":"evil.md","content":"model claims a different file"}]} trailing body text';
@@ -59,6 +60,23 @@ describe("MC-PM-006 default single-file text transport", () => {
     expect(error).toMatchObject({ code: "MODEL_RECEIPT_MISSING", receipt: { transport: "single-file-text", final: false } });
     expect((error as { usage?: unknown }).usage).toBeUndefined();
   });
+  it("rejects a different returned model while retaining its billable usage", async () => {
+    const { execute } = fixture("# 完整但来自其它模型", { model: "unexpected-model" });
+    await expect(execute()).rejects.toMatchObject({ code: "MODEL_IDENTITY_MISMATCH",
+      modelId: "unexpected-model", usage: { promptTokens: 23, completionTokens: 11 }, receipt: { final: false } });
+  });
+  it.each([undefined, "", " \t\n"])("rejects a missing or blank response ID %j without losing paid usage", async (responseId) => {
+    const { execute, complete } = fixture("# 完整但缺少可追溯请求回执", { responseId });
+    await expect(execute()).rejects.toMatchObject({ code: "MODEL_RECEIPT_MISSING",
+      usage: { promptTokens: 23, completionTokens: 11 }, receipt: { final: false, usageComplete: true } });
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+  it("rejects nonzero reasoning usage for explicitly disabled thinking", async () => {
+    const { execute } = fixture("# 完整正文", { usage: { prompt_tokens: 23, completion_tokens: 11,
+      total_tokens: 34, completion_tokens_details: { reasoning_tokens: 5 } } });
+    await expect(execute()).rejects.toMatchObject({ code: "MODEL_MODE_MISMATCH",
+      usage: { promptTokens: 23, completionTokens: 11 }, receipt: { final: false } });
+  });
   it("still rejects secrets and excessive file bytes rather than publishing arbitrary text", async () => {
     await expect(fixture(`secret sk-${"f".repeat(32)}`).execute()).rejects.toMatchObject({ code: "SECRET_DETECTED" });
     await expect(fixture("文".repeat(100_000)).execute()).rejects.toMatchObject({ code: "ARTIFACT_TOO_LARGE" });
@@ -68,6 +86,6 @@ describe("MC-PM-006 default single-file text transport", () => {
     const { provider, complete } = fixture(body);
     const result = await createOneShotEmployeeExecutor(provider)({ ...input, task: { ...input.task, outputRefs: ["a.md", "b.md"] } });
     expect(result.files).toHaveLength(2); expect(result.receipt).toMatchObject({ transport: "structured-json", normalization: { attempted: true } });
-    expect(complete).toHaveBeenCalledExactlyOnceWith(expect.any(Array), expect.objectContaining({ responseFormat: { type: "json_object" }, maxTokens: 4096 }));
+    expect(complete).toHaveBeenCalledExactlyOnceWith(expect.any(Array), expect.objectContaining({ responseFormat: { type: "json_object" } }));
   });
 });

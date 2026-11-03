@@ -523,6 +523,7 @@ async function industryOfWorkspace(scope: Scope): Promise<string | null> {
   const cached = industryCache.get(scope.workspaceId);
   if (cached !== undefined) return cached;
   const client = await getAppPool().connect();
+  let discardConnection = false;
   try {
     await client.query("BEGIN");
     await client.query("SELECT set_config('app.workspace_id', $1, true)", [scope.workspaceId]);
@@ -536,9 +537,11 @@ async function industryOfWorkspace(scope: Scope): Promise<string | null> {
     industryCache.set(scope.workspaceId, value);
     return value;
   } catch {
+    // Optional vocabulary failure must not return an aborted transaction to the pool.
+    try { await client.query("ROLLBACK"); } catch { discardConnection = true; }
     // 查询失败不缓存（下次重试），同时不影响规划主链路（围栏词表仍由 runQuest 内部注入）
     return null;
   } finally {
-    client.release();
+    client.release(discardConnection);
   }
 }

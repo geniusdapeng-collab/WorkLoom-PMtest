@@ -1,7 +1,13 @@
 ---
 name: learning-digest
-version: 3.0.0
+version: 3.0.1
 description: 每周学习周刊——三层信息食谱（论文/工程实践/产品动态）+ "与我们产品有什么关系"研判；并产出技能/规则/eval 固化建议。
+delivery_contract:
+  schema: workloom.pm.skill-evidence/v1
+  traceableSourceRequired: true
+  hypothesisSeparate: true
+  actionOwnerAndVerification: true
+  publicationRequiresReceipt: true
 ---
 
 # 学习周刊与固化建议
@@ -20,6 +26,9 @@ description: 每周学习周刊——三层信息食谱（论文/工程实践/�
 3. 每条附"与我们的产品有什么关系"研判（影响哪个功能、要不要行动、谁该看）——不是资讯搬运，是带观点的内参；
 4. 产出**固化建议**：高频重复动作 → "固化为技能"建议；高频驳回模式 → "规则加严 / eval 增补"建议；每条附证据链（重复次数/样本/预期收益）；
 5. 周刊发布走 R-PM1 人审；固化建议单独成卡，**人批准才执行**。
+
+6. 每条观点挂来源/日期或内部案例 ID，分开事实、解释和待验证假设；跨来源重复事件合并，不能把一则转载计成多个独立支持。
+7. 行动建议明确负责人岗位、适用场景、预期收益假设、验证方法、复核时间与不行动代价；高频只证明值得研究，不能证明因果或授权固化。没有实际发布/知识库回执只交周刊草稿。
 
 ## 四、边界与围栏
 - 权限面：周刊与建议写库（R-PM1 人审）；绝不自动执行固化。
