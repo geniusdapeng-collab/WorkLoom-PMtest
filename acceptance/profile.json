@@ -1,18 +1,18 @@
 {
   "schemaVersion": "workloom.acceptance-profile/v2",
-  "repo": "geniusdapeng-collab/workloom-pm",
-  "productName": "WorkLoom PM",
+  "repo": "geniusdapeng-collab/WorkLoom-PMtest",
+  "productName": "WorkLoom PMtest",
   "lane": "industry",
   "primaryBundle": "ai-pm",
   "workspaceId": null,
   "dataMode": "simulated",
   "startup": {
-    "command": "WORKLOOM_SCHEDULER_MS=0 SERVER_HOST=127.0.0.1 SERVER_PORT=8987 WEB_PORT=5373 WEBB_PORT=5375 WEBC_PORT=5376 pnpm exec concurrently -k -n server,pc,b-mobile,c-mobile \"pnpm -C apps/server start\" \"pnpm -C apps/web exec vite --host 127.0.0.1 --port 5373 --strictPort\" \"pnpm -C apps/webb exec vite --host 127.0.0.1 --port 5375 --strictPort\" \"pnpm -C apps/webc exec vite --host 127.0.0.1 --port 5376 --strictPort\"",
+    "command": "WORKLOOM_SCHEDULER_MS=0 SERVER_HOST=127.0.0.1 SERVER_PORT=9018 WEB_PORT=5404 WEBB_PORT=5406 WEBC_PORT=5407 pnpm exec concurrently -k -n server,pc,b-mobile,c-mobile \"pnpm -C apps/server start\" \"pnpm -C apps/web exec vite --host 127.0.0.1 --port 5404 --strictPort\" \"pnpm -C apps/webb exec vite --host 127.0.0.1 --port 5406 --strictPort\" \"pnpm -C apps/webc exec vite --host 127.0.0.1 --port 5407 --strictPort\"",
     "ports": {
-      "pc": 5373,
-      "bMobile": 5375,
-      "cMobile": 5376,
-      "server": 8987
+      "pc": 5404,
+      "bMobile": 5406,
+      "cMobile": 5407,
+      "server": 9018
     },
     "entryRoute": "/development",
     "notes": "显式四进程源码命令：使用现有 server start 与三个 Vite 入口；仅 loopback，前端 strictPort，不迁移、不 seed、不清理或接管已有端口。执行前须配置本产品独立测试数据库与受控模型预算；启动会包含既有恢复逻辑，不能指向原 IM/客户数据库。本轮仅验证声明，未执行此启动命令；这些是声明端口，不是已启动证据。"
@@ -136,7 +136,7 @@
         "id": "U-01",
         "persona": "owner",
         "stage": "first-run",
-        "title": "首启看到价值与待拍板",
+        "title": "首启看到 PM 交付工作台",
         "mot": true
       },
       {
@@ -292,8 +292,8 @@
       "acceptance/outcomes/industry.yaml"
     ],
     "receipts": [],
-    "fixtureMarker": "suite.rdas.workloom-pm",
-    "residualDisclosure": "本产品验收若另行获准派单，会保留带 suite.rdas.workloom-pm 标记的线程和事件；不删除审计链，须列明残留并排除 ADR/HIR 与经营指标。本轮 validate-only 不派单、不生成回执。"
+    "fixtureMarker": "suite.rdas.workloom-pmtest",
+    "residualDisclosure": "本产品验收若另行获准派单，会保留带 suite.rdas.workloom-pmtest 标记的线程和事件；不删除审计链，须列明残留并排除 ADR/HIR 与经营指标。本轮 validate-only 不派单、不生成回执。"
   },
   "autonomy": {
     "interventionTaxonomy": "H0-H4",
@@ -329,10 +329,10 @@
     "allowWrites": false,
     "supportDir": null,
     "target": {
-      "apiUrl": "http://localhost:8987",
-      "pcUrl": "http://localhost:5373",
-      "bMobileUrl": "http://localhost:5375",
-      "cMobileUrl": "http://localhost:5376"
+      "apiUrl": "http://localhost:9018",
+      "pcUrl": "http://localhost:5404",
+      "bMobileUrl": "http://localhost:5406",
+      "cMobileUrl": "http://localhost:5407"
     },
     "notes": "默认仅声明本产品本地源码预览档位，数据为 simulated、allowWrites=false；不得将其当作已安装客户端或生产验收。本轮只执行只读配置校验，未连接这些目标；真实受控模型评测由独立 PM driver 与逐请求预算证据约束。"
   },
@@ -417,11 +417,11 @@
       "script": "builtin:dry-run"
     }
   ],
-  "notes": "独立 WorkLoom PM 默认验收声明：/development 为首入口，四端声明使用本产品偏移端口，不复用旧 IM 的 preview:all/默认端口/数据库。276 全清单保留；通用 O 域保留 chief-pm 澄清正常 k=5、输入失败、无身份三路径合同；新 PM 团队代表目标见 pmEvaluation。原生图、视频、宿主 bash 和其它上游任务仅作为继承资产留档，不授权本轮执行。profile-check 与 outcome --validate-only 必须保持业务未验证，真实模型、UI、长跑及完整 RDAS 需独立实际证据。",
+  "notes": "独立 WorkLoom PMtest 默认验收声明：/development 为首入口，四端声明使用本产品偏移端口，不复用旧 IM 的 preview:all/默认端口/数据库。276 全清单保留；通用 O 域保留 chief-pm 澄清正常 k=5、输入失败、无身份三路径合同；新 PM 团队代表目标见 pmEvaluation。原生图、视频、宿主 bash 和其它上游任务仅作为继承资产留档，不授权本轮执行。profile-check 与 outcome --validate-only 必须保持业务未验证，真实模型、UI、长跑及完整 RDAS 需独立实际证据。",
   "isolation": {
     "independentProduct": true,
     "isolated": true,
-    "productRepository": "geniusdapeng-collab/workloom-pm",
+    "productRepository": "geniusdapeng-collab/WorkLoom-PMtest",
     "sourceProfileRepository": "workloom-ai/workloom-im",
     "upstreamProfile": "docs/upstream/acceptance-profile.json",
     "upstreamProfileSha256": "f9e92ab4ad94513ed69f7c239e17dc6a3844567265fc975873b9ff71fa6042c8",

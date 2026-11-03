@@ -48,6 +48,12 @@ describe("credential boundaries in complete employee data and DSH receipts", () 
     expect(() => assertNoSecrets({ receipt: { sessionEvidence: [{ path: "prefix" + credential + "suffix" }] } })).toThrow("已阻断");
   });
 
+  it("rejects a nonstandard PM loopback credential before an event can be saved", () => {
+    const fixtureValue = ["local", "fixture", "transport", "value"].join("-");
+    vi.stubEnv("PM_MODEL_API_KEY", fixtureValue);
+    expect(() => assertNoSecrets({ input: { goal: "test " + fixtureValue } })).toThrow("已阻断");
+  });
+
   it("also rejects configured values that are JSON-escaped and never echoes them", () => {
     const credential = 'fixture-configured-"quoted"\ncredential';
     vi.stubEnv("LLM_API_KEY", credential);

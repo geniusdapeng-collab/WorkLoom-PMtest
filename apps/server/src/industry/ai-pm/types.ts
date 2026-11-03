@@ -1,6 +1,8 @@
 import type { AssembledPreset } from "@workloom/runtime";
 import type { CompletionProvider } from "@workloom/base/model-router";
+import type { PmEventSummary } from "./event-contract.js";
 import type { RuleImpact } from "@workloom/base/fence-engine";
+import type { SearchReceipt } from "./search-context.js";
 
 export interface PmScope { tenantId: string; workspaceId: string }
 export type PmRunStatus = "created" | "planning" | "running" | "paused" | "blocked" | "failed" | "completed" | "cancelled";
@@ -54,6 +56,10 @@ export interface EmployeeExecutionInput {
   dependencyArtifacts: DependencyArtifact[];
   /** Server-owned, metered prior review observations. They are input data, not saved plan requirements. */
   semanticRetryObservation?: string;
+  /** Server-read thread excerpts, scoped to the run and bounded before delivery. */
+  followups?: ReadonlyArray<PmEventSummary & { source: string }>;
+  publicEvidence?: SearchReceipt;
+  contextSpill?: Array<{ eventId: string; text: string }>;
   /** Server-controlled, newly created private scratch directory, never supplied by the HTTP client. */
   outputDir: string;
   signal: AbortSignal;
@@ -79,6 +85,7 @@ export interface PmTask extends PmTaskPlan {
   startedAt: string | null; finishedAt: string | null;
 }
 export interface PmRun {
+  threadId?: string;
   id: string; goal: string; idempotencyKey: string; requestedEmployee: string | null;
   checks: ArtifactCheck[]; status: PmRunStatus; modelId: string; planVersion: number;
   createdBy: string; createdAt: string; updatedAt: string; error: string | null;

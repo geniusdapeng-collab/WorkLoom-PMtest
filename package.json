@@ -1,7 +1,7 @@
 {
-  "name": "workloom-pm",
-  "productName": "WorkLoom PM",
-  "workloomPortOffset": 200,
+  "name": "workloom-pmtest",
+  "productName": "WorkLoom PMtest",
+  "workloomPortOffset": 231,
   "workloomStartPath": "/development",
   "version": "0.1.3",
   "private": true,
@@ -124,5 +124,5 @@
     "vitest": "^5.0.1",
     "yaml": "2.9.0"
   },
-  "description": "WorkLoom PM · AI 产品经理带领 AI 研发团队，从用户意图到真实产物、验证与交付回执"
+  "description": "WorkLoom PMtest · AI 产品经理带领 AI 研发团队，从用户意图到真实产物、验证与交付回执"
 }

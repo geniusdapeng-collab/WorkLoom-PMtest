@@ -4,8 +4,8 @@
 #       (+pgvector) + nats-server + 产品载荷，用户机零依赖；首启由
 #       apps/desktop/electron/bootstrap.cjs 自动完成装配→initdb→迁移→种子→起服务，
 #       客户端窗口即产品（不再打开外部浏览器）。
-appId: com.workloom.pm
-productName: WorkLoom PM
+appId: com.workloom.pmtest
+productName: WorkLoom PMtest
 copyright: Copyright © 2026 WorkLoom
 directories:
   output: release
@@ -30,10 +30,10 @@ extraResources:
     to: payload/PAYLOAD_VERSION
 extraMetadata:
   main: apps/desktop/electron/main.cjs
-  name: workloom-pm
-  productName: WorkLoom PM
+  name: workloom-pmtest
+  productName: WorkLoom PMtest
   # 行业版必须在自己的构建配置中声明唯一偏移；基座主进程禁止维护行业仓名称表。
-  workloomPortOffset: 200
+  workloomPortOffset: 231
   workloomStartPath: /development
 asar: true
 # 产物名带平台与架构、**不带版本号**——文件名恒定才能支撑
@@ -51,7 +51,7 @@ nsis:
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
-  shortcutName: WorkLoom PM
+  shortcutName: WorkLoom PMtest
 
 # macOS：DMG（按架构分包：arm64 / x64——载荷内 Node 为架构专属，不打 universal）
 mac:

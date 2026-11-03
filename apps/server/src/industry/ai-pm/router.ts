@@ -5,6 +5,7 @@ import { hasCapability, type Identity } from "@workloom/base/tenancy";
 import { createContext, type TrpcContext } from "../../trpc/context.js";
 import { AccessAuthorityError, currentMemberAuthority, memberAccessGrants } from "../../service/access-authority.js";
 import { CreatePmRunSchema, safeArtifactPath } from "./contract.js";
+import { PmEventId, PmThreadEventSchema } from "./event-contract.js";
 import { PmTeamService, type PmTeamServiceOptions } from "./service.js";
 import { PmError, type PmScope } from "./types.js";
 
@@ -107,9 +108,32 @@ export function createPmTeamRouter(options: PmRouterOptions = {}) {
     const result = await getService().create(actor.scope, CreatePmRunSchema.parse(await readJson(context.req.raw)), actor.identity.memberNo);
     return context.json(result.detail, result.created ? 201 : 200);
   });
+  app.post("/events", async (context) => {
+    allowedQuery(context.req.raw, []);
+    const actor = context.get("pm");
+    const event = PmThreadEventSchema.parse(await readJson(context.req.raw));
+    const receipt = await getService().receiveEvent(actor.scope, event, actor.identity.memberNo);
+    return context.json(receipt, receipt.replayed ? 200 : event.kind === "request" ? 202 : 201);
+  });
+  app.get("/threads/:id/events", async (context) => {
+    const query = allowedQuery(context.req.raw, ["limit"]);
+    const limit = z.coerce.number().int().min(1).max(50).parse(query.get("limit") ?? 20);
+    const events = await getService().listThreadEvents(context.get("pm").scope, PmEventId.parse(context.req.param("id")), limit);
+    return context.json({ events });
+  });
+  app.get("/threads/:id/events/:eventId", async (context) => {
+    allowedQuery(context.req.raw, []);
+    const event = await getService().getThreadEvent(context.get("pm").scope,
+      PmEventId.parse(context.req.param("id")), PmEventId.parse(context.req.param("eventId")));
+    return context.json({ event });
+  });
   app.get("/runs/:id", async (context) => {
     allowedQuery(context.req.raw, []);
     return context.json(await getService().detail(context.get("pm").scope, RunId.parse(context.req.param("id"))));
+  });
+  app.get("/runs/:id/search-evidence", async (context) => {
+    allowedQuery(context.req.raw, []);
+    return context.json(await getService().searchEvidence(context.get("pm").scope, RunId.parse(context.req.param("id"))));
   });
   app.get("/runs/:id/artifacts", async (context) => {
     const query = allowedQuery(context.req.raw, ["path"]);

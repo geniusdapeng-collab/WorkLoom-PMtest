@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Historical upstream deployment. PMtest has no authorized Linux target.
+printf '%s\n' 'WorkLoom PMtest: inherited Linux deployment is disabled; use the source setup in README.md.' >&2
+exit 78
+
 archive="${1:-}"
 target="${2:-/var/lib/workloom-pm-restore-check}"
 if [[ -z "$archive" || ! -f "$archive" ]]; then

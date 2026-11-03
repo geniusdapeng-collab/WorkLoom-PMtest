@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Historical upstream deployment. PMtest has no authorized Linux target.
+printf '%s\n' 'WorkLoom PMtest: inherited Linux deployment is disabled; use the source setup in README.md.' >&2
+exit 78
+
 domain="${1:-pm.pengmanager.com}"
 template="${2:-/opt/workloom-pm/current/deploy/linux/nginx-workloom-pm.conf}"
 [[ "$(id -u)" == 0 ]] || { printf 'Run as root.\n' >&2; exit 1; }

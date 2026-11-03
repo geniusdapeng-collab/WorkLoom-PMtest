@@ -1,5 +1,9 @@
 import { createRequire } from "node:module";
 
+// Historical upstream deployment. Exit before loading pg or accessing roles.
+console.error("WorkLoom PMtest: inherited Linux deployment is disabled; use the source setup in README.md.");
+process.exit(78);
+
 const requireFromRelease = createRequire(new URL("../../package.json", import.meta.url));
 const pg = requireFromRelease("pg");
 

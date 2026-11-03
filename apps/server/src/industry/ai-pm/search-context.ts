@@ -1,0 +1,147 @@
+import { createHash } from "node:crypto";
+import { createDeepSeekTools, type DeepSeekToolsConfig } from "@workloom/base/model-router";
+import { getAppPool, withWorkspace } from "@workloom/db";
+import { assertNoSecrets } from "./contract.js";
+import { PmError, type PmScope } from "./types.js";
+
+export interface SearchReceipt {
+  provider: "deepseek";
+  querySha256: string;
+  search: { resultCount: number };
+  fetch: { url: string; title: string; contentSha256: string; excerpt: string };
+}
+
+const digest = (text: string) => createHash("sha256").update(text).digest("hex");
+const record = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+
+function publicResult(value: unknown): string | undefined {
+  if (!record(value) || typeof value.url !== "string") return;
+  try {
+    const url = new URL(value.url);
+    if (url.protocol === "https:" && !url.username && !url.password && !url.search && !url.hash) return url.href;
+  } catch { return; }
+}
+
+async function liveSearch(query: string, signal: AbortSignal, config: DeepSeekToolsConfig): Promise<SearchReceipt> {
+  const [search, fetchPage] = createDeepSeekTools(config);
+  if (!search || !fetchPage) throw new PmError("SEARCH_NOT_CONFIGURED", "DeepSeek 公共搜索工具未就绪", 503);
+  const results = await search.execute({ query, count: 5, need_content: false }, { signal });
+  if (!record(results) || !Array.isArray(results.results)) throw new PmError("SEARCH_PROTOCOL", "DeepSeek 搜索结果协议异常", 502);
+  const url = results.results.map(publicResult).find((candidate): candidate is string => Boolean(candidate));
+  if (!url) throw new PmError("SEARCH_EVIDENCE_MISSING", "DeepSeek 未返回可抓取的公开证据", 502);
+  const page = await fetchPage.execute({ url }, { signal });
+  if (!record(page) || typeof page.content !== "string" || !page.content.trim()
+    || typeof page.title !== "string" || page.url !== url) {
+    throw new PmError("SEARCH_EVIDENCE_MISSING", "DeepSeek 未返回与来源绑定的正文", 502);
+  }
+  const receipt: SearchReceipt = {
+    provider: "deepseek",
+    querySha256: digest(query),
+    search: { resultCount: results.results.length },
+    fetch: { url, title: page.title, contentSha256: digest(page.content), excerpt: Array.from(page.content).slice(0, 3500).join("") },
+  };
+  assertNoSecrets(receipt);
+  return receipt;
+}
+
+async function requireLease(scope: PmScope, runId: string, owner: string): Promise<void> {
+  const active = await withWorkspace(getAppPool(), scope, async (_db, client) => client.query(
+    `SELECT id FROM pm_runs WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND lease_owner=$4
+      AND status IN ('planning','running') AND lease_expires_at > now()`,
+    [runId, scope.tenantId, scope.workspaceId, owner],
+  ));
+  if (active.rowCount !== 1) throw new PmError("RUN_LEASE_LOST", "搜索前执行租约已失效", 409);
+}
+
+export async function readPmSearchEvidence(scope: PmScope, runId: string): Promise<SearchReceipt | null> {
+  return withWorkspace(getAppPool(), scope, async (_db, client) => {
+    const result = await client.query<{ evidence: SearchReceipt | null }>(
+      "SELECT evidence FROM pm_superagent_search WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3",
+      [runId, scope.tenantId, scope.workspaceId],
+    );
+    return result.rows[0]?.evidence ?? null;
+  });
+}
+
+function searchTransport(): Pick<DeepSeekToolsConfig, "apiKey" | "fetch"> {
+  const pmBase = process.env.PM_MODEL_BASE_URL?.trim();
+  const rawBase = pmBase || process.env.LLM_BASE_URL || process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
+  const base = new URL(rawBase);
+  const local = base.protocol === "http:" && base.hostname === "127.0.0.1" && base.port
+    && base.pathname === "/" && !base.search && !base.hash && !base.username && !base.password;
+  const modelKey = (pmBase ? process.env.PM_MODEL_API_KEY : process.env.LLM_API_KEY)?.trim();
+  if (local && process.env.PM_SEARCH_USE_LOOPBACK === "1" && modelKey) {
+    return {
+      apiKey: modelKey,
+      fetch: (url, init) => {
+        const pathname = new URL(String(url)).pathname;
+        if (pathname !== "/v1/tools/search" && pathname !== "/v1/tools/fetch") throw new Error("Unexpected search transport path");
+        return fetch(new URL(pathname, base.origin), init);
+      },
+    };
+  }
+  if (base.origin === "https://api.deepseek.com" && !base.username && !base.password) {
+    const key = process.env.PM_MODEL_API_KEY?.trim() || process.env.LLM_API_KEY?.trim() || process.env.DEEPSEEK_API_KEY?.trim();
+    if (key) return { apiKey: key };
+  }
+  throw new PmError("SEARCH_NOT_CONFIGURED", "公开搜索需要 DeepSeek 官方连接或显式启用的本机预算代理", 503);
+}
+
+/** A reservation survives a crash or ambiguous vendor response. Resume can reuse settled evidence only. */
+export async function collectPmSearchEvidence(scope: PmScope, runId: string, owner: string, query: string, signal: AbortSignal, authorize: () => Promise<void>): Promise<SearchReceipt> {
+  assertNoSecrets(query);
+  signal.throwIfAborted();
+  const transport = searchTransport();
+  await authorize();
+  const querySha256 = digest(query);
+  const keys = [runId, scope.tenantId, scope.workspaceId] as const;
+  const reservation = await withWorkspace(getAppPool(), scope, async (_db, client) => {
+    const run = await client.query(
+      `SELECT id FROM pm_runs WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND lease_owner=$4
+        AND status IN ('planning','running') AND lease_expires_at > now() FOR UPDATE`,
+      [...keys, owner],
+    );
+    if (run.rowCount !== 1) throw new PmError("RUN_LEASE_LOST", "搜索前执行租约已失效", 409);
+    const inserted = await client.query(
+      `INSERT INTO pm_superagent_search(run_id, tenant_id, workspace_id, query_sha256) VALUES ($1,$2,$3,$4)
+       ON CONFLICT DO NOTHING RETURNING run_id`,
+      [...keys, querySha256],
+    );
+    if (inserted.rowCount === 1) return { created: true as const };
+    const saved = await client.query<{ query_sha256: string; evidence: SearchReceipt | null }>(
+      "SELECT query_sha256, evidence FROM pm_superagent_search WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3",
+      [...keys],
+    );
+    return { created: false as const, prior: saved.rows[0] };
+  });
+  if (!reservation.created) {
+    if (reservation.prior?.query_sha256 === querySha256 && reservation.prior.evidence) return reservation.prior.evidence;
+    throw new PmError("SEARCH_RECEIPT_UNSETTLED", "此前搜索尚无已核验回执，已冻结重复调用", 409);
+  }
+  let receipt: SearchReceipt;
+  try {
+    receipt = await liveSearch(query, signal, {
+      ...transport, timeoutMs: 60_000,
+      beforeRequest: async () => {
+        signal.throwIfAborted();
+        await authorize();
+        await requireLease(scope, runId, owner);
+      },
+    });
+  } catch (error) {
+    signal.throwIfAborted();
+    if (error instanceof PmError) throw error;
+    throw new PmError("SEARCH_RECEIPT_UNSETTLED", "DeepSeek 搜索或抓取未取得完整回执，已保留执行记录", 502);
+  }
+  await withWorkspace(getAppPool(), scope, async (_db, client) => {
+    const result = await client.query(
+      `UPDATE pm_superagent_search SET evidence=$4::jsonb,completed_at=now()
+       WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3 AND completed_at IS NULL`,
+      [...keys, JSON.stringify(receipt)],
+    );
+    if (result.rowCount !== 1) throw new PmError("SEARCH_RECEIPT_UNSETTLED", "DeepSeek 搜索回执未能可靠落库", 503);
+  });
+  signal.throwIfAborted();
+  return receipt;
+}

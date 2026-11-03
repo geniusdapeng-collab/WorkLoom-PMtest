@@ -1,9 +1,9 @@
 {
   "schemaVersion": "workloom.runtime-deps/v1",
   "product": {
-    "productId": "workloom-pm",
+    "productId": "workloom-pmtest",
     "role": "industry",
-    "repository": "geniusdapeng-collab/workloom-pm",
+    "repository": "geniusdapeng-collab/WorkLoom-PMtest",
     "includePlatformOps": false
   },
   "npmVersion": "11.17.0",
@@ -32,7 +32,7 @@
     },
     {
       "path": "package.json",
-      "sha256": "930f4c3ca781b1d4b2facdf22a5df43fe71ab44f23dc842cf19a221d5d9dfedc"
+      "sha256": "8cea1e058543a1ee2bdbe74597de907d5132687bab05bb8ce7d9643fe84fc6dc"
     },
     {
       "path": "packages/base/package.json",
@@ -64,7 +64,7 @@
     },
     {
       "path": "product.manifest.json",
-      "sha256": "d0980faba3e61d01a2801242e3f65c94b5ce481e9e495cea749d25abf9e97b88"
+      "sha256": "7ca8bb5e6bc3e15680437562bd847e8501da2c30d52d85225e2d1ca0cf181f8a"
     },
     {
       "path": "scripts/pack-nm-merge.mjs",

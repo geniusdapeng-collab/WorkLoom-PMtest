@@ -1,22 +1,22 @@
 {
   "schemaVersion": "workloom.product/v1",
-  "productId": "workloom-pm",
+  "productId": "workloom-pmtest",
   "role": "industry",
-  "displayName": "WorkLoom PM",
-  "packageName": "workloom-pm",
-  "repository": "geniusdapeng-collab/workloom-pm",
+  "displayName": "WorkLoom PMtest",
+  "packageName": "workloom-pmtest",
+  "repository": "geniusdapeng-collab/WorkLoom-PMtest",
   "defaultBundle": "ai-pm",
   "demoWorkspaceSlug": "ai-pm-demo",
   "demoMemberNo": "MEM-001",
   "release": {
-    "appId": "com.workloom.pm",
+    "appId": "com.workloom.pmtest",
     "channel": "stable",
-    "artifactPrefix": "WorkLoom PM",
+    "artifactPrefix": "WorkLoom PMtest",
     "workflow": ".github/workflows/desktop-production-release.yml",
     "website": "apps/site"
   },
   "desktop": {
-    "portOffset": 200,
+    "portOffset": 231,
     "startPath": "/development"
   },
   "clients": {
