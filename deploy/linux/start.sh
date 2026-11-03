@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Historical upstream deployment. PMtest has no authorized Linux target.
+printf '%s\n' 'WorkLoom PMtest: inherited Linux deployment is disabled; use the source setup in README.md.' >&2
+exit 78
+
 release_root="${WORKLOOM_RELEASE_ROOT:-/opt/workloom-pm/current}"
 node_bin="${WORKLOOM_NODE_BIN:-/opt/workloom-pm/runtime/current/bin/node}"
 

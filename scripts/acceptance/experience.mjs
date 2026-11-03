@@ -11,7 +11,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { cliArgs, findRepoRoot, loadProfile, urlsOf } from "./lib/profile.mjs";
 import { loadChromium } from "./lib/playwright.mjs";
-import { countDecisionSignals, firstValuePassed, isFirstValueText } from "./lib/experience-rules.mjs";
+import { countDecisionSignals, firstValuePassed, isFirstValueText, isPmProduct } from "./lib/experience-rules.mjs";
 import { loginAsMember, productIdOf } from "./lib/session.mjs";
 
 const args = cliArgs();
@@ -92,7 +92,8 @@ async function firstValue() {
   await page.goto(`${URLs.pc}${R.home}`, { waitUntil: "domcontentloaded" });
   let ceremony = false;
   let skipMs = null;
-  const pmHome = productIdOf(REPO_ROOT) === "workloom-pm";
+  const currentProduct = productIdOf(REPO_ROOT);
+  const pmHome = isPmProduct(currentProduct);
   let text = "";
   let valueMs = 0;
   // 开场组件与业务内容都可能按需加载；同一预算内等待“跳过按钮或首价值”，谁先出现先处理。
@@ -105,21 +106,22 @@ async function firstValue() {
     }
     text = await page.evaluate(() => document.body.innerText);
     valueMs = now() - t0;
-    if (isFirstValueText(pmHome ? "workloom-pm" : "legacy", text)) break;
+    if (isFirstValueText(currentProduct, text)) break;
     await page.waitForTimeout(250);
   }
   const decisions = countDecisionSignals(text);
   return {
     id: "EXP-01", persona: "owner", journey: "首启（0–10 分钟）", dimension: "首启与首价值 / 掌控感",
-    name: "打开工作台即看到今日经营与待拍板事项",
+    name: pmHome ? "打开工作台即看到就绪员工和项目目标" : "打开工作台即看到今日经营与待拍板事项",
     precondition: "成员态登录，演示数据已种子",
-    steps: ["打开首页", "（首启）1 次点击跳过欢迎仪式", "计时到出现晨报/待决"],
-    expected: `首启仪式可跳过；T+${T.firstValueMs / 1000}s 内见价值；决策包 ≤${T.decisionQuota} 件/日`,
+    steps: ["打开首页", "（首启）1 次点击跳过欢迎仪式", pmHome ? "计时到出现 PM 交付工作台" : "计时到出现晨报/待决"],
+    expected: pmHome ? `T+${T.firstValueMs / 1000}s 内显示就绪员工和项目目标`
+      : `首启仪式可跳过；T+${T.firstValueMs / 1000}s 内见价值；决策包 ≤${T.decisionQuota} 件/日`,
     actual: { 有欢迎仪式: ceremony, 跳过毫秒: skipMs, 首次价值毫秒: valueMs, 待决提及: decisions },
     metric: `首次价值 ${(valueMs / 1000).toFixed(1)}s`,
     evidence: await shot(page, "exp-01-first-value"),
     pass: firstValuePassed({
-      productId: pmHome ? "workloom-pm" : "legacy",
+      productId: currentProduct,
       text,
       elapsedMs: valueMs,
       budgetMs: T.firstValueMs,

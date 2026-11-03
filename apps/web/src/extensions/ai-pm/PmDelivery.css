@@ -69,6 +69,17 @@
 .pm-run-goal { font-size: var(--wl-text-h2); font-weight: 500; line-height: 1.9; margin: 0 0 16px; max-height: 220px; overflow: auto; white-space: pre-wrap; }
 .pm-run-actions { align-items: center; border-bottom: 1px solid var(--wl-color-border); display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; padding-bottom: 18px; }
 .pm-run-actions > span { color: var(--wl-color-text-muted); font-size: var(--wl-text-body); }
+.pm-thread { border-bottom: 1px solid var(--wl-color-border); margin-bottom: 20px; padding-bottom: 20px; }
+.pm-thread-heading { align-items: center; display: flex; flex-wrap: wrap; gap: 8px; justify-content: space-between; }
+.pm-thread-heading h3 { font-size: var(--wl-text-h2); margin: 0; }
+.pm-thread-heading h4 { font-size: var(--wl-text-body); margin: 0; }
+.pm-thread-heading time { color: var(--wl-color-text-muted); font-size: var(--wl-text-body); }
+.pm-thread-events { display: grid; gap: 8px; list-style: none; margin: 8px 0 14px; max-height: 280px; overflow: auto; padding: 0; }
+.pm-thread-events li, .pm-thread-original { background: var(--wl-color-surface-raised); border: 1px solid var(--wl-color-border); border-radius: var(--wl-radius-sm); padding: 10px 12px; }
+.pm-thread-events p, .pm-thread-original p { font-size: var(--wl-text-body); line-height: 1.8; margin: 6px 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.pm-thread-original { margin-bottom: 12px; max-height: 320px; overflow: auto; }
+.pm-thread-compose { display: grid; gap: 10px; }
+.pm-thread-compose > .wl-button { justify-self: start; }
 .pm-task-list { display: grid; gap: 12px; list-style: none; margin: 0; padding: 0; }
 .pm-task-list > li { min-width: 0; }
 .pm-task.wl-card { background: var(--wl-color-surface-raised); padding: 16px; }

@@ -12,6 +12,11 @@ function fixture(options: { currentRole?: Identity["role"]; permissions?: Record
     create: vi.fn(async () => ({ created: true, detail: { run: { id: "pm-a", status: "created" }, tasks: [], artifacts: [] } })),
     start: vi.fn(async () => ({ run: { id: "pm-a", status: "planning" }, tasks: [], artifacts: [] })),
     cancel: vi.fn(async () => ({ run: { id: "pm-a", status: "cancelled" }, tasks: [], artifacts: [] })),
+    receiveEvent: vi.fn(async (_scope, event: { kind: string; eventId: string; threadId: string }) => ({
+      eventId: event.eventId, threadId: event.threadId, runId: "pm-a", decision: event.kind === "request" ? "admitted" : "attached", replayed: false,
+    })),
+    listThreadEvents: vi.fn(async () => [{ eventId: "e-1", threadId: "t-1", excerpt: "safe" }]),
+    getThreadEvent: vi.fn(async () => ({ eventId: "e-1", threadId: "t-1", text: "safe full text" })),
     artifact: vi.fn(async () => ({ path: "result.md", content: "safe", sha256: "a".repeat(64), mediaType: "text/markdown" })),
   };
   const authority = vi.fn(async (claim: Identity) => ({ identity: { ...claim, ...base, role: options.currentRole ?? "owner", plan: options.plan ?? "pro", memberNo: claim.memberNo === "GUEST" ? "GUEST" : base.memberNo }, permissions: options.permissions ?? {} }));
@@ -79,5 +84,52 @@ describe("MC-PM-002 HTTP当前成员鉴权与输入边界", () => {
     }
     expect(service.create).not.toHaveBeenCalled();
     expect(service.artifact).not.toHaveBeenCalled();
+  });
+});
+
+describe("PM 原生事件 HTTP", () => {
+  const scope = { tenantId: base.tenantId, workspaceId: base.workspaceId };
+  const request = { kind: "request", eventId: "e-1", threadId: "t-1", input: { goal: "起草完整验收说明", searchQuery: "公开资料" } };
+  const post = (app: ReturnType<typeof createPmTeamRouter>, body: unknown, sentHeaders = headers) =>
+    app.request("/events", { method: "POST", headers: sentHeaders, body: JSON.stringify(body) });
+
+  it("明确接单、追问与重复事件回执遵守各自合同", async () => {
+    const { app, service } = fixture();
+    const created = await post(app, request);
+    expect(created.status).toBe(202);
+    expect(await created.json()).toEqual({ eventId: "e-1", threadId: "t-1", runId: "pm-a", decision: "admitted", replayed: false });
+    expect(service.receiveEvent).toHaveBeenCalledWith(scope, request, base.memberNo);
+    const reply = { kind: "followup", eventId: "e-2", threadId: "t-1", text: "补充" };
+    expect((await post(app, reply)).status).toBe(201);
+    expect(service.receiveEvent).toHaveBeenLastCalledWith(scope, reply, base.memberNo);
+    service.receiveEvent.mockResolvedValueOnce({ eventId: "e-1", threadId: "t-1", runId: "pm-a", decision: "admitted", replayed: true });
+    expect((await post(app, request)).status).toBe(200);
+  });
+
+  it("实时权限先于事件派发，拒绝伪造来源身份、范围和执行选项", async () => {
+    const denied = fixture({ permissions: { deny: ["task.dispatch"] } });
+    expect((await post(denied.app, request)).status).toBe(403);
+    expect(denied.service.receiveEvent).not.toHaveBeenCalled();
+    const { app, service } = fixture();
+    for (const body of [
+      { ...request, actor: "MEM-forged" }, { ...request, workspaceId: "other" }, { ...request, source: "github" },
+      { ...request, eventId: "../bad" }, { ...request, input: { ...request.input, idempotencyKey: "forged" } },
+      { kind: "followup", eventId: "x", threadId: "t-1", text: " " },
+    ]) expect((await post(app, body)).status).toBe(400);
+    expect(service.receiveEvent).not.toHaveBeenCalled();
+  });
+
+  it("只用认证工作区读取有界列表及指定原文，查询参数不能注入范围", async () => {
+    const { app, service } = fixture();
+    const list = await app.request("/threads/t-1/events?limit=7", { headers });
+    expect(await list.json()).toEqual({ events: [{ eventId: "e-1", threadId: "t-1", excerpt: "safe" }] });
+    expect(service.listThreadEvents).toHaveBeenCalledWith(scope, "t-1", 7);
+    const full = await app.request("/threads/t-1/events/e-1", { headers });
+    expect(await full.json()).toEqual({ event: { eventId: "e-1", threadId: "t-1", text: "safe full text" } });
+    expect(service.getThreadEvent).toHaveBeenCalledWith(scope, "t-1", "e-1");
+    for (const path of ["/threads/t-1/events?limit=51", "/threads/t-1/events?limit=1&limit=2", "/threads/t-1/events/e-1?workspaceId=other"]) {
+      expect((await app.request(path, { headers })).status).toBe(400);
+    }
+    expect((await app.request("/threads/t-1/events/e-1")).status).toBe(401);
   });
 });

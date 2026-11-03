@@ -40,3 +40,15 @@ test("Linux deployment scripts are syntactically valid", () => {
   const bootstrap = spawnSync(process.execPath, ["--check", join(deployRoot, "bootstrap-db.mjs")], { encoding: "utf8" });
   assert.equal(bootstrap.status, 0, bootstrap.stderr);
 });
+
+test("PMtest refuses inherited Linux deployment entrypoints before resolving host tools or configuration", () => {
+  const env = { PATH: "/nonexistent-pmtest-command-path", WORKLOOM_RELEASE_ROOT: "/opt/workloom-pm/current",
+    WORKLOOM_DB_NAME: "workloom_pm" };
+  for (const name of ["install.sh", "configure-nginx.sh", "start.sh", "backup.sh", "restore-check.sh", "bootstrap-db.mjs"]) {
+    const command = name.endsWith(".mjs") ? process.execPath : "/bin/bash";
+    const blocked = spawnSync(command, [join(deployRoot, name)], { env, encoding: "utf8" });
+    assert.equal(blocked.status, 78, `${name}: ${blocked.error ?? blocked.stderr}`);
+    assert.match(blocked.stderr, /WorkLoom PMtest: inherited Linux deployment is disabled/);
+    assert.equal(blocked.stdout, "");
+  }
+});

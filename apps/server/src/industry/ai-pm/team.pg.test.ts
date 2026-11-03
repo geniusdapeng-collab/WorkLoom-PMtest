@@ -83,12 +83,14 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
     appUser = database.users.app;
     owner = new pg.Pool({ connectionString: database.ownerUrl, max: 5 });
     app = new pg.Pool({ connectionString: database.appUrl, max: 20 });
-    const migration = await readFile(new URL("../../../../../packages/db/migrations/0043_pm_team.sql", import.meta.url), "utf8");
     // Migration setup must finish before parallel PG suites start. Reapplying
     // its ALTER TABLE / policy DDL here can deadlock another suite's run update.
-    const applied = await owner.query<{ checksum: string }>("SELECT checksum FROM _migrations WHERE name=$1", ["0043_pm_team.sql"]);
-    expect(applied.rows[0]?.checksum, "run pnpm db:migrate before PG tests; the PM migration must already match this source")
-      .toBe(createHash("sha256").update(migration).digest("hex"));
+    for (const name of ["0043_pm_team.sql", "0060_pm_thread_events.sql"]) {
+      const migration = await readFile(new URL(`../../../../../packages/db/migrations/${name}`, import.meta.url), "utf8");
+      const applied = await owner.query<{ checksum: string }>("SELECT checksum FROM _migrations WHERE name=$1", [name]);
+      expect(applied.rows[0]?.checksum, `run pnpm db:migrate before PG tests; ${name} must already match this source`)
+        .toBe(createHash("sha256").update(migration).digest("hex"));
+    }
     for (const scope of [scopeA, scopeB]) {
       await owner.query("INSERT INTO tenants(id,name,plan) VALUES($1,$2,'pro')", [scope.tenantId, "PM test fixture"]);
       await owner.query("INSERT INTO workspaces(id,tenant_id,name,slug,industry,stage) VALUES($1,$2,'PM test fixture',$1,'ai-pm','delivery')", [scope.workspaceId, scope.tenantId]);
@@ -111,6 +113,108 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
     expect(values.filter((value) => value.created)).toHaveLength(1);
     expect(values[0]!.detail.run.goal).toBe(goal);
     await expect(current.create(scopeA, { ...input, goal: "不同的目标内容" }, "MEM-PM-FIXTURE")).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+  });
+
+  it("native events deduplicate across service instances and expose only scoped, bounded thread context", async () => {
+    let releaseAssembly!: () => void;
+    const held = new Promise<void>((done) => { releaseAssembly = done; });
+    const worker = vi.fn(async (input: EmployeeExecutionInput) => fixtureResult(input));
+    const heldCatalog = { ...catalog, assemble: async (...args: Parameters<PmEmployeeCatalog["assemble"]>) => {
+      await held;
+      return catalog.assemble(...args);
+    } };
+    const first = service({ catalog: heldCatalog, employeeExecutor: worker });
+    const second = service({ catalog: heldCatalog, employeeExecutor: worker });
+    const request = { kind: "request", eventId: randomUUID(), threadId: randomUUID(), start: false, input: {
+      goal: "从事件发起正式产物交付", employee: "doc-writer",
+    } };
+    const actor = "MEM-PM-FIXTURE";
+    const followup = { kind: "followup", eventId: randomUUID(), threadId: request.threadId, text: "补充字".repeat(600) };
+    let runId = "";
+    try {
+      const receipts = await Promise.all(Array.from({ length: 8 }, (_, i) => (i % 2 ? first : second).receiveEvent(scopeA, request, actor)));
+      runId = receipts[0]!.runId;
+      expect(new Set(receipts.map((receipt) => receipt.runId))).toEqual(new Set([runId]));
+      expect(receipts.filter((receipt) => !receipt.replayed)).toHaveLength(1);
+      expect((await first.detail(scopeA, runId)).run.threadId).toBe(request.threadId);
+      await expect(first.receiveEvent(scopeA, { ...request, input: { ...request.input, goal: "同一标识换成其它任务" } }, actor)).rejects.toMatchObject({ code: "PM_EVENT_CONFLICT" });
+      await expect(first.receiveEvent(scopeA, request, "MEM-OTHER")).rejects.toMatchObject({ code: "PM_EVENT_CONFLICT" });
+      await expect(first.receiveEvent(scopeA, { ...request, eventId: randomUUID() }, actor)).rejects.toMatchObject({ code: "PM_THREAD_ACTIVE" });
+      await expect(first.receiveEvent(scopeB, followup, actor)).rejects.toMatchObject({ code: "PM_THREAD_NOT_ACTIVE" });
+      expect(await first.receiveEvent(scopeA, followup, actor)).toMatchObject({ runId, decision: "attached", replayed: false });
+      expect(await second.receiveEvent(scopeA, followup, actor)).toMatchObject({ runId, decision: "attached", replayed: true });
+      const summaries = await first.listThreadEvents(scopeA, request.threadId, 2);
+      expect(summaries.map((event) => event.eventId)).toEqual([followup.eventId, request.eventId]);
+      expect(Buffer.byteLength(summaries[0]!.excerpt)).toBeLessThanOrEqual(512);
+      expect(summaries[0]).toMatchObject({ bodyTruncated: true });
+      expect(summaries[0]).not.toHaveProperty("text");
+      expect(await first.getThreadEvent(scopeA, request.threadId, followup.eventId)).toMatchObject({ text: followup.text });
+      expect(await store.requestEventForRun(scopeA, runId)).toEqual(request);
+      await expect(first.getThreadEvent(scopeB, request.threadId, followup.eventId)).rejects.toMatchObject({ code: "PM_EVENT_NOT_FOUND" });
+      await expect(first.listThreadEvents(scopeB, request.threadId, 20)).rejects.toMatchObject({ code: "PM_THREAD_NOT_FOUND" });
+      await expect(scoped(scopeA, (client) => client.query("UPDATE pm_thread_events SET actor_id='changed' WHERE event_id=$1", [request.eventId]))).rejects.toThrow();
+      const actions = await owner.query<{ action: string }>(
+        "SELECT payload->'decision'->>'action' AS action FROM biz_events WHERE tenant_id=$1 AND workspace_id=$2 AND session_id=$3 ORDER BY seq",
+        [scopeA.tenantId, scopeA.workspaceId, runId]);
+      expect(actions.rows.map(({ action }) => action))
+        .toEqual(["pm.run.created", "pm.event.admitted", "pm.event.attached"]);
+      await Promise.all([first.start(scopeA, runId), second.start(scopeA, runId)]);
+      for (let i = 0; i < 100; i++) {
+        if ((await first.detail(scopeA, runId)).tasks[0]?.status === "running") break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect((await first.detail(scopeA, runId)).tasks[0]?.status).toBe("running");
+      await expect(second.receiveEvent(scopeA, { ...followup, eventId: randomUUID() }, actor))
+        .rejects.toMatchObject({ code: "PM_FOLLOWUP_WINDOW_CLOSED" });
+    } finally { releaseAssembly(); }
+    await Promise.all([first.waitForRun(scopeA, runId), second.waitForRun(scopeA, runId)]);
+    expect(worker).toHaveBeenCalledTimes(1);
+    expect(worker.mock.calls[0]![0].followups).toMatchObject([{ eventId: followup.eventId, bodyTruncated: true,
+      source: `/api/pm/threads/${request.threadId}/events/${followup.eventId}` }]);
+    expect((await first.detail(scopeA, runId)).tasks[0]!.adapterReceipt).toMatchObject({ followupEventIds: [followup.eventId] });
+    expect(await second.receiveEvent(scopeA, request, actor)).toMatchObject({ runId, replayed: true });
+    await expect(first.receiveEvent(scopeA, { ...followup, eventId: randomUUID() }, actor)).rejects.toMatchObject({ code: "PM_THREAD_NOT_ACTIVE" });
+    const next = await first.receiveEvent(scopeA, { ...request, eventId: randomUUID(), start: true }, actor);
+    expect(next.runId).not.toBe(runId);
+    await first.waitForRun(scopeA, next.runId);
+    expect(await first.getThreadEvent(scopeA, request.threadId, request.eventId)).toMatchObject({ runId, eventId: request.eventId });
+  });
+
+  it("event, run, and audit rolls back together when the admission event cannot be journaled", async () => {
+    const request = { kind: "request", eventId: randomUUID(), threadId: randomUUID(), input: { goal: "测试事件事务完整性" } } as const;
+    const actor = "MEM-PM-FIXTURE";
+    const failing = new PgPmStore(app, { appendEvent: async (_client, _scope, _runId, draft) => {
+      if (draft.decision.action === "pm.event.admitted") throw new Error("fixture event journal unavailable");
+    } });
+    await expect(failing.receiveEvent(scopeA, request, actor, { modelId: "fixture-deepseek", policyVersion: "fixture-policy" }))
+      .rejects.toThrow("fixture event journal unavailable");
+    expect(await store.findEvent(scopeA, request, actor)).toBeNull();
+    const result = await owner.query("SELECT id FROM pm_runs WHERE tenant_id=$1 AND workspace_id=$2 AND source_thread_id=$3",
+      [scopeA.tenantId, scopeA.workspaceId, request.threadId]);
+    expect(result.rowCount).toBe(0);
+  });
+
+  it("cancelling an event run during worker preparation suppresses execution and preserves its admission receipt", async () => {
+    let releaseAssembly!: () => void;
+    let enteredAssembly!: () => void;
+    const held = new Promise<void>((done) => { releaseAssembly = done; });
+    const entered = new Promise<void>((done) => { enteredAssembly = done; });
+    const worker = vi.fn(async (input: EmployeeExecutionInput) => fixtureResult(input));
+    const current = service({ employeeExecutor: worker, catalog: { ...catalog, assemble: async (...args: Parameters<PmEmployeeCatalog["assemble"]>) => {
+      enteredAssembly();
+      await held;
+      return catalog.assemble(...args);
+    } } });
+    const actor = "MEM-PM-FIXTURE";
+    const request = { kind: "request", eventId: randomUUID(), threadId: randomUUID(), input: { goal: "从事件派发可以取消的任务", employee: "doc-writer" } };
+    const { runId } = await current.receiveEvent(scopeA, request, actor);
+    try {
+      await entered;
+      await current.cancel(scopeA, runId, actor);
+      expect(await current.receiveEvent(scopeA, request, actor)).toMatchObject({ runId, replayed: true });
+    } finally { releaseAssembly(); }
+    expect((await current.waitForRun(scopeA, runId)).run.status).toBe("cancelled");
+    expect(worker).not.toHaveBeenCalled();
   });
 
   it("all14 seeded employees assemble their own integrity-checked skill text with their actual tool contract", async () => {

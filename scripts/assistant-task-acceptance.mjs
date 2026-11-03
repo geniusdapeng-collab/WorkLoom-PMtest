@@ -10,9 +10,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { signDemoToken } from "@workloom/base/tenancy";
+import { loadProductRuntime } from "./product-runtime.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const BASE_URL = (process.env.ASSISTANT_EVAL_BASE_URL ?? "http://127.0.0.1:8988").replace(/\/+$/, "");
+const BASE_URL = (process.env.ASSISTANT_EVAL_BASE_URL ?? `http://127.0.0.1:${loadProductRuntime(ROOT).serverPort}`).replace(/\/+$/, "");
 const ORIGIN = (process.env.ASSISTANT_PUBLIC_ORIGIN ?? BASE_URL).replace(/\/+$/, "");
 const DATABASE_URL = process.env.DATABASE_URL ?? "";
 const WORKSPACE_SLUG = process.env.ASSISTANT_EVAL_WORKSPACE_SLUG ?? "ai-pm-demo";

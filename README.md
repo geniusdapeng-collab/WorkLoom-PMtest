@@ -1,6 +1,6 @@
 <div align="center">
 
-# WorkLoom PM
+# WorkLoom PMtest
 
 **AI 产品经理带领一支 AI 研发团队，把一句话目标变成可执行任务图、真实产物、独立验证与可追溯交付回执。**
 
@@ -10,7 +10,7 @@
 
 </div>
 
-WorkLoom PM 面向产品负责人、创业者和小型研发团队。它不是只会写一段文案或代码的单点助手，而是一套把 **目标澄清、岗位协作、受限执行、质量验证和发布门禁** 串成同一条链路的 AI 产品研发系统。
+WorkLoom PMtest 面向产品负责人、创业者和小型研发团队。它不是只会写一段文案或代码的单点助手，而是一套把 **目标澄清、岗位协作、受限执行、质量验证和发布门禁** 串成同一条链路的 AI 产品研发系统。
 
 正式工作入口是 PC 工作台的 **「开发场域」`/development`**：PM 团队视图用于目标、任务图、执行与产物；原有 DevFabric 开发场域保留为可切换的工作模式。桌面客户端与浏览器开发入口共享服务端。
 
@@ -49,7 +49,7 @@ WorkLoom PM 面向产品负责人、创业者和小型研发团队。它不是�
 
 当你已经能让一个 AI 写文档或写代码，下一步经常卡在三处：需求没有被写成可验证的目标；不同角色之间靠人复制上下文；模型说“完成了”，但文件、测试和交付状态对不上。
 
-WorkLoom PM 把这三处变成明确的工作对象：产品经理维护目标和验收标准，员工各自带着岗位和技能执行，任务依赖与产物回执把工作连接起来。人类负责业务方向、预算与授权；系统在允许的范围内持续推进，遇到失败保留原因与证据。
+WorkLoom PMtest 把这三处变成明确的工作对象：产品经理维护目标和验收标准，员工各自带着岗位和技能执行，任务依赖与产物回执把工作连接起来。人类负责业务方向、预算与授权；系统在允许的范围内持续推进，遇到失败保留原因与证据。
 
 | 具体场景 | 团队怎样工作 | 交付时检查什么 |
 |---|---|---|
@@ -141,8 +141,8 @@ DeepSeek Harness 是工具执行循环与会话机制，不是第二个产品经
 需要 **Node.js 24 或以上、仓库固定的 pnpm 10.14.0、PostgreSQL 17 与 pgvector**。依赖以 [`package.json`](package.json) 和 [`pnpm-lock.yaml`](pnpm-lock.yaml) 为准；首次安装保持锁文件，不使用“升级到最新”代替复现环境。
 
 ```bash
-git clone https://github.com/geniusdapeng-collab/workloom-pm.git
-cd workloom-pm
+git clone https://github.com/geniusdapeng-collab/WorkLoom-PMtest.git
+cd WorkLoom-PMtest
 pnpm install --frozen-lockfile
 cp .env.example .env
 ```
@@ -170,11 +170,13 @@ LLM_MODEL=deepseek-flash
 pnpm app:dev
 ```
 
-源码启动器读取根 `.env`，由显式进程环境覆盖，统一传给 server、Web 与 Electron；默认端口由产品清单偏移派生。浏览器开发使用 `SERVER_PORT=8987 WEB_PORT=5373 pnpm dev`，进入 `http://localhost:5373/development`；自定义端口时同步调整启动进程变量。`pnpm app` 构建 Web 后打开 Electron，`pnpm app:dev` 使用 HMR，`pnpm app --smoke` 只验证源码服务与主进程，不等于安装包渲染或签名验收。
+源码启动器读取根 `.env`，由显式进程环境覆盖，统一传给 server、Web 与 Electron；默认端口由产品清单偏移派生。浏览器开发使用 `SERVER_PORT=9018 WEB_PORT=5404 pnpm dev`，进入 `http://localhost:5404/development`；自定义端口时同步调整启动进程变量。`pnpm app` 构建 Web 后打开 Electron，`pnpm app:dev` 使用 HMR，`pnpm app --smoke` 只验证源码服务与主进程，不等于安装包渲染或签名验收。
 
 桌面首屏由受控产品清单的 `desktop.startPath` 指向 `/development`，源码与安装包使用同一路由；可用 `WORKLOOM_START_PATH` 显式选择安全的本地路径。原经营首页仍可从导航打开。本产品把 `clients.bPc.secretaryAutoScan` 设为 `false`，停用浏览页面时的秘书自动写入扫描；已有收件箱仍每 20 秒刷新，用户主动发起的助手操作保持可用。
 
-独立产品身份为 `workloom-pm`，桌面 appId 为 `com.workloom.pm`，偏移为 `200`。打包默认端口为 server `8987`、web `5373`、PG `5632`、NATS `4422`；源码数据库仍以你配置的连接串为准。源码客户端默认支持目录按系统应用目录下的 `workloom-pm` 隔离；可用 `WORKLOOM_SUPPORT_DIR` 显式覆盖。Electron 名称与快捷方式也使用独立产品身份。
+独立产品身份为 `workloom-pmtest`，桌面 appId 为 `com.workloom.pmtest`，偏移为 `231`。打包默认端口为 server `9018`、web `5404`、PG `5663`、NATS `4453`；源码数据库仍以你配置的连接串为准。源码客户端默认支持目录按系统应用目录下的 `workloom-pmtest` 隔离；可用 `WORKLOOM_SUPPORT_DIR` 显式覆盖。Electron 名称与快捷方式也使用独立产品身份。当前以源码运行。
+
+`deploy/linux/` 保留上游 Linux 部署资料供查阅，PMtest 的安装、启动、Nginx、备份、恢复检查和数据库初始化入口均已停用。
 
 本仓是独立产品副本，`product.manifest.json#clientDelivery.mode=repo-owned` 明确三端应用壳与 `packages/ui` 随同一产品提交发布，不接收上游 `ui-v*` 客户端基座状态。发布门禁仍会验真三端入口、`@workloom/ui` workspace 依赖与必备生产文件；这条声明不是跳过检查。
 
@@ -223,7 +225,7 @@ pnpm runtime:deps:verify
 | `apps/desktop/` | Electron 客户端与内嵌运行时启动 |
 | `vendor/`、`scripts/`、`docs/` | 上游运行时基线、工程工具与可追溯文档 |
 
-[原中文 README](docs/UPSTREAM-README.md) 与 [原英文 README](docs/UPSTREAM-README_EN.md) 按导入时原文保留。它们以及受控全景文档中的旧仓库、CNB、安装包和历史数量属于上游快照，**不代表 WorkLoom PM 当前已经完成的发布或验收**。现行产品身份以 [`product.manifest.json`](product.manifest.json) 为准，PM 交付证据见本仓两份 PM 文档。
+[原中文 README](docs/UPSTREAM-README.md) 与 [原英文 README](docs/UPSTREAM-README_EN.md) 按导入时原文保留。它们以及受控全景文档中的旧仓库、CNB、安装包和历史数量属于上游快照，**不代表 WorkLoom PMtest 当前已经完成的发布或验收**。现行产品身份以 [`product.manifest.json`](product.manifest.json) 为准，PM 交付证据见本仓两份 PM 文档。
 
 下方为继承的基座能力目录，由生成器维护；它描述代码入口，不能当作 PM 真实任务通过率。本产品首次源码启动使用上文的 `pnpm app:dev`；自动块内保留的 `preview:all` 首启提示属于上游快照。修改能力面后运行 `pnpm capabilities` / `pnpm capabilities:check`。
 

@@ -1,3 +1,8 @@
+> **Historical upstream reference.** PMtest uses the source setup in
+> [the repository README](../../README.md). Its inherited Linux entrypoints
+> reject execution. The service unit and Nginx configuration below name the
+> original WorkLoom PM deployment and must not be installed for PMtest.
+
 # WorkLoom PM Linux deployment
 
 This deployment keeps WorkLoom PM independent from PengManager:

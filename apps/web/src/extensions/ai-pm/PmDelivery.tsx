@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router";
-import { AsyncState, Badge, BannerAlert, Button, Card, Icon, Select, Textarea, clientChineseText, clientIdentifierText, clientStatusLabel, clientValueText } from "@workloom/ui";
+import { AsyncState, Badge, BannerAlert, Button, Card, Icon, Input, Select, Textarea, clientChineseText, clientIdentifierText, clientStatusLabel, clientValueText } from "@workloom/ui";
 import { ensureDemoLogin, getToken } from "../../lib/trpc";
 import P25 from "./P25";
 import "./PmDelivery.css";
@@ -8,7 +8,7 @@ import "./PmDelivery.css";
 interface Employee { presetKey: string; name: string; description: string }
 type RunState = "created" | "planning" | "running" | "paused" | "blocked" | "failed" | "completed" | "cancelled";
 interface Usage { promptTokens: number; completionTokens: number }
-interface Run { id: string; goal: string; status: RunState; requestedEmployee: string | null; modelId: string;
+interface Run { id: string; threadId?: string; goal: string; status: RunState; requestedEmployee: string | null; modelId: string;
   createdAt: string; updatedAt: string; error: string | null; errorCode: string | null; usage: Usage;
   verification?: unknown }
 interface Task { id: string; presetKey: string; goal: string; dependsOn: string[]; acceptance: string[]; outputRefs: string[];
@@ -19,6 +19,9 @@ interface Detail { run: Run; tasks: Task[]; artifacts: Artifact[] }
 interface Status { configured: boolean; modelId: string; employees: Employee[]; policyVersion: string;
   backend?: string; sandboxRootConfigured?: boolean }
 interface FileView { path: string; content: string; sha256: string; mediaType: string; sizeBytes: number; taskId: string }
+interface EventReceipt { eventId: string; threadId: string; runId: string; decision: "admitted" | "attached"; replayed: boolean }
+interface ThreadEventMetadata { eventId: string; kind: "request" | "followup"; createdAt: string; excerpt: string; bodyTruncated: boolean }
+type ThreadEvent = ThreadEventMetadata & ({ kind: "request"; input: { goal: string; searchQuery?: string } } | { kind: "followup"; text: string });
 
 const LABEL: Record<string, string> = {
   created: "等待开始", planning: "产品经理正在拆解", running: "团队执行中", paused: "已暂停，可恢复",
@@ -51,6 +54,10 @@ function statusTone(value: string): "neutral" | "success" | "warning" | "danger"
   return "neutral";
 }
 
+class PmRequestError extends Error {
+  constructor(message: string, readonly code?: string) { super(message); }
+}
+
 async function pmRequest<T>(path: string, options: { body?: unknown; signal?: AbortSignal } = {}): Promise<T> {
   const token = getToken();
   const response = await fetch(`/api/pm${path}`, {
@@ -58,13 +65,97 @@ async function pmRequest<T>(path: string, options: { body?: unknown; signal?: Ab
     headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(options.body === undefined ? {} : { "content-type": "application/json" }) },
     ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }), signal: options.signal,
   });
-  const payload = await response.json().catch(() => null) as { error?: { message?: string } | string; message?: string } | null;
+  const payload = await response.json().catch(() => null) as { error?: { message?: string; code?: string } | string; message?: string } | null;
   if (!response.ok) {
     const detail = typeof payload?.error === "string" ? payload.error : payload?.error?.message ?? payload?.message;
-    throw new Error(detail || (response.status === 401 ? "登录后才能查看团队任务。" : `请求失败（${response.status}）`));
+    const code = typeof payload?.error === "object" ? payload.error?.code : undefined;
+    throw new PmRequestError(detail || (response.status === 401 ? "登录后才能查看团队任务。" : `请求失败（${response.status}）`), code);
   }
   if (!payload || typeof payload !== "object") throw new Error("服务返回的数据不完整，请重试。");
   return payload as T;
+}
+
+function PmThreadPanel({ threadId, runStatus, busy, onFollowup }: { threadId: string; runStatus: RunState; busy: boolean; onFollowup: () => void }) {
+  const [events, setEvents] = useState<ThreadEventMetadata[] | null>(null);
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+  const [version, setVersion] = useState(0);
+  const [listError, setListError] = useState("");
+  const [postError, setPostError] = useState("");
+  const [readError, setReadError] = useState("");
+  const [opened, setOpened] = useState<ThreadEvent | null>(null);
+  const [opening, setOpening] = useState("");
+  const pending = useRef<{ text: string; eventId: string } | null>(null);
+  const sendingRef = useRef(false);
+  const path = `/threads/${encodeURIComponent(threadId)}/events`;
+  const canFollow = ["created", "planning", "running", "paused", "blocked", "failed"].includes(runStatus);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setListError("");
+    void pmRequest<{ events: ThreadEventMetadata[] }>(`${path}?limit=20`, { signal: controller.signal }).then(({ events }) => {
+      if (!controller.signal.aborted) setEvents(events);
+    }).catch((failure: unknown) => {
+      if (!controller.signal.aborted) setListError(messageOf(failure));
+    });
+    return () => controller.abort();
+  }, [path, version]);
+
+  async function postFollowup(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (busy || !canFollow || sendingRef.current) return;
+    const trimmed = text.trim();
+    if (!trimmed || trimmed.length > 8000) { setPostError("请填写 1 至 8,000 个字的补充说明。"); return; }
+    if (pending.current?.text !== trimmed) pending.current = { text: trimmed, eventId: crypto.randomUUID() };
+    sendingRef.current = true; setSending(true); setPostError("");
+    const token = getToken();
+    try {
+      const receipt = await pmRequest<EventReceipt>("/events", { body: { kind: "followup", threadId, ...pending.current } });
+      if (getToken() !== token) return;
+      if (receipt.eventId !== pending.current.eventId || receipt.threadId !== threadId || receipt.decision !== "attached") {
+        throw new Error("补充消息的回执不完整，请重试。");
+      }
+      pending.current = null; setText(""); setVersion((value) => value + 1); onFollowup();
+    } catch (failure) {
+      if (getToken() !== token) return;
+      if (failure instanceof PmRequestError && failure.code === "PM_FOLLOWUP_WINDOW_CLOSED") {
+        setPostError("最后一个执行步骤已开始，这条补充未提交。可以保留内容，另开任务处理。");
+        onFollowup();
+      } else setPostError(messageOf(failure));
+    }
+    finally { sendingRef.current = false; setSending(false); }
+  }
+
+  async function readEvent(eventId: string) {
+    setOpening(eventId); setReadError(""); setOpened(null);
+    const token = getToken();
+    try {
+      const { event } = await pmRequest<{ event: ThreadEvent }>(`${path}/${encodeURIComponent(eventId)}`);
+      if (getToken() === token) setOpened(event);
+    } catch (failure) { if (getToken() === token) setReadError(messageOf(failure)); }
+    finally { setOpening(""); }
+  }
+
+  return <section className="pm-thread" aria-labelledby="pm-thread-title">
+    <div className="pm-thread-heading"><h3 id="pm-thread-title">任务消息</h3><Button variant="quiet" onClick={() => setVersion((value) => value + 1)}>刷新消息</Button></div>
+    {listError ? <BannerAlert level="alert">{listError}</BannerAlert> : !events ? <AsyncState status="loading" title="正在读取任务消息…" /> : events.length === 0 ? <p>还没有任务消息。</p> : <ol className="pm-thread-events">{events.map((event) => <li key={event.eventId}>
+      <div className="pm-thread-heading"><strong>{event.kind === "request" ? "任务目标" : "补充说明"}</strong><time dateTime={event.createdAt}>{timeOf(event.createdAt)}</time></div>
+      <p>{event.excerpt}</p>
+      {event.bodyTruncated && <Button variant="quiet" disabled={Boolean(opening)} onClick={() => void readEvent(event.eventId)}>{opening === event.eventId ? "正在读取原文…" : "查看完整消息"}</Button>}
+    </li>)}</ol>}
+    {readError && <BannerAlert level="alert">{readError}</BannerAlert>}
+    {opened && <div className="pm-thread-original"><div className="pm-thread-heading"><h4>消息原文</h4><Button variant="quiet" onClick={() => setOpened(null)}>关闭原文</Button></div>
+      <p>{opened.kind === "request" ? opened.input.goal : opened.text}</p>
+      {opened.kind === "request" && opened.input.searchQuery && <p>公开网页检索词：{opened.input.searchQuery}</p>}
+    </div>}
+    {postError && <BannerAlert level="alert">{postError}</BannerAlert>}
+    {!canFollow && postError && text && <Textarea label="未提交的补充草稿" value={text} rows={3} readOnly />}
+    {canFollow && <form className="pm-thread-compose" onSubmit={(event) => void postFollowup(event)}>
+      <Textarea id="pm-followup" label="补充当前任务" value={text} onChange={(event) => { setText(event.target.value); setPostError(""); }} rows={3} maxLength={8000}
+        description="补充信息进入同一任务。需要调整已经执行的步骤时，请先核对当前进展。" disabled={sending || busy} required />
+      <Button type="submit" variant="primary" disabled={sending || busy || !text.trim()} busy={sending} busyLabel="正在添加…">添加补充说明</Button>
+    </form>}
+  </section>;
 }
 
 export default function PmDelivery() {
@@ -76,6 +167,7 @@ export default function PmDelivery() {
   const [goal, setGoal] = useState("");
   const [employee, setEmployee] = useState("");
   const [fileChecks, setFileChecks] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -84,46 +176,58 @@ export default function PmDelivery() {
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [file, setFile] = useState<FileView | null>(null);
   const [fileBusy, setFileBusy] = useState("");
-  const busyRef = useRef(false);
-  const requestKey = useRef<{ fingerprint: string; key: string } | null>(null);
+  const actionController = useRef<AbortController | null>(null);
+  const requestKey = useRef<{ fingerprint: string; eventId: string; threadId: string } | null>(null);
   const selectedRef = useRef<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const loadController = useRef<AbortController | null>(null);
 
-  const load = useCallback(async (signal?: AbortSignal) => {
+  const load = useCallback(async () => {
+    loadController.current?.abort();
+    const controller = new AbortController();
+    loadController.current = controller;
+    const { signal } = controller;
     try {
       await ensureDemoLogin();
+      if (signal.aborted) return;
       const [configuration, history] = await Promise.all([
         pmRequest<Status>("/status", { signal }), pmRequest<{ runs: Run[] }>("/runs", { signal }),
       ]);
-      if (signal?.aborted) return;
+      if (signal.aborted) return;
       setStatus(configuration); setRuns(history.runs); setError("");
     } catch (failure) {
-      if (!signal?.aborted) setError(messageOf(failure));
-    } finally { if (!signal?.aborted) setLoading(false); }
+      if (!signal.aborted) setError(messageOf(failure));
+    } finally { if (!signal.aborted) setLoading(false); }
   }, []);
 
   useEffect(() => {
-    const controller = new AbortController();
-    void load(controller.signal);
-    const refresh = () => { setLoading(true); void load(controller.signal); };
+    void load();
+    const refresh = () => {
+      actionController.current?.abort(); actionController.current = null; setBusy(false);
+      selectedRef.current = null; requestKey.current = null;
+      setSelected(null); setDetail(null); setFile(null); setFileBusy(""); setStatus(null); setRuns([]);
+      setGoal(""); setEmployee(""); setFileChecks(""); setSearchQuery("");
+      setNotice(""); setError(""); setFormError(""); setLoading(true); void load();
+    };
     window.addEventListener("workloom:identity-changed", refresh);
-    return () => { controller.abort(); window.removeEventListener("workloom:identity-changed", refresh); };
+    return () => { loadController.current?.abort(); actionController.current?.abort(); window.removeEventListener("workloom:identity-changed", refresh); };
   }, [load]);
 
   useEffect(() => {
     selectedRef.current = selected;
-    setDetail(null); setFile(null);
+    setDetail((previous) => previous?.run.id === selected ? previous : null); setFile(null);
     if (!selected) return;
     const controller = new AbortController();
+    const token = getToken();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const poll = async () => {
       try {
         const next = await pmRequest<Detail>(`/runs/${encodeURIComponent(selected)}`, { signal: controller.signal });
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || getToken() !== token) return;
         setDetail(next); setError("");
         setRuns((previous) => [next.run, ...previous.filter((run) => run.id !== next.run.id)]);
         if (["created", "planning", "running"].includes(next.run.status)) timer = setTimeout(() => void poll(), 2000);
-      } catch (failure) { if (!controller.signal.aborted) setError(messageOf(failure)); }
+      } catch (failure) { if (!controller.signal.aborted && getToken() === token) setError(messageOf(failure)); }
     };
     void poll();
     return () => { controller.abort(); if (timer) clearTimeout(timer); };
@@ -131,55 +235,72 @@ export default function PmDelivery() {
 
   async function createRun(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (busyRef.current) return;
+    if (actionController.current) return;
     const trimmed = goal.trim();
     if (trimmed.length < 4) { setFormError("请说明要解决的问题和期望产物，至少输入4个字。"); inputRef.current?.focus(); return; }
     const paths = fileChecks.split("\n").map((path) => path.trim()).filter(Boolean);
     if (paths.length > 30 || paths.some((path) => path.length > 220 || path.startsWith("/") || path.split("/").some((part) => !part || part === ".." || part.startsWith(".")))) {
       setFormError("验证路径每行一个，最多30项，请使用不含上级目录或隐藏目录的相对文件路径。"); return;
     }
-    const fingerprint = JSON.stringify({ goal: trimmed, employee, paths });
-    if (requestKey.current?.fingerprint !== fingerprint) requestKey.current = { fingerprint, key: crypto.randomUUID() };
-    busyRef.current = true; setBusy(true); setFormError(""); setError(""); setNotice("");
-    let created: Detail | null = null;
+    const query = searchQuery.trim();
+    if ([...query].length > 128) { setFormError("公开网页检索词最多 128 个字符。"); return; }
+    const input = { goal: trimmed, ...(employee ? { employee } : {}),
+      ...(paths.length ? { checks: paths.map((path) => ({ type: "fileExists", path })) } : {}), ...(query ? { searchQuery: query } : {}) };
+    const fingerprint = JSON.stringify(input);
+    if (requestKey.current?.fingerprint !== fingerprint) {
+      requestKey.current = { fingerprint, eventId: crypto.randomUUID(), threadId: crypto.randomUUID() };
+    }
+    const { eventId, threadId } = requestKey.current;
+    const controller = new AbortController();
+    actionController.current = controller; setBusy(true); setFormError(""); setError(""); setNotice("");
     try {
-      created = await pmRequest<Detail>("/runs", { body: { goal: trimmed, idempotencyKey: requestKey.current.key,
-        ...(employee ? { employee } : {}), ...(paths.length ? { checks: paths.map((path) => ({ type: "fileExists", path })) } : {}) } });
-      setSelected(created.run.id); selectedRef.current = created.run.id; setDetail(created);
-      setRuns((previous) => [created!.run, ...previous.filter((run) => run.id !== created!.run.id)]);
-      await pmRequest(`/runs/${encodeURIComponent(created.run.id)}/start`, { body: {} });
-      setNotice(`目标已提交，${clientIdentifierText(created.run.id)}。团队将开始执行。`);
+      const receipt = await pmRequest<EventReceipt>("/events", { body: { kind: "request", eventId, threadId, input }, signal: controller.signal });
+      if (controller.signal.aborted) return;
+      if (receipt.eventId !== eventId || receipt.threadId !== threadId || !receipt.runId || receipt.decision !== "admitted") {
+        throw new Error("目标的提交回执不完整，请重试。");
+      }
+      requestKey.current = null;
+      setSelected(receipt.runId); selectedRef.current = receipt.runId;
+      setGoal(""); setEmployee(""); setFileChecks(""); setSearchQuery("");
+      setNotice(`目标已提交，${clientIdentifierText(receipt.runId)}。团队会在后台开始执行。`);
       setRefreshVersion((value) => value + 1);
     } catch (failure) {
-      setFormError(created ? `目标已保存，启动尚未完成：${messageOf(failure)}。可在任务详情中重试开始。` : messageOf(failure));
-    } finally { busyRef.current = false; setBusy(false); }
+      if (!controller.signal.aborted) setFormError(messageOf(failure));
+    } finally {
+      if (actionController.current === controller) { actionController.current = null; setBusy(false); }
+    }
   }
 
   async function act(action: "start" | "resume" | "cancel") {
-    if (!selected || busyRef.current) return;
-    busyRef.current = true; setBusy(true); setError("");
+    if (!selected || actionController.current) return;
+    const controller = new AbortController();
+    actionController.current = controller; setBusy(true); setError("");
     try {
-      await pmRequest(`/runs/${encodeURIComponent(selected)}/${action}`, { body: {} });
+      await pmRequest(`/runs/${encodeURIComponent(selected)}/${action}`, { body: {}, signal: controller.signal });
+      if (controller.signal.aborted) return;
       setNotice(action === "cancel" ? "已请求取消，正在读取最终状态。" : action === "resume" ? "已请求恢复，正在读取团队进展。" : "已请求开始，正在读取团队计划。");
       setRefreshVersion((value) => value + 1);
-    } catch (failure) { setError(messageOf(failure)); }
-    finally { busyRef.current = false; setBusy(false); }
+    } catch (failure) { if (!controller.signal.aborted) setError(messageOf(failure)); }
+    finally {
+      if (actionController.current === controller) { actionController.current = null; setBusy(false); }
+    }
   }
 
   async function readArtifact(artifact: Artifact, download = false) {
     if (!selected || fileBusy) return;
     const runId = selected; setFileBusy(artifact.path); setError("");
+    const token = getToken();
     try {
       const result = await pmRequest<FileView>(`/runs/${encodeURIComponent(runId)}/artifacts?path=${encodeURIComponent(artifact.path)}`);
-      if (selectedRef.current !== runId) return;
+      if (selectedRef.current !== runId || getToken() !== token) return;
       if (result.sha256 !== artifact.sha256) throw new Error("产物摘要与任务回执不一致，已停止展示。");
       if (download) {
         const url = URL.createObjectURL(new Blob([result.content], { type: result.mediaType || "text/plain;charset=utf-8" }));
         const anchor = document.createElement("a"); anchor.href = url; anchor.download = result.path.split("/").at(-1) || "artifact.txt";
         anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
       } else setFile(result);
-    } catch (failure) { setError(messageOf(failure)); }
-    finally { setFileBusy(""); }
+    } catch (failure) { if (getToken() === token) setError(messageOf(failure)); }
+    finally { if (getToken() === token) setFileBusy(""); }
   }
 
   const employeeName = (key: string) => clientChineseText(status?.employees.find((item) => item.presetKey === key)?.name, "待确认员工");
@@ -221,11 +342,15 @@ export default function PmDelivery() {
           </Select>
           <details className="pm-checks"><summary>指定必须交付的文件（可选）</summary>
             <Textarea id="pm-checks" label="必须交付的文件" hideLabel optionalLabel="" description="每行一个相对路径，系统会验证文件是否实际存在。" value={fileChecks} onChange={(event) => setFileChecks(event.target.value)} rows={3} placeholder={"文档/需求说明.md\n说明/验收记录.txt"} disabled={busy} /></details>
+          <details className="pm-checks"><summary>添加公开网页检索（可选）</summary>
+            <Input id="pm-search-query" label="公开网页检索词" optionalLabel="" value={searchQuery} maxLength={128} onChange={(event) => { setSearchQuery(event.target.value); setFormError(""); }}
+              description="只填写可公开的关键词。系统会将该检索词发送给外部搜索服务，请勿填写客户信息、内部资料或密钥。"
+              placeholder="例如：站点公开文档的产品名称和功能关键词" disabled={busy} /></details>
           {formError && <BannerAlert level="alert" className="pm-message">{formError}</BannerAlert>}
           <Button type="submit" variant="primary" className="pm-submit" disabled={busy || loading || !status?.configured} busy={busy} busyLabel="正在提交目标…">交给团队执行<Icon name="send" /></Button>
           <p className="pm-boundary">本轮产物保存在隔离目录。外部发布和生产变更使用独立审批流程。</p>
         </form>
-        <div className="pm-example-list"><p className="pm-small-label">从一个具体场景开始</p>{EXAMPLES.map((example) => <Button variant="quiet" disabled={busy} key={example.tag} onClick={() => { setGoal(example.goal); setEmployee(""); setFileChecks(""); setFormError(""); inputRef.current?.focus(); }}>
+        <div className="pm-example-list"><p className="pm-small-label">从一个具体场景开始</p>{EXAMPLES.map((example) => <Button variant="quiet" disabled={busy} key={example.tag} onClick={() => { setGoal(example.goal); setEmployee(""); setFileChecks(""); setSearchQuery(""); setFormError(""); inputRef.current?.focus(); }}>
           <span>{example.tag}</span><strong>{example.title}</strong><Icon name="chevron" /></Button>)}</div>
       </Card>
 
@@ -243,6 +368,7 @@ export default function PmDelivery() {
             <span>模型用量 {(detail.run.usage.promptTokens + detail.run.usage.completionTokens).toLocaleString()} 词元 · {modelName(detail.run.modelId)}</span>
           </div>
           {detail.run.error && <BannerAlert level="alert" className="pm-message">{clientChineseText(detail.run.error, "本次交付遇到异常，请核对产物后重试；详细原因已记录，可由管理员查看。")}</BannerAlert>}
+          {detail.run.threadId && <PmThreadPanel key={detail.run.id} threadId={detail.run.threadId} runStatus={detail.run.status} busy={busy} onFollowup={() => setRefreshVersion((value) => value + 1)} />}
           {detail.tasks.length === 0 && <AsyncState status={detail.run.status === "planning" ? "loading" : "empty"} title={detail.run.status === "planning" ? "产品经理正在安排员工、依赖与验收标准。" : "本次尚未生成任务计划。"} description={detail.run.status === "created" ? "开始执行后，员工分工与依赖将保存在这里。" : "请结合任务状态与提示，决定重试、恢复或核对产物。"} />}
           <ol className="pm-task-list">{detail.tasks.map((task, index) => <li key={task.id}>
             <Card className="pm-task">

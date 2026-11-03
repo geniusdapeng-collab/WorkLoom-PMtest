@@ -151,3 +151,21 @@ DeepSeek 文本入口使用固定的官方 V4.1 请求模板、BPE 词表和协�
 仓库中旧 RDAS 兼容模式和历史评测额度保留自己的合同。普通 PM 源码进程不会自动继承验收代理的单任务额度；前台助手使用自身的每日额度。超过真实窗口的输入会明确返回不能容纳；当前没有对任意任务自动拆分和合成的产品能力。[A/D]
 
 客户端包含真实模型适配、默认型号和运行时配置入口，Key 通过启动环境注入。源码、前端资源和可分发载荷不包含本次真实 Key。[A+B]
+
+
+## PMtest 的 Super-agent 接入
+
+PMtest 保留 PM 的岗位、沙箱和交付回执。事件路由参考 DeepSeek Harness 团队的 [Super-agent 设计](https://mp.weixin.qq.com/s/zoS7GlReWPhfCjENGxXCdg) 与 [公开原型](https://github.com/deepseek-ai/dsh-superagent-prototype/tree/8c32a9dc5d72c033816c6a8110b37f40cf94fba4)，按 WorkLoom 的现有租户权限和事务实现。
+
+- `POST /api/pm/events` 接受 `{kind:"request",eventId,threadId,input:{goal,employee?,checks?,searchQuery?},start?}`。默认接单后自动启动。需要先录入补充时，设 `start:false` 并沿用任务的 `/start` 接口。相同事件可重放，同 ID 换正文或发起人返回 409。
+- `{kind:"followup",eventId,threadId,text}` 直达同一活动任务。单轮最多三条，最后一个执行器被认领后返回 409，请在该轮结束后用同一线程 ID 开启下一轮。接单与补充回执均记录到 WorkData。
+- `GET /api/pm/threads/:id/events` 提供有界摘要，`GET /api/pm/threads/:id/events/:eventId` 按需读取原文。每条摘要最多 512 个 UTF-8 字节。研发执行器可通过既有 `read_file` 读取本任务长补充的只读副本。普通文档员工使用摘要。
+- `searchQuery` 只适合公开检索词，最多 128 个字符。服务器单独调用 DeepSeek Search 和 Fetch，持久保存来源、摘录与摘要。通过 `GET /api/pm/runs/:id/search-evidence` 查看核验结果。PM 的模型凭据和地址可分别通过 `PM_MODEL_API_KEY`、`PM_MODEL_BASE_URL` 注入。与本机预算代理连用时，显式设置 `PM_SEARCH_USE_LOOPBACK=1`，搜索和推理共用同一个本机预算边界。云端推理不持有本机执行器权限。
+- Watchdog 是独立进程，以明确配置的单个租户和工作区运行。它通过既有账本事务回收过期租约。有未结算的模型调用时保留阻断状态，否则转为暂停，已核验产物继续保留。恢复由成员触发。轮询失败记错误并继续后续扫描。
+
+```bash
+export PM_WATCHDOG_TENANT=demo PM_WATCHDOG_WORKSPACE=ws-aipm-demo
+pnpm -C apps/server exec tsx --env-file=../../.env src/industry/ai-pm/watchdog.ts
+```
+
+添加 `--once` 可运行一次并读取已处理的租约数量。默认间隔 15 秒，可用 `PM_WATCHDOG_INTERVAL_MS` 配置。搜索结果未知时冻结原尝试，避免自动发起第二次收费请求；查询结果仍可对账，或由成员在原任务结束后发起下一轮。外部渠道接入和多项目调度另有独立授权与交付范围。

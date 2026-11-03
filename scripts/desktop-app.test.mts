@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:net";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -159,12 +159,17 @@ test("Electron 源码环境精确映射端口、源码上下文与隔离 userDat
   assert.equal(env.WORKLOOM_SERVER_URL, undefined);
 });
 
-test("未显式指定 userData 时仍按产品身份隔离源码客户端", () => {
-  const root = dirname(dirname(fileURLToPath(import.meta.url)));
-  const env = buildElectronEnvironment({ environment: {}, webPort: 5373, serverPort: 8987,
-    sourceRoot: root, sourceNode: process.execPath, smoke: false });
-  assert.equal(typeof env.WORKLOOM_SUPPORT_DIR, "string");
-  assert.equal(basename(env.WORKLOOM_SUPPORT_DIR!), "workloom-pm");
+test("PMtest 源码客户端从正式产品清单派生名称、隔离目录和默认端口", () => {
+  const repository = dirname(dirname(fileURLToPath(import.meta.url)));
+  const root = mkdtempSync(join(tmpdir(), "workloom-pmtest-identity-"));
+  try {
+    copyFileSync(join(repository, "product.manifest.json"), join(root, "product.manifest.json"));
+    const config = resolveDesktopLaunchConfig(root, {});
+    assert.equal(config.webPort, 5404);
+    assert.equal(config.serverPort, 9018);
+    assert.equal(config.environment.WORKLOOM_APP_TITLE, "WorkLoom PMtest");
+    assert.equal(basename(config.environment.WORKLOOM_SUPPORT_DIR!), "workloom-pmtest");
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 function productFixture(envText = "", offset = 200) {

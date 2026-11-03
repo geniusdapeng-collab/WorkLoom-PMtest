@@ -72,3 +72,15 @@ function judgeController(preset: AssembledPreset, baseline: RuntimeRule[], conte
     level, impacts: [...semantic.impacts, ...controller.impacts], triggeredBy: [...semantic.triggeredBy, ...controller.triggeredBy],
     evalErrors: [...semantic.evalErrors, ...controller.evalErrors] };
 }
+
+/** Only a separately supplied public query can use the PM evidence connector. */
+export function judgePmPublicSearch(rules: RuntimeRule[]): JudgeVerdict {
+  const grant: RuntimeRule = {
+    rule_id: "PM-SBX-PUBLIC-EVIDENCE", name: "成员显式请求的公开资料检索",
+    version: PM_SANDBOX_POLICY_VERSION, is_baseline: false, level: "auto",
+    objectTypes: ["public_evidence"], actions: ["web.research"],
+    when: "context.explicit_public_query == true",
+  };
+  return judge({ object: { type: "public_evidence" }, action: "web.research", effect: "read",
+    params: {}, context: { explicit_public_query: true } }, [...rules, grant], "review");
+}

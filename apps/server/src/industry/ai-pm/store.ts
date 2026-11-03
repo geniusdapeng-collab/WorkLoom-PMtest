@@ -9,6 +9,8 @@ import {
   type PmAssetBinding, type PmRun, type PmRunDetail, type PmRunStatus, type PmScope, type PmTask, type PmTaskPlan,
 } from "./types.js";
 import { assertNoSecrets } from "./contract.js";
+import { boundedPmText, createInputFromEvent, type PmEventReceipt, type PmEventRecord,
+  type PmEventSummary, type PmRequestEvent, type PmThreadEvent } from "./event-contract.js";
 import type { PmOwnerCorrection } from "./planning.js";
 
 type Row = Record<string, unknown>;
@@ -19,8 +21,24 @@ const fingerprint = (input: PmCreateInput) => createHash("sha256").update(JSON.s
   goal: input.goal, employee: input.employee ?? null, checks: input.checks ?? [],
 })).digest("hex");
 
+const eventFingerprint = (event: PmThreadEvent): string => createHash("sha256").update(JSON.stringify(event)).digest("hex");
+const eventReceipt = (row: Row, replayed: boolean): PmEventReceipt => ({
+  eventId: String(row.event_id), threadId: String(row.thread_id), runId: String(row.run_id),
+  decision: row.kind === "request" ? "admitted" : "attached", replayed,
+});
+const EVENT_TEXT = "CASE WHEN kind='request' THEN body->'input'->>'goal' ELSE body->>'text' END";
+const EVENT_SUMMARY = `event_id,thread_id,run_id,actor_id,kind,created_at,left(${EVENT_TEXT},513) AS excerpt,octet_length(${EVENT_TEXT}) AS body_bytes`;
+
+function eventSummary(row: Row): PmEventSummary {
+  return {
+    eventId: String(row.event_id), threadId: String(row.thread_id), runId: String(row.run_id),
+    actor: String(row.actor_id), kind: row.kind as PmThreadEvent["kind"], createdAt: stamp(row.created_at),
+    excerpt: boundedPmText(String(row.excerpt), 512), bodyTruncated: Number(row.body_bytes) > 512,
+  };
+}
 function runRow(row: Row): PmRun {
   return {
+    ...(row.source_thread_id == null ? {} : { threadId: String(row.source_thread_id) }),
     id: String(row.id), goal: String(row.goal), idempotencyKey: String(row.idempotency_key), requestedEmployee: nullableString(row.requested_employee),
     checks: row.checks as PmRun["checks"], status: row.status as PmRunStatus, modelId: String(row.model_id), planVersion: Number(row.plan_version),
     createdBy: String(row.created_by), createdAt: stamp(row.created_at), updatedAt: stamp(row.updated_at),
@@ -57,6 +75,7 @@ export interface PlanningReceipt {
   /** Server-side corrections from output ownership back to the responsible employee. */
   ownerCorrections?: PmOwnerCorrection[];
   modelRequest?: import("@workloom/base/model-router").CompletionRequestReceipt;
+  followupEventIds?: string[];
 }
 export interface FailureMetering {
   /** Absent means unknown. Never substitute zero for an unmetered sent call. */
@@ -121,6 +140,12 @@ export function requiresPmUsageReconciliation(detail: PmRunDetail): boolean {
 }
 export interface PmStore {
   create(scope: PmScope, input: PmCreateInput, actor: string, modelId: string, policyVersion: string): Promise<{ detail: PmRunDetail; created: boolean }>;
+  findEvent(scope: PmScope, event: PmThreadEvent, actor: string): Promise<PmEventReceipt | null>;
+  receiveEvent(scope: PmScope, event: PmThreadEvent, actor: string, request?: { modelId: string; policyVersion: string }): Promise<PmEventReceipt>;
+  listThreadEvents(scope: PmScope, threadId: string, limit: number): Promise<PmEventSummary[]>;
+  getThreadEvent(scope: PmScope, threadId: string, eventId: string): Promise<PmEventRecord>;
+  requestEventForRun(scope: PmScope, runId: string): Promise<PmRequestEvent | null>;
+  followupsForRun(scope: PmScope, runId: string): Promise<PmEventSummary[]>;
   detail(scope: PmScope, id: string): Promise<PmRunDetail>;
   list(scope: PmScope, limit: number): Promise<PmRun[]>;
   employees(scope: PmScope): Promise<PmEmployee[]>;
@@ -203,23 +228,133 @@ export class PgPmStore implements PmStore {
 
   async create(scope: PmScope, input: PmCreateInput, actor: string, modelId: string, policyVersion: string) {
     assertNoSecrets(input);
+    return this.tx(scope, (client) => this.createOn(client, scope, input, actor, modelId, policyVersion));
+  }
+
+  private async createOn(client: PoolClient, scope: PmScope, input: PmCreateInput, actor: string, modelId: string, policyVersion: string, threadId?: string) {
+    const id = `pm-${randomUUID()}`;
+    const digest = fingerprint(input);
+    const added = await client.query<{ id: string }>(
+      `INSERT INTO pm_runs(id,tenant_id,workspace_id,idempotency_key,request_fingerprint,goal,requested_employee,checks,model_id,policy_version,created_by,source_thread_id)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12)
+       ON CONFLICT(tenant_id,workspace_id,idempotency_key) DO NOTHING RETURNING id`,
+      [id, scope.tenantId, scope.workspaceId, input.idempotencyKey, digest, input.goal, input.employee ?? null, JSON.stringify(input.checks ?? []), modelId, policyVersion, actor, threadId ?? null]);
+    if (added.rows[0]) {
+      await this.journal(client, scope, id, "pm.run.created", { createdBy: actor, requestedEmployee: input.employee ?? null,
+        goalSha256: createHash("sha256").update(input.goal).digest("hex"), policyVersion, ...(threadId ? { threadId } : {}) });
+      return { detail: await this.detailOn(client, scope, id), created: true };
+    }
+    const existing = await client.query<{ id: string; request_fingerprint: string }>(
+      "SELECT id,request_fingerprint FROM pm_runs WHERE tenant_id=$1 AND workspace_id=$2 AND idempotency_key=$3", [scope.tenantId, scope.workspaceId, input.idempotencyKey]);
+    if (!existing.rows[0] || existing.rows[0].request_fingerprint !== digest) throw new PmError("IDEMPOTENCY_CONFLICT", "同一幂等键对应了不同目标、员工或验收条件", 409);
+    return { detail: await this.detailOn(client, scope, existing.rows[0].id), created: false };
+  }
+
+  private async findEventOn(client: PoolClient, scope: PmScope, event: PmThreadEvent, actor: string): Promise<PmEventReceipt | null> {
+    const result = await client.query<Row>(
+      "SELECT event_id,thread_id,run_id,kind,actor_id,fingerprint FROM pm_thread_events WHERE tenant_id=$1 AND workspace_id=$2 AND event_id=$3",
+      [scope.tenantId, scope.workspaceId, event.eventId]);
+    const row = result.rows[0];
+    if (!row) return null;
+    if (row.fingerprint !== eventFingerprint(event) || row.actor_id !== actor) {
+      throw new PmError("PM_EVENT_CONFLICT", "同一事件标识不能对应不同内容或发送人", 409);
+    }
+    return eventReceipt(row, true);
+  }
+
+  findEvent(scope: PmScope, event: PmThreadEvent, actor: string): Promise<PmEventReceipt | null> {
+    return this.tx(scope, (client) => this.findEventOn(client, scope, event, actor));
+  }
+
+  receiveEvent(scope: PmScope, event: PmThreadEvent, actor: string, request?: { modelId: string; policyVersion: string }): Promise<PmEventReceipt> {
+    assertNoSecrets({ event, actor });
     return this.tx(scope, async (client) => {
-      const id = `pm-${randomUUID()}`;
-      const digest = fingerprint(input);
-      const added = await client.query<{ id: string }>(
-        `INSERT INTO pm_runs(id,tenant_id,workspace_id,idempotency_key,request_fingerprint,goal,requested_employee,checks,model_id,policy_version,created_by)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11)
-         ON CONFLICT(tenant_id,workspace_id,idempotency_key) DO NOTHING RETURNING id`,
-        [id, scope.tenantId, scope.workspaceId, input.idempotencyKey, digest, input.goal, input.employee ?? null, JSON.stringify(input.checks ?? []), modelId, policyVersion, actor]);
-      if (added.rows[0]) {
-        await this.journal(client, scope, id, "pm.run.created", { createdBy: actor, requestedEmployee: input.employee ?? null, goalSha256: createHash("sha256").update(input.goal).digest("hex"), policyVersion });
-        return { detail: await this.detailOn(client, scope, id), created: true };
+      // Serialize replays across threads, then serialize mutations on the selected thread.
+      const scopeKey = [scope.tenantId, scope.workspaceId];
+      await client.query("SELECT pg_advisory_xact_lock(6041, hashtext($1))", [JSON.stringify([...scopeKey, event.eventId])]);
+      const existing = await this.findEventOn(client, scope, event, actor);
+      if (existing) return existing;
+      await client.query("SELECT pg_advisory_xact_lock(6042, hashtext($1))", [JSON.stringify([...scopeKey, event.threadId])]);
+      // Row lock coordinates with cancellation and completion. Failed/blocked/paused runs remain resumable.
+      const active = await client.query<{ id: string; status: PmRunStatus; plan_version: number }>(
+        `SELECT id,status,plan_version FROM pm_runs WHERE tenant_id=$1 AND workspace_id=$2 AND source_thread_id=$3
+          AND status NOT IN ('completed','cancelled') ORDER BY created_at DESC,id DESC LIMIT 1 FOR UPDATE`,
+        [...scopeKey, event.threadId]);
+      let runId = active.rows[0]?.id;
+      if (event.kind === "request") {
+        if (runId) throw new PmError("PM_THREAD_ACTIVE", "该线程已有可续接任务，请发送补充事件", 409);
+        if (!request) throw new PmError("PM_EVENT_NOT_READY", "接单执行配置未就绪", 503);
+        const input = createInputFromEvent(event, createHash("sha256").update(event.eventId).digest("hex"));
+        const created = await this.createOn(client, scope, input, actor, request.modelId, request.policyVersion, event.threadId);
+        if (!created.created) throw new PmError("PM_EVENT_CONFLICT", "事件标识和已有任务冲突", 409);
+        runId = created.detail.run.id;
       }
-      const existing = await client.query<{ id: string; request_fingerprint: string }>(
-        "SELECT id,request_fingerprint FROM pm_runs WHERE tenant_id=$1 AND workspace_id=$2 AND idempotency_key=$3", [scope.tenantId, scope.workspaceId, input.idempotencyKey]);
-      if (!existing.rows[0] || existing.rows[0].request_fingerprint !== digest) throw new PmError("IDEMPOTENCY_CONFLICT", "同一幂等键对应了不同目标、员工或验收条件", 409);
-      return { detail: await this.detailOn(client, scope, existing.rows[0].id), created: false };
+      if (!runId) throw new PmError("PM_THREAD_NOT_ACTIVE", "该线程没有可续接任务", 409);
+      if (event.kind === "followup") {
+        const run = active.rows[0]!;
+        // claimTask and this check both take the run row lock. Once the last
+        // worker is claimed, a new message cannot be presented as incorporated.
+        if (Number(run.plan_version) > 0) {
+          const consumer = await client.query(
+            `SELECT 1 FROM pm_tasks WHERE tenant_id=$1 AND workspace_id=$2 AND run_id=$3
+              AND status=ANY($4::text[]) LIMIT 1`,
+            [...scopeKey, runId, run.status === "running" ? ["pending"] : ["pending", "paused", "blocked", "failed"]],
+          );
+          if (!consumer.rowCount) throw new PmError("PM_FOLLOWUP_WINDOW_CLOSED", "本轮已派发最后一位员工，请在任务结束后开启下一轮", 409);
+        }
+        const prior = await client.query(
+          "SELECT 1 FROM pm_thread_events WHERE tenant_id=$1 AND workspace_id=$2 AND run_id=$3 AND kind='followup' OFFSET 2 LIMIT 1",
+          [...scopeKey, runId],
+        );
+        if (prior.rowCount) throw new PmError("PM_FOLLOWUP_LIMIT", "本轮最多接收三条补充，请将剩余内容用于下一轮", 409);
+      }
+      const digest = eventFingerprint(event);
+      const added = await client.query<Row>(
+        `INSERT INTO pm_thread_events(tenant_id,workspace_id,event_id,thread_id,run_id,actor_id,kind,fingerprint,body)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) RETURNING event_id,thread_id,run_id,kind`,
+        [...scopeKey, event.eventId, event.threadId, runId, actor, event.kind, digest, JSON.stringify(event)]);
+      const receipt = eventReceipt(added.rows[0]!, false);
+      await this.journal(client, scope, runId, `pm.event.${receipt.decision}`, {
+        eventId: event.eventId, threadId: event.threadId, kind: event.kind, actor, payloadSha256: digest,
+      });
+      return receipt;
     });
+  }
+
+  listThreadEvents(scope: PmScope, threadId: string, limit: number): Promise<PmEventSummary[]> {
+    return this.tx(scope, async (client) => {
+      const result = await client.query<Row>(
+        `SELECT ${EVENT_SUMMARY} FROM pm_thread_events WHERE tenant_id=$1 AND workspace_id=$2 AND thread_id=$3 ORDER BY ordinal DESC LIMIT $4`,
+        [scope.tenantId, scope.workspaceId, threadId, limit]);
+      if (!result.rowCount) throw new PmError("PM_THREAD_NOT_FOUND", "线程不存在或无权访问", 404);
+      return result.rows.map(eventSummary);
+    });
+  }
+
+  getThreadEvent(scope: PmScope, threadId: string, eventId: string): Promise<PmEventRecord> {
+    return this.tx(scope, async (client) => {
+      const result = await client.query<Row>(
+        `SELECT ${EVENT_SUMMARY},body FROM pm_thread_events WHERE tenant_id=$1 AND workspace_id=$2 AND thread_id=$3 AND event_id=$4`,
+        [scope.tenantId, scope.workspaceId, threadId, eventId]);
+      const row = result.rows[0];
+      if (!row) throw new PmError("PM_EVENT_NOT_FOUND", "事件不存在或无权访问", 404);
+      return { ...row.body as PmThreadEvent, ...eventSummary(row) } as PmEventRecord;
+    });
+  }
+
+  requestEventForRun(scope: PmScope, runId: string): Promise<PmRequestEvent | null> {
+    return this.tx(scope, async (client) => {
+      const result = await client.query<{ body: PmRequestEvent }>(
+        "SELECT body FROM pm_thread_events WHERE tenant_id=$1 AND workspace_id=$2 AND run_id=$3 AND kind='request'",
+        [scope.tenantId, scope.workspaceId, runId]);
+      return result.rows[0]?.body ?? null;
+    });
+  }
+
+  followupsForRun(scope: PmScope, runId: string): Promise<PmEventSummary[]> {
+    return this.tx(scope, async (client) => (await client.query<Row>(
+      `SELECT ${EVENT_SUMMARY} FROM pm_thread_events WHERE tenant_id=$1 AND workspace_id=$2 AND run_id=$3 AND kind='followup' ORDER BY ordinal DESC LIMIT 3`,
+      [scope.tenantId, scope.workspaceId, runId])).rows.map(eventSummary).reverse());
   }
 
   detail(scope: PmScope, id: string): Promise<PmRunDetail> { return this.tx(scope, (client) => this.detailOn(client, scope, id)); }

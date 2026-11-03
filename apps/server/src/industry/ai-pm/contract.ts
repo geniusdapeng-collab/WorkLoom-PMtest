@@ -10,7 +10,7 @@ export const MAX_TASKS = 8;
 // "employee-task-<uuid>" segment must not be mistaken for an embedded "sk-" key.
 // Delimiters (including Unicode text) still admit a credential-shaped token.
 const SECRET_PATTERN = /(?:(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN(?: [A-Z]+)* PRIVATE KEY-----|Bearer\s+[A-Za-z0-9._-]{20,})/;
-const CONFIGURED_CREDENTIAL_KEYS = ["DEEPSEEK_API_KEY", "LLM_API_KEY", "GH_TOKEN", "GITHUB_TOKEN"] as const;
+const CONFIGURED_CREDENTIAL_KEYS = ["DEEPSEEK_API_KEY", "LLM_API_KEY", "PM_MODEL_API_KEY", "GH_TOKEN", "GITHUB_TOKEN"] as const;
 
 /** Fail closed before persistence, model input or artifact publication. Never echo the matched text. */
 export function assertNoSecrets(value: unknown): void {
@@ -19,7 +19,7 @@ export function assertNoSecrets(value: unknown): void {
   catch { throw new PmError("INVALID_DATA", "数据不能安全序列化"); }
   // Known runtime credentials are denied anywhere, even when concatenated to a
   // word. Compare both raw and JSON-escaped forms without copying values into
-  // errors, logs or receipts; only the four relevant runtime variables are read.
+  // errors, logs or receipts; only the listed runtime variables are read.
   const configuredSecret = typeof text === "string" && CONFIGURED_CREDENTIAL_KEYS.some((key) => {
     const secret = process.env[key]?.trim();
     return !!secret && (text.includes(secret) || text.includes(JSON.stringify(secret).slice(1, -1)));
