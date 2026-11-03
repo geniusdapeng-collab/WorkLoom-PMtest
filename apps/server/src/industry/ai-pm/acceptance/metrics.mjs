@@ -86,8 +86,10 @@ export function intentSlotAvailable(boundary, { searchSelected = false, searchCo
   const used = boundary?.budget?.used?.llmCalls;
   const cap = boundary?.budget?.budgets?.maxLlmCalls;
   const frozen = boundary?.budget?.frozenBy;
-  return { allowed: Number.isSafeInteger(used) && used >= 0 && Number.isSafeInteger(cap) && cap >= 0
-    && Array.isArray(frozen) && frozen.length === 0 && used < cap - searchReserve, searchReserve };
+  const unlimited = cap === null && boundary?.budget?.schema === "workloom.pm-task-budget/v1";
+  return { allowed: Number.isSafeInteger(used) && used >= 0 && (unlimited || Number.isSafeInteger(cap) && cap >= 0)
+    && Array.isArray(frozen) && frozen.length === 0 && (!boundary?.budget?.exceeded || boundary.budget.exceeded.length === 0)
+    && (unlimited || used < cap - searchReserve), searchReserve };
 }
 
 export function buildEvaluationMetrics(cases, session) {

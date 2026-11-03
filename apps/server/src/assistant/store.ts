@@ -13,6 +13,29 @@ import type {
 } from "./types.js";
 
 type Row = Record<string, unknown>;
+interface BudgetSettlement {
+  measured: boolean;
+  usage: AssistantUsage | null;
+  callsUsed: number;
+  searchCallsUsed: number;
+  blockedReason: string | null;
+}
+interface BudgetReservation {
+  runId: string;
+  reservationId: string;
+  budgetDate: string;
+  forecastTokens: number;
+  reservedCalls: number;
+  reservedSearchCalls: number;
+  settlement: BudgetSettlement | null;
+}
+const nonnegativeInteger = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+function measuredUsage(value: AssistantUsage | undefined): AssistantUsage | null {
+  if (!value || !nonnegativeInteger(value.promptTokens) || !nonnegativeInteger(value.completionTokens)) return null;
+  const total = value.promptTokens + value.completionTokens;
+  if (!nonnegativeInteger(total) || value.totalTokens !== undefined && value.totalTokens !== total) return null;
+  return { promptTokens: value.promptTokens, completionTokens: value.completionTokens, totalTokens: total };
+}
 
 const stamp = (value: unknown): string => value instanceof Date ? value.toISOString() : String(value);
 const nullableStamp = (value: unknown): string | null => value == null ? null : stamp(value);
@@ -117,7 +140,7 @@ export interface AssistantStore {
   setSessionStatus(scope: AssistantScope, id: string, status: "active" | "archived" | "deleted"): Promise<AssistantSession>;
   listMessages(scope: AssistantScope, sessionId: string, afterSeq?: string, limit?: number): Promise<AssistantMessage[]>;
   createTurn(scope: AssistantScope, input: CreateTurnInput): Promise<{ run: AssistantRun; userMessage: AssistantMessage; assistantMessage: AssistantMessage; replayed: boolean }>;
-  historyForRun(scope: AssistantScope, runId: string, limit?: number): Promise<AssistantMessage[]>;
+  historyForRun(scope: AssistantScope, runId: string): Promise<AssistantMessage[]>;
   getRun(scope: AssistantScope, id: string): Promise<AssistantRun>;
   setRunThread(scope: AssistantScope, runId: string, threadId: string): Promise<void>;
   updateSearchState(scope: AssistantScope, runId: string, input: {
@@ -146,8 +169,10 @@ export interface AssistantStore {
     responseId?: string | null;
   }): Promise<void>;
   getEvents(scope: AssistantScope, runId: string, afterId: string, limit?: number): Promise<AssistantRunEvent[]>;
-  reserveBudget(scope: AssistantScope, runId: string, maxOutputTokens: number, reservedCalls?: number, reservedSearchCalls?: number): Promise<{ budgetDate: string }>;
+  reserveBudget(scope: AssistantScope, runId: string, heldTokens: number, reservedCalls?: number, reservedSearchCalls?: number, reservationId?: string): Promise<{ budgetDate: string; reservationId: string }>;
   settleBudget(scope: AssistantScope, input: {
+    runId: string;
+    reservationId: string;
     budgetDate: string;
     usage?: AssistantUsage;
     reservedCalls: number;
@@ -164,6 +189,7 @@ export class PgAssistantStore implements AssistantStore {
 
   private async tx<T>(scope: AssistantScope, fn: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
+    let discard = false;
     try {
       await client.query("BEGIN");
       await client.query("SELECT set_config('app.tenant_id',$1,true)", [scope.tenantId]);
@@ -172,10 +198,14 @@ export class PgAssistantStore implements AssistantStore {
       await client.query("COMMIT");
       return value;
     } catch (error) {
-      await client.query("ROLLBACK").catch(() => undefined);
+      try { await client.query("ROLLBACK"); }
+      catch (rollbackError) {
+        discard = true;
+        throw new AggregateError([error, rollbackError], "Assistant transaction failed and could not roll back; the pooled connection was discarded");
+      }
       throw error;
     } finally {
-      client.release();
+      client.release(discard);
     }
   }
 
@@ -422,30 +452,29 @@ export class PgAssistantStore implements AssistantStore {
     });
   }
 
-  async historyForRun(scope: AssistantScope, runId: string, limit = 40): Promise<AssistantMessage[]> {
+  async historyForRun(scope: AssistantScope, runId: string): Promise<AssistantMessage[]> {
     return this.tx(scope, async (client) => {
-      const run = await client.query<{ session_id: string; user_message_id: string }>(
-        `SELECT session_id,user_message_id FROM assistant_runs
-          WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND owner_member_no=$4`,
+      const run = await client.query<{ session_id: string; user_seq: string }>(
+        `SELECT r.session_id,m.seq AS user_seq FROM assistant_runs r
+           JOIN assistant_messages m ON m.id=r.user_message_id AND m.session_id=r.session_id
+             AND m.tenant_id=r.tenant_id AND m.workspace_id=r.workspace_id
+          WHERE r.id=$1 AND r.tenant_id=$2 AND r.workspace_id=$3 AND r.owner_member_no=$4`,
         [runId, scope.tenantId, scope.workspaceId, scope.memberNo],
       );
       if (!run.rows[0]) throw new AssistantStoreError("RUN_NOT_FOUND", "运行不存在或无权访问", 404);
       const result = await client.query<Row>(
-        `SELECT * FROM (
-           SELECT * FROM assistant_messages
+        `SELECT * FROM assistant_messages
             WHERE session_id=$1 AND tenant_id=$2 AND workspace_id=$3
               AND owner_member_no=$4
               AND role IN ('user','assistant') AND status='completed'
-              AND id<>$5
-            ORDER BY seq DESC LIMIT $6
-         ) recent ORDER BY seq ASC`,
+              AND seq<$5
+            ORDER BY seq ASC`,
         [
           run.rows[0].session_id,
           scope.tenantId,
           scope.workspaceId,
           scope.memberNo,
-          run.rows[0].user_message_id,
-          limit,
+          run.rows[0].user_seq,
         ],
       );
       return result.rows.map(messageRow);
@@ -666,17 +695,65 @@ export class PgAssistantStore implements AssistantStore {
     });
   }
 
-  async reserveBudget(scope: AssistantScope, runId: string, maxOutputTokens: number, reservedCalls = 1, reservedSearchCalls = 0): Promise<{ budgetDate: string }> {
+  private async budgetReservations(client: PoolClient, scope: AssistantScope, budgetDate: string): Promise<Map<string, BudgetReservation>> {
+    const events = await client.query<{ run_id: string; payload: Row }>(
+      `SELECT run_id,payload FROM assistant_run_events
+        WHERE tenant_id=$1 AND workspace_id=$2 AND type='usage.updated'
+          AND payload->>'budgetDate'=$3 AND payload ? 'budgetEvent' ORDER BY id ASC`,
+      [scope.tenantId, scope.workspaceId, budgetDate],
+    );
+    const reservations = new Map<string, BudgetReservation>();
+    for (const event of events.rows) {
+      const payload = event.payload;
+      const reservationId = payload.reservationId;
+      if (typeof reservationId !== "string" || !reservationId.trim() || payload.runId !== event.run_id) {
+        throw new AssistantStoreError("BUDGET_LEDGER_INVALID", "预算事件缺少明确运行与预占身份，禁止继续付费", 503);
+      }
+      if (payload.budgetEvent === "reserved") {
+        if (reservations.has(reservationId) || !nonnegativeInteger(payload.forecastTokens) || !nonnegativeInteger(payload.reservedCalls)
+          || !nonnegativeInteger(payload.reservedSearchCalls) || payload.reservedCalls + payload.reservedSearchCalls < 1) {
+          throw new AssistantStoreError("BUDGET_LEDGER_INVALID", "预算预占事件重复或计量无效", 503);
+        }
+        reservations.set(reservationId, { runId: event.run_id, reservationId, budgetDate,
+          forecastTokens: payload.forecastTokens, reservedCalls: payload.reservedCalls, reservedSearchCalls: payload.reservedSearchCalls, settlement: null });
+      } else if (payload.budgetEvent === "settled") {
+        const prior = reservations.get(reservationId);
+        const usage = measuredUsage(payload.usage as AssistantUsage | undefined);
+        if (!prior || prior.runId !== event.run_id || prior.settlement || typeof payload.measured !== "boolean"
+          || !nonnegativeInteger(payload.callsUsed) || !nonnegativeInteger(payload.searchCallsUsed)
+          || payload.measured && !usage || payload.blockedReason !== null && typeof payload.blockedReason !== "string") {
+          throw new AssistantStoreError("BUDGET_LEDGER_INVALID", "预算结算事件与原预占不一致", 503);
+        }
+        prior.settlement = { measured: payload.measured, usage, callsUsed: payload.callsUsed,
+          searchCallsUsed: payload.searchCallsUsed, blockedReason: payload.blockedReason as string | null };
+      } else throw new AssistantStoreError("BUDGET_LEDGER_INVALID", "未知预算事件，禁止继续付费", 503);
+    }
+    return reservations;
+  }
+
+  /** The caller supplies the complete input plus legal output bound, after
+   * serialization. This is a hard daily hold, never an expected-output estimate. */
+  async reserveBudget(scope: AssistantScope, runId: string, heldTokens: number, reservedCalls = 1, reservedSearchCalls = 0, reservationId = runId): Promise<{ budgetDate: string; reservationId: string }> {
     const maxCalls = boundedInteger(process.env.ASSISTANT_DAILY_CALL_LIMIT, 300, 1, 100_000);
     const maxTokens = boundedInteger(process.env.ASSISTANT_DAILY_TOKEN_LIMIT, 2_000_000, 1_000, 100_000_000);
     const maxSearchCalls = boundedInteger(process.env.ASSISTANT_DAILY_SEARCH_LIMIT, 100, 1, 100_000);
-    if (!Number.isSafeInteger(reservedCalls) || reservedCalls < 1 || reservedCalls > 10_000) {
-      throw new AssistantStoreError("INVALID_BUDGET_CONFIG", "预算调用预留必须是 1..10000 的整数", 503);
-    }
-    if (!Number.isSafeInteger(reservedSearchCalls) || reservedSearchCalls < 0 || reservedSearchCalls > 10_000) {
-      throw new AssistantStoreError("INVALID_BUDGET_CONFIG", "搜索预算预留必须是 0..10000 的整数", 503);
+    if (!nonnegativeInteger(reservedCalls) || reservedCalls > 10_000 || !nonnegativeInteger(reservedSearchCalls) || reservedSearchCalls > 10_000
+      || reservedCalls + reservedSearchCalls < 1 || !nonnegativeInteger(heldTokens) || reservedCalls > 0 && heldTokens === 0
+      || typeof reservationId !== "string" || !reservationId.trim() || reservationId.length > 200) {
+      throw new AssistantStoreError("INVALID_BUDGET_CONFIG", "模型/搜索预占必须有明确身份、非负计数及完整请求 token 上界", 503);
     }
     return this.tx(scope, async (client) => {
+      const run = await client.query<{ session_id: string }>(
+        `SELECT session_id FROM assistant_runs WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND owner_member_no=$4`,
+        [runId, scope.tenantId, scope.workspaceId, scope.memberNo],
+      );
+      if (!run.rows[0]) throw new AssistantStoreError("RUN_NOT_FOUND", "运行不存在或无权预占", 404);
+      const unresolved = await client.query<{ blocked_reason: string }>(
+        `SELECT blocked_reason FROM assistant_budgets WHERE tenant_id=$1 AND workspace_id=$2
+          AND blocked=true AND blocked_reason LIKE 'USAGE_UNKNOWN:%' LIMIT 1`,
+        [scope.tenantId, scope.workspaceId],
+      );
+      if (unresolved.rows[0]) throw new AssistantStoreError("BUDGET_FROZEN", unresolved.rows[0].blocked_reason, 429);
       const dateResult = await client.query<{ budget_date: string }>(
         "SELECT (now() AT TIME ZONE 'Asia/Shanghai')::date::text AS budget_date",
       );
@@ -697,6 +774,15 @@ export class PgAssistantStore implements AssistantStore {
         [budgetDate, scope.tenantId, scope.workspaceId],
       );
       const row = existing.rows[0];
+      const reservations = await this.budgetReservations(client, scope, budgetDate);
+      if (reservations.has(reservationId)) throw new AssistantStoreError("BUDGET_RESERVATION_EXISTS", "该物理请求或任务已预占，禁止用相同身份再次付费", 409);
+      const pending = [...reservations.values()].filter((item) => !item.settlement || !item.settlement.measured);
+      const forecast = pending.reduce((sum, item) => sum + item.forecastTokens, 0);
+      const expectedCalls = pending.reduce((sum, item) => sum + item.reservedCalls, 0);
+      const expectedSearch = pending.reduce((sum, item) => sum + item.reservedSearchCalls, 0);
+      if (!nonnegativeInteger(forecast) || expectedCalls !== Number(row?.calls_reserved ?? 0) || expectedSearch !== Number(row?.search_calls_reserved ?? 0)) {
+        throw new AssistantStoreError("BUDGET_UNVERIFIED", "既有预占缺少可重放的精确预测，须先核实原账本，禁止推定零用量", 429);
+      }
       const reserved = Number(row?.calls_reserved ?? 0);
       const calls = reserved + Number(row?.calls_used ?? 0);
       const promptTokens = Number(row?.prompt_tokens_used ?? 0);
@@ -709,7 +795,8 @@ export class PgAssistantStore implements AssistantStore {
       if (searchCalls + reservedSearchCalls > maxSearchCalls) {
         throw new AssistantStoreError("SEARCH_BUDGET_BLOCKED", `今日网页搜索余额不足以预留 ${reservedSearchCalls} 次`, 429);
       }
-      if (promptTokens + completionTokens + reserved * 8192 + maxOutputTokens > maxTokens) {
+      if (!nonnegativeInteger(promptTokens + completionTokens + forecast + heldTokens)
+        || promptTokens + completionTokens + forecast + heldTokens > maxTokens) {
         throw new AssistantStoreError("BUDGET_BLOCKED", "今日 token 余额不足，本次请求未发出", 429);
       }
       await client.query(
@@ -727,17 +814,19 @@ export class PgAssistantStore implements AssistantStore {
          SELECT $1,session_id,tenant_id,workspace_id,'usage.updated',$4::jsonb
            FROM assistant_runs WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3`,
         [runId, scope.tenantId, scope.workspaceId, JSON.stringify({
-          budgetDate,
-          reservedCalls,
-          reservedSearchCalls,
-          maxOutputTokens,
+          budgetEvent: "reserved", runId, reservationId, budgetDate,
+          reservedCalls, reservedSearchCalls, forecastTokens: heldTokens,
+          holdPolicy: "full-input-plus-legal-output",
+          accounting: "The legacy forecastTokens field stores a hard hold: complete input plus legal output. It never sets model max_tokens",
         })],
       );
-      return { budgetDate };
+      return { budgetDate, reservationId };
     });
   }
 
   async settleBudget(scope: AssistantScope, input: {
+    runId: string;
+    reservationId: string;
     budgetDate: string;
     usage?: AssistantUsage;
     reservedCalls: number;
@@ -749,8 +838,8 @@ export class PgAssistantStore implements AssistantStore {
     const callsUsed = input.callsUsed ?? 1;
     const reservedSearchCalls = input.reservedSearchCalls ?? 0;
     const searchCallsUsed = input.searchCallsUsed ?? 0;
-    if (!Number.isSafeInteger(input.reservedCalls) || input.reservedCalls < 1 || input.reservedCalls > 10_000) {
-      throw new AssistantStoreError("INVALID_BUDGET_CONFIG", "预算调用结算必须对应 1..10000 次预留", 503);
+    if (!Number.isSafeInteger(input.reservedCalls) || input.reservedCalls < 0 || input.reservedCalls > 10_000) {
+      throw new AssistantStoreError("INVALID_BUDGET_CONFIG", "预算调用结算必须对应 0..10000 次预留", 503);
     }
     if (!Number.isSafeInteger(callsUsed) || callsUsed < 0 || callsUsed > 10_000) {
       throw new AssistantStoreError("INVALID_BUDGET_CONFIG", "已用调用数必须是 0..10000 的整数", 503);
@@ -759,12 +848,45 @@ export class PgAssistantStore implements AssistantStore {
       || !Number.isSafeInteger(searchCallsUsed) || searchCallsUsed < 0 || searchCallsUsed > 10_000) {
       throw new AssistantStoreError("INVALID_BUDGET_CONFIG", "搜索预算结算必须是 0..10000 的整数", 503);
     }
+    if (input.reservedCalls + reservedSearchCalls < 1 || typeof input.runId !== "string" || typeof input.reservationId !== "string") {
+      throw new AssistantStoreError("INVALID_BUDGET_CONFIG", "预算结算必须关联原运行及明确预占", 503);
+    }
+    const normalizedUsage = measuredUsage(input.usage);
+    const invalidUsage = input.usage !== undefined && !normalizedUsage;
+    const usage = normalizedUsage ?? (callsUsed === 0 && !input.blockedReason && !invalidUsage ? { promptTokens: 0, completionTokens: 0, totalTokens: 0 } : null);
+    const measured = usage !== null && !input.blockedReason;
+    const blockedReason = measured ? null : `USAGE_UNKNOWN:${input.blockedReason || (invalidUsage ? "模型计量不完整或总数矛盾，保留原预占" : "供应商实际用量未知，保留原预占并冻结后续付费")}`;
+    const settlement: BudgetSettlement = { measured, usage, callsUsed, searchCallsUsed, blockedReason };
     await this.tx(scope, async (client) => {
+      const run = await client.query<{ session_id: string }>(
+        `SELECT session_id FROM assistant_runs WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND owner_member_no=$4`,
+        [input.runId, scope.tenantId, scope.workspaceId, scope.memberNo],
+      );
+      if (!run.rows[0]) throw new AssistantStoreError("RUN_NOT_FOUND", "运行不存在或无权结算", 404);
+      const locked = await client.query<Row>(
+        `SELECT * FROM assistant_budgets WHERE budget_date=$1 AND tenant_id=$2 AND workspace_id=$3 FOR UPDATE`,
+        [input.budgetDate, scope.tenantId, scope.workspaceId],
+      );
+      if (!locked.rows[0]) throw new AssistantStoreError("BUDGET_RESERVATION_MISSING", "没有对应预算预占", 409);
+      const reservations = await this.budgetReservations(client, scope, input.budgetDate);
+      const prior = reservations.get(input.reservationId);
+      if (!prior || prior.runId !== input.runId || prior.reservedCalls !== input.reservedCalls || prior.reservedSearchCalls !== reservedSearchCalls) {
+        throw new AssistantStoreError("BUDGET_RESERVATION_MISSING", "结算身份或计数不匹配原预占", 409);
+      }
+      if (prior.settlement) {
+        if (JSON.stringify(prior.settlement) !== JSON.stringify(settlement)) throw new AssistantStoreError("BUDGET_SETTLEMENT_CONFLICT", "已结算回执不能覆盖或重复计量", 409);
+        return;
+      }
+      if (Number(locked.rows[0].calls_reserved) < prior.reservedCalls || Number(locked.rows[0].search_calls_reserved) < prior.reservedSearchCalls) {
+        throw new AssistantStoreError("BUDGET_LEDGER_INVALID", "预算汇总小于待结算预占，拒绝静默归零", 503);
+      }
+      const hardBoundExceeded = measured && (usage!.totalTokens! > prior.forecastTokens || callsUsed > prior.reservedCalls || searchCallsUsed > prior.reservedSearchCalls);
+      const freezeReason = hardBoundExceeded ? "QUOTA_BOUND_EXCEEDED:供应商实际用量超过原硬预占，已如实结算，核实前冻结当日后续调用" : blockedReason;
       await client.query(
         `UPDATE assistant_budgets
-            SET calls_reserved=GREATEST(0,calls_reserved-$4),
+            SET calls_reserved=calls_reserved-$4,
                 calls_used=calls_used+$5,
-                search_calls_reserved=GREATEST(0,search_calls_reserved-$6),
+                search_calls_reserved=search_calls_reserved-$6,
                 search_calls_used=search_calls_used+$7,
                 prompt_tokens_used=prompt_tokens_used+$8,
                 completion_tokens_used=completion_tokens_used+$9,
@@ -776,14 +898,20 @@ export class PgAssistantStore implements AssistantStore {
           input.budgetDate,
           scope.tenantId,
           scope.workspaceId,
-          input.reservedCalls,
-          callsUsed,
-          reservedSearchCalls,
-          searchCallsUsed,
-          input.usage?.promptTokens ?? 0,
-          input.usage?.completionTokens ?? 0,
-          input.blockedReason ?? null,
+          measured ? input.reservedCalls : 0,
+          measured ? callsUsed : 0,
+          measured ? reservedSearchCalls : 0,
+          measured ? searchCallsUsed : 0,
+          measured ? usage!.promptTokens : 0,
+          measured ? usage!.completionTokens : 0,
+          freezeReason,
         ],
+      );
+      await client.query(
+        `INSERT INTO assistant_run_events(run_id,session_id,tenant_id,workspace_id,type,payload)
+         VALUES($1,$2,$3,$4,'usage.updated',$5::jsonb)`,
+        [input.runId, run.rows[0].session_id, scope.tenantId, scope.workspaceId,
+          JSON.stringify({ budgetEvent: "settled", runId: input.runId, reservationId: input.reservationId, budgetDate: input.budgetDate, ...settlement, hardBoundExceeded })],
       );
     });
   }
@@ -793,7 +921,7 @@ export class PgAssistantStore implements AssistantStore {
       const stale = await client.query<{ id: string; session_id: string; assistant_message_id: string }>(
         `UPDATE assistant_runs
             SET status='interrupted',error_code='PROCESS_INTERRUPTED',
-                error='服务进程中断；已保留会话与部分消息，请重试',finished_at=now(),updated_at=now()
+                error='服务进程中断；已保留会话与部分消息，须先核实原调用计量',finished_at=now(),updated_at=now()
           WHERE tenant_id=$1 AND workspace_id=$2
             AND status IN ('queued','running')
             AND updated_at < now() - interval '10 minutes'
@@ -801,6 +929,24 @@ export class PgAssistantStore implements AssistantStore {
         [scope.tenantId, scope.workspaceId],
       );
       for (const row of stale.rows) {
+        // The append-only reservation proves a request was authorized, but a
+        // process restart cannot prove whether it reached the provider. Keep
+        // its forecast and stop new paid work until that outcome is reconciled.
+        await client.query(
+          `UPDATE assistant_budgets b SET blocked=true,
+             blocked_reason='USAGE_UNKNOWN:服务进程中断且原预占没有完整结算',updated_at=now()
+           WHERE b.tenant_id=$2 AND b.workspace_id=$3 AND EXISTS (
+             SELECT 1 FROM assistant_run_events reserved
+              WHERE reserved.run_id=$1 AND reserved.tenant_id=b.tenant_id AND reserved.workspace_id=b.workspace_id
+                AND reserved.payload->>'budgetEvent'='reserved'
+                AND reserved.payload->>'budgetDate'=b.budget_date::text
+                AND NOT EXISTS (SELECT 1 FROM assistant_run_events settled
+                  WHERE settled.run_id=reserved.run_id AND settled.tenant_id=reserved.tenant_id AND settled.workspace_id=reserved.workspace_id
+                    AND settled.payload->>'budgetEvent'='settled'
+                    AND settled.payload->>'reservationId'=reserved.payload->>'reservationId'
+                    AND settled.payload->>'measured'='true'))`,
+          [row.id, scope.tenantId, scope.workspaceId],
+        );
         await client.query(
           `UPDATE assistant_messages
               SET status='failed',finished_at=now()
@@ -811,7 +957,7 @@ export class PgAssistantStore implements AssistantStore {
           `INSERT INTO assistant_run_events(run_id,session_id,tenant_id,workspace_id,type,payload)
            VALUES($1,$2,$3,$4,'error',$5::jsonb)`,
           [row.id, row.session_id, scope.tenantId, scope.workspaceId,
-            JSON.stringify({ code: "PROCESS_INTERRUPTED", message: "服务进程中断，需重试" })],
+            JSON.stringify({ code: "PROCESS_INTERRUPTED", message: "服务进程中断，先核实原调用计量再恢复" })],
         );
       }
       return stale.rowCount ?? 0;

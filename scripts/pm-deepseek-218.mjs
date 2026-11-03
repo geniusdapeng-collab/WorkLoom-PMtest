@@ -3,8 +3,8 @@
  *
  * The upstream key stays inside this process and the loopback budget proxy.
  * The product provider and Search tool only receive an ephemeral control token.
- * Paid requests are sharded because the repository's live budget contract caps
- * one persistent run at 40 physical calls.
+ * Shards are resumable work batches. Their independent PM accounting forecasts
+ * never replace the provider's exact model window; measured usage settles them.
  */
 import { createHash, randomBytes } from "node:crypto";
 import {
@@ -14,7 +14,8 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { OpenAiCompatibleProvider, createDeepSeekTools } from "@workloom/base/model-router";
 import { executeSandboxNodeTests } from "../apps/server/src/industry/ai-pm/code-verifier.ts";
-import { createOfficialTokenCounter, createPmBudgetProxy } from "./pm-budget-proxy.mjs";
+import { createPmBudgetProxy } from "./pm-budget-proxy.mjs";
+import { countDeepSeekInputTokens } from "../packages/base/model-router/deepseek-window.ts";
 import {
   DEFAULT_SHARD_REQUEST_CAP,
   completeJsonDelimiters,
@@ -29,7 +30,7 @@ import {
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CATALOG_PATH = join(ROOT, "bundles/ai-pm/eval/deepseek-218.json");
-const OUT_DIR = resolve(process.env.PM_DEEPSEEK_218_OUT ?? join(ROOT, "outputs/deepseek-218"));
+const OUT_DIR = resolve(process.env.PM_DEEPSEEK_218_OUT ?? join(ROOT, "outputs/deepseek-218-window-v2"));
 const REEVALUATE = process.env.PM_DEEPSEEK_218_REEVALUATE === "1";
 const PHASE = process.env.PM_DEEPSEEK_218_PHASE ?? (REEVALUATE ? "reevaluate-1" : "initial");
 const RERUN = process.env.PM_DEEPSEEK_218_RERUN ?? "none";
@@ -37,10 +38,6 @@ const ONLY = process.env.PM_DEEPSEEK_218_ONLY
   ? new Set(process.env.PM_DEEPSEEK_218_ONLY.split(",").map((value) => value.trim()).filter(Boolean))
   : null;
 const API_KEY = process.env.DEEPSEEK_API_KEY || process.env.LLM_API_KEY || "";
-const PYTHON = process.env.PM_TOKENIZER_PYTHON
-  || "python3";
-const TOKENIZER_PATH = process.env.PM_TOKENIZER_PATH
-  || join(ROOT, "work/deepseek-recipe/static/tokenizers/v41/tokenizer.json");
 const SUITE_ID = process.env.PM_DEEPSEEK_218_SUITE_ID
   || `deepseek-218-${new Date().toISOString().replaceAll(/[:.]/g, "-")}`;
 const MAX_COST_CNY = numberEnv("PM_DEEPSEEK_218_MAX_COST_CNY", 30);
@@ -48,7 +45,6 @@ const MAX_SEARCH_CALLS = integerEnv("PM_DEEPSEEK_218_MAX_SEARCH_CALLS", 50, 1, 1
 if (!REEVALUATE && !API_KEY.trim()) throw new Error("缺少 DEEPSEEK_API_KEY 或 LLM_API_KEY；未发起付费调用");
 if (!["none", "failed", "all"].includes(RERUN)) throw new Error("PM_DEEPSEEK_218_RERUN 只能是 none、failed 或 all");
 if (!/^[A-Za-z0-9_.:-]{1,160}$/.test(SUITE_ID)) throw new Error("PM_DEEPSEEK_218_SUITE_ID 含非法字符");
-if (!REEVALUATE && !existsSync(TOKENIZER_PATH)) throw new Error(`缺少经校验的 V4.1 tokenizer：${TOKENIZER_PATH}`);
 
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 const now = () => new Date().toISOString();
@@ -397,11 +393,12 @@ async function main() {
   }
 
   const plans = planShards(catalog.tasks, DEFAULT_SHARD_REQUEST_CAP);
-  const tokenCounter = createOfficialTokenCounter({ python: PYTHON, tokenizerPath: TOKENIZER_PATH });
-  let suiteBudget = remainingCostBudget(loadBudgetSummaries(OUT_DIR), MAX_COST_CNY);
+  const tokenCounter = { count: countDeepSeekInputTokens };
+  const previousBudgets = loadBudgetSummaries(OUT_DIR);
+  if (previousBudgets.some((row) => row.measurementComplete !== true)) throw new Error("既有 shard 的真实用量未核实；保留原预占并停止，不能换 shard 盲重试");
+  let suiteBudget = remainingCostBudget(previousBudgets, MAX_COST_CNY);
   let activeProxy;
   try {
-    await tokenCounter.ready;
     let fatalBudget = false;
     for (const plan of plans.shards) {
       const shardTasks = plan.tasks.filter(shouldRun);
@@ -423,11 +420,9 @@ async function main() {
         outDir: shardDir,
         runId: proxyRunId.slice(0, 180),
         maxSearchCalls: MAX_SEARCH_CALLS,
-        budgets: {
-          maxLlmCalls: Math.min(40, plan.estimatedCalls),
-          maxLlmTokens: 300_000,
-          maxCostCny: Math.min(30, suiteBudget.remaining),
-          maxWallClockMin: 45,
+        taskBudget: {
+          maxCalls: plan.estimatedCalls,
+          maxCostCny: suiteBudget.remaining,
         },
       });
       const proxyOrigin = activeProxy.url;
@@ -472,7 +467,6 @@ async function main() {
             { role: "system", content: systemPrompt(task) },
             { role: "user", content: userPrompt(task, searchReceipt) },
           ], {
-            maxTokens: task.maxOutputTokens,
             thinking: "disabled",
             requireUsage: true,
             responseFormat: { type: "json_object" },
@@ -486,6 +480,7 @@ async function main() {
             responseId: response.responseId ?? null,
             finishReason: response.finishReason,
             usage: response.usage ?? null,
+            window: response.request ?? null,
             latencyMs: Math.round(performance.now() - modelStarted),
           };
           appendJson(eventsPath, { at: now(), event: "model_finish", taskId: task.id, responseModel: response.model, responseId: response.responseId ?? null,
@@ -504,6 +499,13 @@ async function main() {
           errorMessage = evaluation.error;
         } catch (error) {
           errorMessage = safeMessage(error, API_KEY, controlToken);
+          if (error?.receipt?.usageComplete === true && error?.usage) request = {
+            requestedModel: provider.modelId, responseModel: error.modelId ?? null, responseId: error.receipt.responseId ?? null,
+            finishReason: error.receipt.finishReason ?? null, window: error.request ?? null,
+            usage: { prompt_tokens: error.usage.promptTokens, completion_tokens: error.usage.completionTokens,
+              total_tokens: error.usage.promptTokens + error.usage.completionTokens },
+            protocolRejected: true,
+          };
           evaluation = {
             schema: "workloom.pm-deepseek-result/v1",
             taskId: task.id,
@@ -589,8 +591,7 @@ async function main() {
       if (fatalBudget) break;
     }
   } finally {
-    if (activeProxy) await activeProxy.close().catch(() => undefined);
-    tokenCounter.close();
+    if (activeProxy) await activeProxy.close();
   }
 
   const finalLatest = catalog.tasks.map((task) => latest.get(task.id)).filter(Boolean);

@@ -5,6 +5,8 @@
  *  - F6.6/L6.2：所有文本与工具协议出站都在提供方层强制脱敏；调用方另负责租户、围栏和计量留痕
  */
 import { maskDeep } from "../workdata/pii.js";
+import { createHash, randomUUID } from "node:crypto";
+import { DEEPSEEK_V41_WINDOW, planDeepSeekWindow } from "./deepseek-window.js";
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -56,6 +58,30 @@ export interface BeforeCompletionRequest {
   maxTokens: number;
   model: string;
   signal: AbortSignal;
+  /** Exact post-masking wire snapshot. Mutating a hook's copy cannot change dispatch. */
+  body: Record<string, unknown>;
+  request?: CompletionRequestReceipt;
+}
+
+export interface CompletionRequestReceipt {
+  model: string;
+  fullInputTokens: number;
+  maxTokens: number;
+  contextTokens: number;
+  requestSha256: string;
+  tokenizerSha256: string;
+  recipeVersion: string;
+}
+
+export type CompletionDispatchState = "blocked-before-send" | "possibly-sent" | "sent-usage-known";
+/** Bounded accounting metadata only: never a prompt, raw response, or secret. */
+export interface CompletionDispatchReceipt {
+  attemptId: string;
+  model: string;
+  dispatchState: CompletionDispatchState;
+  usageComplete: boolean;
+  requestSha256?: string;
+  modelRequest?: CompletionRequestReceipt;
 }
 
 export interface CompletionOptions {
@@ -70,6 +96,8 @@ export interface CompletionOptions {
   responseFormat?: { type: "text" | "json_object" };
   /** 预算预留/治理闸门必须在网络请求之前完成；异常直接终止，不降级至 mock。 */
   beforeRequest?: (request: BeforeCompletionRequest) => void | Promise<void>;
+  /** Last durable dispatch marker, after quota admission and before fetch. */
+  beforeDispatch?: (receipt: CompletionDispatchReceipt) => void | Promise<void>;
   /** 旧 chat 网关可能没有 usage；真实工具执行默认拒绝缺失计量。 */
   requireUsage?: boolean;
 }
@@ -80,6 +108,8 @@ export interface CompletionResult extends ChatResult {
   model: string;
   finishReason: string;
   usage?: CompletionUsage;
+  request?: CompletionRequestReceipt;
+  requestReceipt?: CompletionDispatchReceipt;
 }
 
 export interface CompletionProvider {
@@ -95,7 +125,7 @@ export interface OpenAiProviderConfig {
   beforeRequest?: CompletionOptions["beforeRequest"];
 }
 
-export const DEFAULT_DEEPSEEK_MODEL = "deepseek-flash";
+export const DEFAULT_DEEPSEEK_MODEL = DEEPSEEK_V41_WINDOW.modelId;
 
 /** 同时约束请求和读取响应；finally 释放计时器与父级信号监听器。 */
 export function requestDeadline(parent?: AbortSignal, timeoutMs = 120_000): {
@@ -128,6 +158,38 @@ export async function abortable<T>(work: Promise<T>, signal: AbortSignal): Promi
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function receiptIdentifier(value: unknown, limit: number, secret?: string): string | undefined {
+  if (typeof value !== "string" || value.length > limit || !/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(value)
+    || /(?:sk-|gh[pousr]_|github_pat_)/i.test(value) || (secret && value.includes(secret))) return undefined;
+  return value;
+}
+
+/** A rejected message can still be a paid physical request. Copy only bounded
+ * accounting fields, never assistant text, reasoning or tool arguments. */
+function meteredProtocolFailure(error: unknown, value: unknown, requestedModel: string, secret?: string): Error {
+  const failure = error instanceof Error ? error : new Error("模型响应协议错误");
+  if (!isRecord(value) || !isRecord(value.usage)) return failure;
+  const prompt = value.usage.prompt_tokens;
+  const completion = value.usage.completion_tokens;
+  if (!Number.isSafeInteger(prompt) || !Number.isSafeInteger(completion) || (prompt as number) < 0 || (completion as number) < 0) return failure;
+  const sum = (prompt as number) + (completion as number);
+  const total = value.usage.total_tokens ?? sum;
+  if (!Number.isSafeInteger(sum) || !Number.isSafeInteger(total) || total !== sum) return failure;
+  const reportedModel = receiptIdentifier(value.model, 150, secret);
+  const modelId = reportedModel ?? receiptIdentifier(requestedModel, 150, secret);
+  const responseId = receiptIdentifier(value.id, 200, secret);
+  const choice = Array.isArray(value.choices) && isRecord(value.choices[0]) ? value.choices[0] : undefined;
+  const finishReason = receiptIdentifier(choice?.finish_reason, 32, secret);
+  Object.assign(failure, {
+    usage: { promptTokens: prompt, completionTokens: completion },
+    ...(modelId ? { modelId } : {}), ...(responseId ? { responseId } : {}),
+    receipt: { adapter: "completion-protocol", final: false, usageComplete: true,
+      modelIdentitySource: reportedModel ? "reported" : "requested-unverified",
+      ...(responseId ? { responseId } : {}), ...(finishReason ? { finishReason } : {}) },
+  });
+  return failure;
 }
 
 function parseCompletion(value: unknown, model: string, requireUsage: boolean): CompletionResult {
@@ -266,49 +328,102 @@ export class OpenAiCompatibleProvider implements ModelProvider {
   }
   /** 完整协议：assistant/tool 配对与 reasoning_content 不再被单轮文本投影丢弃。 */
   async complete(messages: ProviderMessage[], opts: CompletionOptions = {}): Promise<CompletionResult> {
+    const dispatch: CompletionDispatchReceipt = { attemptId: randomUUID(),
+      model: receiptIdentifier(this.modelId, 150, this.cfg.apiKey) ?? "unverified-model",
+      dispatchState: "blocked-before-send", usageComplete: true };
+    try {
+    if (opts.signal?.aborted) throw new Error("模型调用已取消（计量前）");
     if (!messages.length) throw new Error("模型输入消息不能为空");
-    const maxTokens = opts.maxTokens ?? 4096;
-    if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 393_216) throw new Error("maxTokens 超出范围");
+    if (opts.maxTokens !== undefined && (!Number.isSafeInteger(opts.maxTokens) || opts.maxTokens < 1 || opts.maxTokens > 393_216)) throw new Error("maxTokens 超出范围");
     if (opts.temperature !== undefined && (!Number.isFinite(opts.temperature) || opts.temperature < 0 || opts.temperature > 2)) throw new Error("temperature 超出范围");
     const deepseek = this.modelId.startsWith("deepseek-") || new URL(this.cfg.baseUrl).hostname === "api.deepseek.com";
     const thinking = opts.thinking ?? "disabled";
     if (deepseek && thinking === "enabled" && opts.toolChoice && opts.toolChoice !== "auto" && opts.toolChoice !== "none") {
       throw new Error("DeepSeek thinking 模式只支持 auto/none toolChoice");
     }
-    if (this.cfg.apiKey && JSON.stringify({ messages, tools: opts.tools }).includes(this.cfg.apiKey)) throw new Error("模型输入包含连接器密钥，已阻断出站");
+    if (deepseek && this.modelId !== DEFAULT_DEEPSEEK_MODEL) throw new Error("DeepSeek 模型能力未登记，禁止猜测上下文窗口");
+    if (this.cfg.apiKey && JSON.stringify({ messages, tools: opts.tools, responseFormat: opts.responseFormat }).includes(this.cfg.apiKey)) throw new Error("模型输入包含连接器密钥，已阻断出站");
     const masked = maskDeep(messages).value;
-    const tools = opts.tools ?? [];
-    const body: Record<string, unknown> = { model: this.modelId, messages: masked, max_tokens: maxTokens, stream: false };
+    const tools = maskDeep(opts.tools ?? []).value;
+    const body: Record<string, unknown> = { model: this.modelId, messages: masked, stream: false };
     if (deepseek) body.thinking = { type: thinking };
     if (opts.reasoningEffort !== undefined) body.reasoning_effort = opts.reasoningEffort;
     if (thinking === "disabled") body.temperature = opts.temperature ?? 0.2;
     if (tools.length) body.tools = tools;
     if (opts.toolChoice !== undefined) body.tool_choice = opts.toolChoice;
     if (opts.responseFormat) body.response_format = opts.responseFormat;
-    const deadline = requestDeadline(opts.signal, opts.timeoutMs ?? 120_000);
+    const window = deepseek ? await planDeepSeekWindow(body) : undefined;
+    const maxTokens = window?.maxOutputTokens ?? opts.maxTokens ?? 4096;
+    if (window && opts.maxTokens !== undefined && opts.maxTokens !== maxTokens) {
+      throw new Error("DeepSeek maxTokens 与完整输入窗口不符；移除历史输出常量，由模型能力计算");
+    }
+    body.max_tokens = maxTokens;
+    const serializedBody = window?.serializedBody ?? JSON.stringify(body);
+    dispatch.requestSha256 = createHash("sha256").update(serializedBody).digest("hex");
+    const requestReceipt: CompletionRequestReceipt | undefined = window ? {
+      model: this.modelId, fullInputTokens: window.fullInputTokens, maxTokens, contextTokens: window.contextTokens,
+      requestSha256: window.requestSha256, tokenizerSha256: window.tokenizerSha256, recipeVersion: window.recipeVersion,
+    } : undefined;
+    if (requestReceipt) dispatch.modelRequest = requestReceipt;
+    const deadline = requestDeadline(opts.signal, opts.timeoutMs ?? 600_000);
     try {
-      const request = { messages: masked, tools, maxTokens, model: this.modelId, signal: deadline.signal };
+      const request = { messages: structuredClone(masked), tools: structuredClone(tools), maxTokens, model: this.modelId,
+        body: JSON.parse(serializedBody) as Record<string, unknown>, request: requestReceipt && { ...requestReceipt }, signal: deadline.signal };
       deadline.signal.throwIfAborted();
       if (this.cfg.beforeRequest) await abortable(Promise.resolve(this.cfg.beforeRequest(request)), deadline.signal);
       if (opts.beforeRequest && opts.beforeRequest !== this.cfg.beforeRequest) await abortable(Promise.resolve(opts.beforeRequest(request)), deadline.signal);
       deadline.signal.throwIfAborted();
+      if (opts.beforeDispatch) await abortable(Promise.resolve(opts.beforeDispatch(structuredClone({ ...dispatch, dispatchState: "possibly-sent", usageComplete: false }))), deadline.signal);
+      deadline.signal.throwIfAborted();
       let res: Response;
+      dispatch.dispatchState = "possibly-sent";
+      dispatch.usageComplete = false;
       try { res = await abortable((this.cfg.fetch ?? fetch)(`${this.cfg.baseUrl.replace(/\/$/, "")}/chat/completions`, {
         method: "POST",
         headers: { "content-type": "application/json", ...this.authHeaders() },
-        body: JSON.stringify(body), signal: deadline.signal, redirect: "error",
+        body: serializedBody, signal: deadline.signal, redirect: "error",
       }), deadline.signal); }
       catch { deadline.signal.throwIfAborted(); throw new Error("模型网络请求失败"); }
       if (!res.ok) {
+        // Only the configured loopback boundary can attest a definite local
+        // denial. A remote HTTP error or a mismatching hash never clears a hold.
+        const boundary = new URL(this.cfg.baseUrl);
+        if (boundary.protocol === "http:" && boundary.hostname === "127.0.0.1"
+          && res.headers.get("x-workloom-model-dispatch") === "not-sent"
+          && res.headers.get("x-workloom-request-sha256") === dispatch.requestSha256) {
+          dispatch.dispatchState = "blocked-before-send";
+        }
         // 清理失败不能覆盖已知的 HTTP 状态，也不能把上游正文/密钥放进异常。
         void res.body?.cancel().catch(() => undefined);
-        throw new Error(`模型调用失败：HTTP ${res.status}`);
+        throw Object.assign(new Error(`模型调用失败：HTTP ${res.status}`), { httpStatus: res.status });
       }
       let data: unknown;
       try { data = await abortable(res.json(), deadline.signal); }
       catch { deadline.signal.throwIfAborted(); throw new Error("模型响应协议错误：无效 JSON"); }
-      return parseCompletion(data, this.modelId, opts.requireUsage !== false);
+      try {
+        const result = parseCompletion(data, this.modelId, opts.requireUsage !== false);
+        if (result.usage) { dispatch.dispatchState = "sent-usage-known"; dispatch.usageComplete = true; }
+        return { ...result, ...(requestReceipt ? { request: requestReceipt } : {}), requestReceipt: { ...dispatch } };
+      }
+      catch (error) {
+        const failure = meteredProtocolFailure(error, data, this.modelId, this.cfg.apiKey);
+        if (requestReceipt) Object.assign(failure, { request: requestReceipt });
+        throw failure;
+      }
+    } catch (error) {
+      if (error instanceof Error && requestReceipt) Object.assign(error, { request: requestReceipt });
+      throw error;
     } finally { deadline.close(); }
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error("模型调用失败");
+      const existing = (failure as { receipt?: Record<string, unknown> }).receipt;
+      if (existing?.usageComplete === true && dispatch.dispatchState !== "blocked-before-send") {
+        dispatch.dispatchState = "sent-usage-known"; dispatch.usageComplete = true;
+      }
+      Object.assign(failure, { dispatchState: dispatch.dispatchState, requestReceipt: { ...dispatch },
+        receipt: { ...existing, dispatchState: dispatch.dispatchState, usageComplete: dispatch.usageComplete, requestReceipt: { ...dispatch } } });
+      throw failure;
+    }
   }
 }
 

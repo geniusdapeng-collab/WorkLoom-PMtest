@@ -29,8 +29,10 @@ def main():
     encoding = DeepseekV41Encoding().with_tokenizer(Tokenizer.from_file(str(asset)))
     print(json.dumps({"ready": True, "recipeVersion": RECIPE_VERSION, "tokenizerSha256": TOKENIZER_SHA256}), flush=True)
     for line in sys.stdin:
-        if len(line) > 2_000_000:
-            print(json.dumps({"error": "Request exceeds the counter input limit"}), flush=True)
+        # Match the explicit proxy transport boundary. A character-count clamp
+        # must not reject a legal 1M-token request before model token accounting.
+        if len(line.encode("utf-8")) > 32_000_000:
+            print(json.dumps({"error": "Request exceeds the explicit 32000000-byte transport limit"}), flush=True)
             continue
         try:
             body = json.loads(line)

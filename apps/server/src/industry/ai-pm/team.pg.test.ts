@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AssembledPreset } from "@workloom/runtime";
 import { bundlesRoot, loadVerifiedBundleManifest, loadVerifiedBundleWorkforcePresets } from "@workloom/base/bundles";
-import type { CompletionProvider, CompletionResult } from "@workloom/base/model-router";
+import { OpenAiCompatibleProvider, type CompletionProvider, type CompletionResult } from "@workloom/base/model-router";
 import { ArtifactStore } from "./artifacts.js";
 import { PmTeamService, createOneShotEmployeeExecutor } from "./service.js";
 import { PgPmStore } from "./store.js";
@@ -61,7 +61,8 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
     },
   };
   function service(overrides: Partial<ConstructorParameters<typeof PmTeamService>[0]> = {}) {
-    const value = new PmTeamService({ store, artifactStore, catalog, providerFactory: () => provider(), employeeExecutor: async (input) => fixtureResult(input), ...overrides });
+    const value = new PmTeamService({ store, artifactStore, catalog, providerFactory: () => provider(),
+      employeeReview: (_provider, generate) => generate, employeeExecutor: async (input) => fixtureResult(input), ...overrides });
     services.push(value); return value;
   }
   async function create(current: PmTeamService, input: Record<string, unknown> = {}) {
@@ -83,7 +84,11 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
     owner = new pg.Pool({ connectionString: database.ownerUrl, max: 5 });
     app = new pg.Pool({ connectionString: database.appUrl, max: 20 });
     const migration = await readFile(new URL("../../../../../packages/db/migrations/0043_pm_team.sql", import.meta.url), "utf8");
-    await owner.query(migration);
+    // Migration setup must finish before parallel PG suites start. Reapplying
+    // its ALTER TABLE / policy DDL here can deadlock another suite's run update.
+    const applied = await owner.query<{ checksum: string }>("SELECT checksum FROM _migrations WHERE name=$1", ["0043_pm_team.sql"]);
+    expect(applied.rows[0]?.checksum, "run pnpm db:migrate before PG tests; the PM migration must already match this source")
+      .toBe(createHash("sha256").update(migration).digest("hex"));
     for (const scope of [scopeA, scopeB]) {
       await owner.query("INSERT INTO tenants(id,name,plan) VALUES($1,$2,'pro')", [scope.tenantId, "PM test fixture"]);
       await owner.query("INSERT INTO workspaces(id,tenant_id,name,slug,industry,stage) VALUES($1,$2,'PM test fixture',$1,'ai-pm','delivery')", [scope.workspaceId, scope.tenantId]);
@@ -333,8 +338,8 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
     expect(calls).toBe(5);
     const task = finished.tasks[0]!;
     // This state contains only fixture IDs, fixed error messages and metering.
-    // A worker-level rejection must be diagnosed before the later OS verifier
-    // branch; completed tasks cannot be rewritten by the final failRun call.
+    // The code owner's verification happens before completion. Unsupported
+    // hosts must retain a failed owner and no published artifacts.
     const executionState = JSON.stringify({ platform: process.platform, nodeMajor: Number(process.versions.node.split(".")[0]),
       run: { status: finished.run.status, errorCode: finished.run.errorCode, error: finished.run.error, usage: finished.run.usage },
       task: { status: task.status, errorCode: task.errorCode, error: task.error, usage: task.usage,
@@ -343,20 +348,23 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
           secretRejected: task.adapterReceipt?.secretRejected, receiptTooLarge: task.adapterReceipt?.receiptTooLarge },
         attempts: task.attemptReceipts.map((attempt) => ({ final: attempt.final, usage: attempt.usage })) },
       artifacts: finished.artifacts.map((artifact) => ({ path: artifact.path, sha256: artifact.sha256 })) });
-    expect(task.status, executionState).toBe("completed");
-    expect(finished.tasks[0]!.adapterReceipt).toMatchObject({ adapter: "deepseek-harness-headless", modelCalls: 5, exitCode: 0, usageComplete: true,
-      assetBinding: fixtureBinding("dev-orchestrator", "a"), assetBindingSource: "verified-catalog" });
-    expect(finished.run.usage).toEqual({ promptTokens: 115, completionTokens: 55 });
-    expect(finished.artifacts.map((artifact) => artifact.path).sort()).toEqual(["sum.mjs", "sum.test.mjs"]);
     const checks = finished.run.verification!.checks as Array<{ passed: boolean; message: string }>;
     if (!["darwin", "linux"].includes(process.platform) || Number(process.versions.node.split(".")[0]) < 24) {
       // Unsupported hosts retain the real fail-closed branch. macOS Seatbelt and
       // Linux bubblewrap are both production-supported OS sandboxes.
       expect(finished.run.status).toBe("failed");
-      expect(finished.run.errorCode).toBe("RUN_CHECK_FAILED");
+      expect(finished.run.errorCode).toBe("TASK_CODE_CHECK_FAILED");
+      expect(task.status, executionState).toBe("failed");
+      expect(finished.artifacts).toEqual([]);
+      expect(finished.run.usage).toEqual({ promptTokens: 115, completionTokens: 55 });
       expect(checks.some((check) => !check.passed && check.message.startsWith("OS_SANDBOX_UNAVAILABLE:"))).toBe(true);
       return;
     }
+    expect(task.status, executionState).toBe("completed");
+    expect(finished.tasks[0]!.adapterReceipt).toMatchObject({ adapter: "deepseek-harness-headless", modelCalls: 5, exitCode: 0, usageComplete: true,
+      assetBinding: fixtureBinding("dev-orchestrator", "a"), assetBindingSource: "verified-catalog" });
+    expect(finished.run.usage).toEqual({ promptTokens: 115, completionTokens: 55 });
+    expect(finished.artifacts.map((artifact) => artifact.path).sort()).toEqual(["sum.mjs", "sum.test.mjs"]);
     expect(finished.run.status, finished.run.error ?? "coding run must complete").toBe("completed");
     const executed = checks.find((check) => check.passed && check.message.startsWith("{"));
     expect(executed, "the code must have an actual OS execution receipt, not just two existence checks").toBeDefined();
@@ -405,6 +413,104 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
     expect(completed.run.usage).toEqual({ promptTokens: 94, completionTokens: 49 });
     expect(completed.tasks[0]!.attemptReceipts).toHaveLength(2);
     expect(completed.tasks[0]!.usage).toEqual({ promptTokens: 40, completionTokens: 21 });
+  });
+
+  it("resumes a reviewed document with its anchored failure observations, keeping the saved plan and completed ancestor", async () => {
+    let rejectDocument = true;
+    const calls: EmployeeExecutionInput[] = [];
+    const planning = provider();
+    const current = service({ providerFactory: () => planning, employeeExecutor: async (input) => {
+      calls.push(input);
+      if (input.task.id === "prd" && rejectDocument) {
+        rejectDocument = false;
+        throw Object.assign(new PmError("SEMANTIC_REVIEW_FAILED", "完整审稿未放行", 409), {
+          usage: { promptTokens: 9, completionTokens: 4 }, modelId: "fixture-deepseek", receipt: {
+            adapter: "deepseek-completion", semanticReviewPolicy: "workloom.pm.semantic-review/v1", final: false,
+            usageComplete: true, modelRequestsComplete: true, reconciliationRequired: false, stages: [
+              { stage: "review", status: "completed", verdict: "repair", findings: [{ id: "same-input", kind: "contradiction",
+                outputPath: "prd.md", sourceQuoteSha256: "a".repeat(64), outputQuoteSha256: "b".repeat(64),
+                verificationSummary: "同一验收同时写为通过与未执行", correctionSummary: "只保留能由已知证据推出的状态" }] },
+            ],
+          },
+        });
+      }
+      return fixtureResult(input);
+    } });
+    const created = await create(current);
+    await current.start(scopeA, created.run.id);
+    const failed = await current.waitForRun(scopeA, created.run.id);
+    expect(failed.run.errorCode).toBe("SEMANTIC_REVIEW_FAILED");
+    expect(failed.artifacts.map((artifact) => artifact.path)).toEqual(["requirements.md"]);
+    expect(calls[1]!.semanticRetryObservation).toBeUndefined();
+    await current.start(scopeA, created.run.id, true);
+    const completed = await current.waitForRun(scopeA, created.run.id);
+    expect(calls.map((call) => call.task.id)).toEqual(["requirements", "prd", "prd"]);
+    expect(calls[2]!.semanticRetryObservation).toContain("同一验收同时写为通过与未执行");
+    expect(calls[2]!.semanticRetryObservation).not.toContain("a".repeat(64));
+    expect(calls[2]!.task.acceptance).toEqual(failed.tasks[1]!.acceptance);
+    expect(completed.run.status).toBe("completed");
+    expect(completed.run.planVersion).toBe(1);
+    expect(completed.tasks[1]!.acceptance).toEqual(failed.tasks[1]!.acceptance);
+    expect(completed.artifacts.find((artifact) => artifact.path === "requirements.md")?.sha256).toBe(failed.artifacts[0]!.sha256);
+    expect(planning.complete).toHaveBeenCalledTimes(1);
+  });
+
+  it("code verification blocks handoff before completion and explicit resume repairs only the failed owner with feedback", async () => {
+    const codingPlan: PmTaskPlan[] = [plan[0]!,
+      { id: "code", presetKey: "dev-orchestrator", goal: "依据requirements.md实现模块与测试", dependsOn: ["requirements"],
+        acceptance: ["实现与测试均通过"], outputRefs: ["module.mjs", "module.test.mjs"] },
+      { id: "delivery", presetKey: "doc-writer", goal: "依据module.mjs写交付说明", dependsOn: ["code"],
+        acceptance: ["只引用通过的产物"], outputRefs: ["delivery.md"] }];
+    let valid = false;
+    const planning = provider(codingPlan);
+    const calls: EmployeeExecutionInput[] = [];
+    const current = service({ providerFactory: () => planning,
+      employeeExecutor: async (input) => { calls.push(input); return fixtureResult(input); },
+      verifyRun: async () => [{ check: { type: "fileExists", path: "module.test.mjs" }, passed: valid,
+        message: valid ? "trusted fixture: 6 passed" : "trusted fixture: expected size 4, got 5" }] });
+    const detail = await create(current, { goal: "需求、模块实现与交付说明" });
+    await current.start(scopeA, detail.run.id);
+    const failed = await current.waitForRun(scopeA, detail.run.id);
+    expect(failed.run.errorCode).toBe("TASK_CODE_CHECK_FAILED");
+    expect(failed.tasks.map((task) => task.status)).toEqual(["completed", "failed", "blocked"]);
+    expect(calls.map((input) => input.task.id)).toEqual(["requirements", "code"]);
+    expect(failed.artifacts.map((artifact) => artifact.path)).toEqual(["requirements.md"]);
+    expect(failed.tasks[1]!.attemptReceipts[0]).toMatchObject({ final: false,
+      receipt: { validationFeedback: { source: "server-code-verifier", passed: false } } });
+    expect(failed.run.verification).toMatchObject({ checks: [{ passed: false }] });
+    expect(failed.run.usage).toEqual({ promptTokens: 85, completionTokens: 45 });
+    valid = true;
+    await current.start(scopeA, detail.run.id, true);
+    const finished = await current.waitForRun(scopeA, detail.run.id);
+    expect(finished.run.status).toBe("completed");
+    expect(calls.map((input) => input.task.id)).toEqual(["requirements", "code", "code", "delivery"]);
+    expect(calls[2]!.task.acceptance.join("\n")).toContain("expected size 4, got 5");
+    expect(calls[3]!.task.acceptance.join("\n")).toContain("trusted fixture: 6 passed");
+    expect(calls[3]!.task.acceptance.join("\n")).toContain("module.test.mjs");
+    expect(calls[3]!.task.acceptance.join("\n")).toContain(finished.artifacts.find((file) => file.path === "module.mjs")!.sha256);
+    expect(finished.tasks[1]!.acceptance).toEqual(codingPlan[1]!.acceptance);
+    expect(finished.tasks[1]!.attemptReceipts).toHaveLength(2);
+    expect(finished.tasks[1]!.attemptReceipts[0]).toEqual(failed.tasks[1]!.attemptReceipts[0]);
+    expect(finished.tasks[1]!.adapterReceipt).toMatchObject({ validationFeedback: { source: "server-code-verifier", passed: true } });
+    expect(finished.run.usage).toEqual({ promptTokens: 147, completionTokens: 79 });
+    expect(planning.complete).toHaveBeenCalledTimes(1);
+  });
+
+  it("a code verifier exception retains paid usage and never sends unverified code downstream", async () => {
+    const codingPlan: PmTaskPlan[] = [
+      { id: "code", presetKey: "dev-orchestrator", goal: "实现模块", dependsOn: [], acceptance: ["执行测试"], outputRefs: ["module.mjs", "module.test.mjs"] },
+      { id: "docs", presetKey: "doc-writer", goal: "读取module.mjs写说明", dependsOn: ["code"], acceptance: ["说明"], outputRefs: ["delivery.md"] }];
+    const worker = vi.fn(async (input: EmployeeExecutionInput) => fixtureResult(input));
+    const current = service({ providerFactory: () => provider(codingPlan), employeeExecutor: worker,
+      verifyRun: async () => { throw new Error("synthetic sandbox unavailable"); } });
+    const detail = await create(current, { goal: "实现模块并写交付说明" });
+    await current.start(scopeA, detail.run.id);
+    const failed = await current.waitForRun(scopeA, detail.run.id);
+    expect(failed.run.status).toBe("failed");
+    expect(failed.tasks[0]!.status).toBe("failed"); expect(failed.tasks[1]!.status).toBe("blocked");
+    expect(failed.artifacts).toEqual([]); expect(worker).toHaveBeenCalledTimes(1);
+    expect(failed.run.usage).toEqual({ promptTokens: 54, completionTokens: 28 });
+    expect(failed.tasks[0]!.attemptReceipts).toHaveLength(1);
   });
 
   it("removes only an unregistered artifact and resumes after a database completion failure", async () => {
@@ -535,6 +641,46 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
     expect(result.run.planningReceipts[0]).toMatchObject({ receipt: { assetBinding: fixtureBinding("chief-pm", "a"), assetBindingSource: "verified-catalog" } });
   });
 
+  it.each([undefined, "", " \t\n"])("a planner response with missing or blank ID %j cannot dispatch employees and keeps metering", async (responseId) => {
+    const value = completion(JSON.stringify({ tasks: plan })); value.responseId = responseId;
+    const complete = vi.fn(async () => value);
+    const worker = vi.fn(async (input: EmployeeExecutionInput) => fixtureResult(input));
+    const current = service({ providerFactory: () => ({ modelId: "fixture-deepseek", complete }), employeeExecutor: worker });
+    const detail = await create(current);
+    await current.start(scopeA, detail.run.id);
+    const result = await current.waitForRun(scopeA, detail.run.id);
+    expect(result.run.status).toBe("blocked");
+    expect(result.run.errorCode).toBe("MODEL_RECEIPT_MISSING");
+    expect(result.run.usage).toEqual({ promptTokens: 23, completionTokens: 11 });
+    expect(result.run.planningReceipts).toHaveLength(1);
+    expect(result.run.planningReceipts[0]).toMatchObject({ final: false, usage: { promptTokens: 23, completionTokens: 11 },
+      receipt: { adapter: "chief-pm-planner", usageComplete: true } });
+    expect(result.tasks).toEqual([]); expect(result.artifacts).toEqual([]);
+    expect(complete).toHaveBeenCalledTimes(1); expect(worker).not.toHaveBeenCalled();
+  });
+
+  it("a parsed but empty truncated provider response retains paid tokens in the failed employee ledger", async () => {
+    const request = vi.fn(async () => Response.json({ id: "fixture-truncated-paid", model: "fixture-deepseek",
+      choices: [{ finish_reason: "length", message: { role: "assistant", content: "", reasoning_content: "private-thought-do-not-persist" } }],
+      usage: { prompt_tokens: 23, completion_tokens: 8192, total_tokens: 8215, completion_tokens_details: { reasoning_tokens: 8192 } } }));
+    const value = new OpenAiCompatibleProvider("fixture-deepseek", { baseUrl: "https://synthetic.invalid", fetch: request });
+    const current = service({ providerFactory: () => value, employeeExecutor: undefined });
+    const detail = await create(current, { employee: "doc-writer" });
+    await current.start(scopeA, detail.run.id);
+    const result = await current.waitForRun(scopeA, detail.run.id);
+    expect(result.run.status).toBe("failed");
+    expect(result.run.usage).toEqual({ promptTokens: 23, completionTokens: 8192 });
+    expect(result.tasks[0]!.responseId).toBe("fixture-truncated-paid");
+    expect(result.tasks[0]!.attemptReceipts.filter((row) => row.kind === "model-attempt")).toHaveLength(2);
+    const settlements = result.tasks[0]!.attemptReceipts.filter((row) => row.kind !== "model-attempt");
+    expect(settlements).toHaveLength(1);
+    expect(settlements[0]).toMatchObject({ final: false,
+      usage: { promptTokens: 23, completionTokens: 8192 }, modelId: "fixture-deepseek",
+      receipt: { adapter: "completion-protocol", responseId: "fixture-truncated-paid", usageComplete: true, finishReason: "length" } });
+    expect(JSON.stringify(result)).not.toContain("private-thought-do-not-persist");
+    expect(result.artifacts).toEqual([]); expect(request).toHaveBeenCalledTimes(1);
+  });
+
   it("failed final verification preserves its evidence; explicit recheck does not rerun completed paid employees", async () => {
     const worker = vi.fn(async (input: EmployeeExecutionInput) => fixtureResult(input));
     let passes = false;
@@ -602,5 +748,98 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
     const receipt = await owner.query<{ id: string }>("SELECT id FROM pm_artifacts WHERE tenant_id=$1 AND workspace_id=$2 LIMIT 1", [scopeA.tenantId, scopeA.workspaceId]);
     expect(receipt.rows[0]).toBeDefined();
     await expect(scoped(scopeA, (client) => client.query("UPDATE pm_artifacts SET sha256=$2 WHERE id=$1", [receipt.rows[0]!.id, "0".repeat(64)]))).rejects.toThrow();
+  });
+
+  it.each(["planner", "employee"])("unknown %s usage is durable and explicit resume cannot send a second paid request", async (stage) => {
+    const request = vi.fn(async () => Response.json({ id: "synthetic-unknown-usage", model: "fixture-deepseek",
+      choices: [{ finish_reason: "stop", message: { role: "assistant", content: "private unknown response" } }] }));
+    const physical = new OpenAiCompatibleProvider("fixture-deepseek", { baseUrl: "https://synthetic.invalid", fetch: request });
+    const current = service({ providerFactory: () => physical, employeeExecutor: undefined });
+    const detail = await create(current, stage === "employee" ? { employee: "doc-writer" } : {});
+    await current.start(scopeA, detail.run.id);
+    const failed = await current.waitForRun(scopeA, detail.run.id);
+    expect(failed.run.status).toBe("blocked");
+    expect(failed.run.errorCode).toBe("MODEL_USAGE_RECONCILIATION_REQUIRED");
+    const receipts = stage === "employee" ? failed.tasks[0]!.attemptReceipts : failed.run.planningReceipts;
+    expect(receipts.some((row) => (row.requestReceipt as Record<string, unknown> | undefined)?.dispatchState === "possibly-sent")).toBe(true);
+    expect(receipts.at(-1)).toMatchObject({ final: false, receipt: { usageComplete: false, reconciliationRequired: true } });
+    expect(receipts.at(-1)?.usage ?? null).toBeNull();
+    if (stage === "employee") expect(failed.tasks[0]!.usage).toBeNull();
+    expect(JSON.stringify(receipts)).not.toContain("private unknown response");
+    const restarted = service({ providerFactory: () => physical, employeeExecutor: undefined });
+    await expect(restarted.start(scopeA, detail.run.id, true)).rejects.toMatchObject({ code: "MODEL_USAGE_RECONCILIATION_REQUIRED" });
+    await expect(store.claimRun(scopeA, detail.run.id, "bypass-service", true)).rejects.toMatchObject({ code: "MODEL_USAGE_RECONCILIATION_REQUIRED" });
+    expect(request).toHaveBeenCalledTimes(1); expect(failed.artifacts).toEqual([]);
+  });
+
+  it("nested DSH partial known usage is retained while its unknown continuation forbids resume", async () => {
+    const worker = vi.fn(async () => {
+      throw Object.assign(new PmError("DSH_WORKER_FAILED", "synthetic partial DSH failure"), {
+        usage: { promptTokens: 19, completionTokens: 7 }, modelId: "fixture-deepseek",
+        receipt: { adapter: "deepseek-harness-headless", modelCalls: 2, usageComplete: false, final: false },
+        cause: { partial: { requestReceipt: { attemptId: "synthetic-unknown-second", model: "fixture-deepseek", dispatchState: "possibly-sent", usageComplete: false } } },
+      });
+    });
+    const current = service({ employeeExecutor: worker }); const detail = await create(current, { employee: "doc-writer" });
+    await current.start(scopeA, detail.run.id); const failed = await current.waitForRun(scopeA, detail.run.id);
+    expect(failed.run.errorCode).toBe("MODEL_USAGE_RECONCILIATION_REQUIRED");
+    expect(failed.run.usage).toEqual({ promptTokens: 19, completionTokens: 7 });
+    expect(failed.tasks[0]!.attemptReceipts.at(-1)).toMatchObject({ usage: { promptTokens: 19, completionTokens: 7 },
+      receipt: { usageComplete: false, knownUsageScope: "partial-measured-only" } });
+    await expect(current.start(scopeA, detail.run.id, true)).rejects.toMatchObject({ code: "MODEL_USAGE_RECONCILIATION_REQUIRED" });
+    expect(worker).toHaveBeenCalledTimes(1);
+  });
+
+  it("definite no-send admission rejection can resume without inventing a paid attempt", async () => {
+    let deny = true;
+    const request = vi.fn(async () => Response.json({ id: "fixture-known-after-admission", model: "fixture-deepseek",
+      choices: [{ finish_reason: "stop", message: { role: "assistant", content: "完整可核验正文" } }],
+      usage: { prompt_tokens: 23, completion_tokens: 11, total_tokens: 34 } }));
+    const physical = new OpenAiCompatibleProvider("fixture-deepseek", { baseUrl: "https://synthetic.invalid", fetch: request,
+      beforeRequest: () => { if (deny) throw new Error("synthetic budget denial before network"); } });
+    const current = service({ providerFactory: () => physical, employeeExecutor: undefined });
+    const detail = await create(current, { employee: "doc-writer" });
+    await current.start(scopeA, detail.run.id); const rejected = await current.waitForRun(scopeA, detail.run.id);
+    expect(rejected.run.errorCode).toBe("MODEL_BUDGET_EXHAUSTED"); expect(request).not.toHaveBeenCalled();
+    expect(rejected.tasks[0]!.usage).toBeNull();
+    deny = false; await current.start(scopeA, detail.run.id, true);
+    expect((await current.waitForRun(scopeA, detail.run.id)).run.status).toBe("completed");
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("a durable dispatch marker survives a process crash and blocks lease recovery from replaying it", async () => {
+    const current = service(); const detail = await create(current);
+    await store.claimRun(scopeA, detail.run.id, "synthetic-crashed-after-dispatch", false);
+    await store.recordModelAttempt(scopeA, detail.run.id, "synthetic-crashed-after-dispatch", undefined,
+      { attemptId: "synthetic-pending-attempt", model: "fixture-deepseek", dispatchState: "possibly-sent", usageComplete: false, requestSha256: "a".repeat(64) });
+    await owner.query("UPDATE pm_runs SET lease_expires_at=now()-interval '1 second' WHERE id=$1", [detail.run.id]);
+    const recovered = await current.detail(scopeA, detail.run.id);
+    expect(recovered.run.status).toBe("blocked"); expect(recovered.run.errorCode).toBe("MODEL_USAGE_RECONCILIATION_REQUIRED");
+    await expect(current.start(scopeA, detail.run.id, true)).rejects.toMatchObject({ code: "MODEL_USAGE_RECONCILIATION_REQUIRED" });
+    expect(recovered.run.planningReceipts).toHaveLength(1);
+  });
+
+  it("an internal per-call quota wrapper cannot change the fixed model or claim a run on wrapper failure", async () => {
+    const physical = provider(); const current = service({ providerFactory: () => physical });
+    const detail = await create(current);
+    await expect(current.start(scopeA, detail.run.id, false, () => ({ modelId: "other-model", complete: physical.complete })))
+      .rejects.toMatchObject({ code: "MODEL_DRIFT" });
+    expect((await store.detail(scopeA, detail.run.id)).run.status).toBe("created");
+    const wrappedCalls = vi.fn(async (...args: Parameters<CompletionProvider["complete"]>) => physical.complete(...args));
+    await current.start(scopeA, detail.run.id, false, (fixed) => ({ modelId: fixed.modelId, complete: wrappedCalls }));
+    expect((await current.waitForRun(scopeA, detail.run.id)).run.status).toBe("completed");
+    expect(wrappedCalls).toHaveBeenCalledTimes(1);
+  });
+
+  it("failure to persist the pre-dispatch marker prevents network I/O", async () => {
+    const guardedStore = new PgPmStore(app);
+    vi.spyOn(guardedStore, "recordModelAttempt").mockRejectedValueOnce(new Error("synthetic durable marker unavailable"));
+    const request = vi.fn(async () => Response.json({}));
+    const physical = new OpenAiCompatibleProvider("fixture-deepseek", { baseUrl: "https://synthetic.invalid", fetch: request });
+    const current = service({ store: guardedStore, providerFactory: () => physical, employeeExecutor: undefined });
+    const detail = await create(current, { employee: "doc-writer" });
+    await current.start(scopeA, detail.run.id); const failed = await current.waitForRun(scopeA, detail.run.id);
+    expect(request).not.toHaveBeenCalled(); expect(failed.run.status).toBe("failed");
+    expect(failed.tasks[0]!.usage).toBeNull(); expect(failed.tasks[0]!.attemptReceipts).toEqual([]);
   });
 });

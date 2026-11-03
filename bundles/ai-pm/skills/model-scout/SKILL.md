@@ -1,7 +1,15 @@
 ---
 name: model-scout
-version: 3.0.0
+version: 3.0.2
 description: 模型侦察。新模型发布监控 + 本产品场景 eval 子集试跑 + 质量/时延/成本三轴选型报告；换型触发器纪律防止被 benchmark 营销带偏。
+delivery_contract:
+  schema: workloom.pm.skill-evidence/v1
+  eligibilityStatus: satisfied-violated-unknown
+  currentModelSource: explicit-evidence-only
+  sameEvaluationContext: true
+  observedAndAdvertisedSeparate: true
+  sampleAndUncertaintyRequired: true
+  modelSwitchRequiresApproval: true
 ---
 
 # 模型能力侦察
@@ -19,6 +27,11 @@ description: 模型侦察。新模型发布监控 + 本产品场景 eval 子集�
 3. 触发器成立 → 用本产品 eval 子集对新模型试跑（谷时窗口控成本）；
 4. 产出三轴阶跃报告：质量（实测通过率，标注样本量与置信度）/ 时延 / 成本（按真实流量结构测算月成本），附换型建议、风险评估与回滚预案；
 5. 报告提交人审（R-PM9 模型路由切换必审）；同步知识保鲜官更新模型代际信息。
+
+6. 比较固定完整模型 ID、参数、prompt/工具、输入集、任务数量与测试日期；同一数据和判定口径下比较，标清公开宣称、真实试跑与推算。
+7. 延迟分 p50/p95、首 token 与总时长，成本分输入/输出/缓存及币种报价日期；没有这些原始数据标未测。小样本报告分母、区间和不确定性，不把单次成功写成显著跃升；换型需已验证安全回退目标。
+
+8. 每个准入条件分别标“有证据满足/有证据违反/证据不足未知”，未知不改写为已违反政策或已测失败。无法核验时可建议暂不放行并列补证条件，但不得编造供应商的数据留存、训练使用、地区或授权政策。当前使用模型、供应商和安全回退目标只从明确材料确定，比较列表第一项、较旧版本或对照样本都不自动代表生产现状；未给就写未知，提出核验计划。
 
 ## 四、边界与围栏
 - 权限面：联网只读；报告写库；试跑走凭据 L4 注入、谷时窗口。

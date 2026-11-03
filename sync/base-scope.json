@@ -406,19 +406,19 @@
       "reason": "上游 dsh 0.2.1-rc.2 的 devDependencies 含包名 @deepseek-ai/dsh-llm-deepseek-api-key，被启发式规则按「api-key + 字符串字面量」误判；该字面量是 npm 版本号 0.2.1-rc.2，不是凭据。vendor/dsh 为上游 tarball 逐字节基线（sha512 已与 registry 核对），按 D12 纪律不得改写，故登记内容绑定放行。"
     },
     ".workloom-runtime-deps/package-lock.json": {
-      "sha256": "f8442b8d0ff7b436f1ab1d2b88c3c249aba2eb8c136f9e8c24a555da11a100b6",
+      "sha256": "e17241b4639a4c853839d361f23598f334b247d3d31ced869c945e806edf910b",
       "findings": [
         {
           "rule": "literal-sensitive-assignment",
-        "line": 1229
+        "line": 1230
         },
         {
           "rule": "literal-sensitive-assignment",
-        "line": 3858
+        "line": 3859
         },
         {
           "rule": "literal-sensitive-assignment",
-        "line": 3882
+        "line": 3883
         }
       ],
       "reason": "生成的 npm 运行时锁在 dependencies/peerDependencies 中含上游包名 @deepseek-ai/dsh-llm-deepseek-api-key；三处值均为已锁定 npm 版本 0.2.1-rc.2，被 api-key 字段启发式误报，不是运行凭据。保留原始锁字节与全部高置信规则，仅对本文件 SHA 和三处规则/行号登记审阅。"

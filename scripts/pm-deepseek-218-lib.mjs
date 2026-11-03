@@ -59,6 +59,8 @@ export function validateCatalog(value) {
     if (!Number.isSafeInteger(task.maxDeliverableChars) || task.maxDeliverableChars < 100 || task.maxDeliverableChars > 20_000) {
       fail(`${task.id} has invalid maxDeliverableChars`);
     }
+    // This is historical catalog metadata, retained for reproducible old scores.
+    // The current runner never sends it as max_tokens; the provider plans the window.
     if (!Number.isSafeInteger(task.maxOutputTokens) || task.maxOutputTokens < 64 || task.maxOutputTokens > 8192) {
       fail(`${task.id} has invalid maxOutputTokens`);
     }
@@ -561,7 +563,7 @@ ${worst.length ? worst.map((row) => `- ${row.taskId} · ${row.score} · ${row.fa
 - Search 题额外保留真实 Search 回执，并要求最终来源与回执同域。
 - 代码题使用仓库现有 macOS + Node 24 隔离执行器运行独立 trusted test；它不是跨平台或任意恶意代码证明。
 - 内容断言是确定性质量门禁，不是人工盲评；通过率只对应该固定合成任务集，不能外推为任意业务的自主交付成功率。
-- 218 个逻辑任务按照现有单 run 物理请求上限拆成多个 shard；预算、调用数与失败证据分别汇总，不把 shard 数当任务成功率。
-- 最终 100% 是在本轮明确修复任务合同、评测器和代码沙箱接线后的结果；它不能外推为任意业务分布、任意模型版本或首次无干预成功率。
+- 218 个逻辑任务按可恢复工作批次拆成多个 shard；总成本从各 shard 的持久化记录汇总，单次模型窗口由完整输入计算，不能拿批次预算替代；不把 shard 数当任务成功率。
+- 通过率以本报告的实际计数为准；它不能外推为任意业务分布、任意模型版本或首次无干预成功率。
 `;
 }

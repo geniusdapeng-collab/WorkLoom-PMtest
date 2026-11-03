@@ -19,6 +19,28 @@
   },
   "components": [
     {
+      "name": "Hugging Face Tokenizers.js",
+      "package": "@huggingface/tokenizers",
+      "repo": "https://github.com/huggingface/tokenizers.js",
+      "license": "Apache-2.0",
+      "channel": "npm",
+      "usage": "runtime",
+      "probe": {
+        "kind": "lockfile",
+        "file": "pnpm-lock.yaml",
+        "package": "@huggingface/tokenizers"
+      },
+      "scope": [
+        "packages/base/model-router（DeepSeek V4.1 实际请求计量）",
+        "桌面生产载荷（纯 JavaScript，离线运行）"
+      ],
+      "cadence": "monthly",
+      "gate": "full",
+      "notes": "只作 BPE 编码引擎，DeepSeek 官方模板、词表与许可在 model-router/assets/deepseek-v41 固定；升级须对照官方 recipe 完整 token ID 并通过三目标运行时载荷校验。",
+      "latest": "0.2.0",
+      "latest_checked_at": "2026-11-03T15:07:31.000Z"
+    },
+    {
       "name": "DeepSeek Harness（dsh）",
       "package": "@deepseek-ai/dsh",
       "repo": "https://github.com/deepseek-ai/deepseek-harness",

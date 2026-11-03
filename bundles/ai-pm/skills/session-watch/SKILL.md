@@ -1,7 +1,13 @@
 ---
 name: session-watch
-version: 1.0.0
+version: 1.0.1
 description: 机床会话监督——事件流归一、围栏判定、熔断、场域直播。
+delivery_contract:
+  schema: workloom.pm.skill-evidence/v1
+  selfReport: "claim-not-proof"
+  completionRequiresVerification: true
+  redactBeforePersistence: true
+  missingUsage: "unknown-not-zero"
 ---
 
 # 机床会话监督
@@ -18,6 +24,9 @@ description: 机床会话监督——事件流归一、围栏判定、熔断、�
 3. payload 落库前凭据模式脱敏（sk-/ghp_/AKIA/私钥/Bearer）
 4. 里程碑镜像进 biz_events 哈希链（dispatched / session_end）
 5. 直播推送 P25：事件流增量轮询 + 织造车间机床亮起 + 关键节点语音播报
+
+6. 区分工具自报进度、观测到的文件/命令回执、独立验收结论；done 事件只表示会话结束，不证明需求完成、测试成功或已发布。
+7. 按 sessionId/事件 ID 去重并保留顺序与缺口，异常中止、超时、取消与完成分别呈现；缺 usage 写未知，不记零成本。候选内容变化使旧验收失效，完成必须回读产物摘要与真实检查。
 
 ## 四、边界与围栏
 - 围栏判定针对工具自报命令流；硬约束另有两层：codex --sandbox workspace-write 与 worktree 钳制

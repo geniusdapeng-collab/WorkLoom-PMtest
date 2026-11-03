@@ -6,6 +6,7 @@
   "dependencies": {
     "@deepseek-ai/dsh": "0.2.1-rc.2",
     "@hono/node-server": "2.1.1",
+    "@huggingface/tokenizers": "0.2.0",
     "@tailwindcss/vite": "4.3.3",
     "@trpc/server": "11.19.0",
     "@vitejs/plugin-react": "6.1.1",

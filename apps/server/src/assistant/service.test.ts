@@ -129,6 +129,18 @@ function completedTaskFacade(detail = completedTaskDetail): AssistantTaskFacade 
   };
 }
 
+const fixtureRequest = { model: "deepseek-flash", fullInputTokens: 100, maxTokens: 393216, contextTokens: 1048576,
+  requestSha256: "a".repeat(64), tokenizerSha256: "b".repeat(64), recipeVersion: "0.2.0" };
+function meteredModel(model: AssistantModelClient): AssistantModelClient {
+  const stream = model.stream as ReturnType<typeof vi.fn>;
+  const implementation = stream.getMockImplementation()! as AssistantModelClient["stream"];
+  stream.mockImplementation(async (input: Parameters<AssistantModelClient["stream"]>[0]) => {
+    await input.onRequest?.(fixtureRequest);
+    return implementation(input);
+  });
+  return model;
+}
+
 const failedTaskDetail = {
   ...completedTaskDetail,
   run: {
@@ -161,7 +173,7 @@ describe("assistant web search orchestration", () => {
     const search: AssistantSearchClient = { configured: true, search: vi.fn(async () => searchReceipt) };
     const service = new AssistantService({
       store: store as unknown as AssistantStore,
-      model,
+      model: meteredModel(model),
       search,
       events: { append: vi.fn() },
       taskFacade: {} as never,
@@ -206,7 +218,7 @@ describe("assistant web search orchestration", () => {
     };
     const service = new AssistantService({
       store: store as unknown as AssistantStore,
-      model,
+      model: meteredModel(model),
       search,
       events: { append: vi.fn() },
       taskFacade: {} as never,
@@ -243,7 +255,7 @@ describe("assistant web search orchestration", () => {
     store.finishRun.mockRejectedValueOnce(new Error("message persistence failed"));
     const service = new AssistantService({
       store: store as unknown as AssistantStore,
-      model,
+      model: meteredModel(model),
       search: { configured: true, search: vi.fn(async () => ({ ...searchReceipt, results: [] })) },
       events: { append: vi.fn() },
       taskFacade: {} as never,
@@ -261,8 +273,8 @@ describe("assistant web search orchestration", () => {
     expect(store.settleBudget).toHaveBeenCalledWith(assistantIdentity.assistantScope, expect.objectContaining({
       usage,
       reservedCalls: 1,
-      reservedSearchCalls: 1,
-      searchCallsUsed: 1,
+      reservedSearchCalls: 0,
+      searchCallsUsed: 0,
     }));
     expect(store.settleBudget).not.toHaveBeenCalledWith(
       assistantIdentity.assistantScope,
@@ -270,9 +282,10 @@ describe("assistant web search orchestration", () => {
     );
   });
 
-  it("settles completed task usage before task message persistence", async () => {
+  it("delegates physical charging and does not settle an entire DAG again after persistence failure", async () => {
     const store = fakeStore({ mode: "task", webSearchRequested: false });
     store.finishRun.mockRejectedValueOnce(new Error("task message persistence failed"));
+    const facade = completedTaskFacade();
     const service = new AssistantService({
       store: store as unknown as AssistantStore,
       model: {
@@ -283,7 +296,7 @@ describe("assistant web search orchestration", () => {
       },
       search: { configured: false, search: vi.fn() },
       events: { append: vi.fn() },
-      taskFacade: completedTaskFacade(),
+      taskFacade: facade,
     });
     await service.send(assistantIdentity, run.sessionId, {
       text: "生成并验证研发产物",
@@ -292,24 +305,12 @@ describe("assistant web search orchestration", () => {
       webSearch: false,
     });
     await vi.waitFor(() => expect(store.failRun).toHaveBeenCalledOnce());
-    expect(store.settleBudget).toHaveBeenCalledOnce();
-    expect(store.settleBudget.mock.invocationCallOrder[0]).toBeLessThan(
-      store.finishRun.mock.invocationCallOrder[0]!,
-    );
-    expect(store.settleBudget).toHaveBeenCalledWith(assistantIdentity.assistantScope, expect.objectContaining({
-      usage: { promptTokens: 88, completionTokens: 44, totalTokens: 132 },
-      reservedCalls: 65,
-      callsUsed: 2,
-      reservedSearchCalls: 0,
-      searchCallsUsed: 0,
-    }));
-    expect(store.settleBudget).not.toHaveBeenCalledWith(
-      assistantIdentity.assistantScope,
-      expect.objectContaining({ blockedReason: expect.any(String) }),
-    );
+    expect(facade.start).toHaveBeenCalledWith(assistantIdentity.assistantScope, completedTaskDetail.run.id, expect.any(Function));
+    expect(store.reserveBudget).not.toHaveBeenCalled();
+    expect(store.settleBudget).not.toHaveBeenCalled();
   });
 
-  it("settles actual task calls instead of the full reservation when a task node fails", async () => {
+  it("retains failed task usage for display without charging the aggregate again", async () => {
     const store = fakeStore({ mode: "task", webSearchRequested: false });
     const facade = completedTaskFacade(failedTaskDetail);
     const service = new AssistantService({
@@ -329,13 +330,10 @@ describe("assistant web search orchestration", () => {
       webSearch: false,
     });
     await vi.waitFor(() => expect(store.failRun).toHaveBeenCalledOnce());
-    expect(store.settleBudget).toHaveBeenCalledWith(assistantIdentity.assistantScope, expect.objectContaining({
+    expect(store.failRun).toHaveBeenCalledWith(assistantIdentity.assistantScope, run.id, expect.objectContaining({
       usage: { promptTokens: 70, completionTokens: 30, totalTokens: 100 },
-      reservedCalls: 65,
-      callsUsed: 4,
-      reservedSearchCalls: 0,
-      searchCallsUsed: 0,
     }));
+    expect(store.settleBudget).not.toHaveBeenCalled();
   });
 
   it("limits concurrent runs per workspace instead of across all tenants", async () => {
@@ -419,7 +417,7 @@ describe("assistant web search orchestration", () => {
     };
     const service = new AssistantService({
       store: store as unknown as AssistantStore,
-      model,
+      model: meteredModel(model),
       search: { configured: false, search: vi.fn() },
       events: { append: vi.fn() },
       taskFacade: {} as never,
@@ -456,6 +454,7 @@ describe("assistant web search orchestration", () => {
       runIds[2],
       expect.objectContaining({ code: "CONCURRENCY_LIMIT" }),
     );
+    await vi.waitFor(() => expect(pending).toHaveLength(3));
     for (const resolve of pending) resolve();
     await vi.waitFor(() => expect(store.finishRun).toHaveBeenCalledTimes(3));
   });

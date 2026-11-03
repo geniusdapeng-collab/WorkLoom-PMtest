@@ -4,6 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { preferredDispatchPresets, preferredDispatchRulePresets } from "./dispatch-routing.js";
+import roleCases from "./fixtures/pm-role-routing.json";
 
 describe("派活岗位路由（N-13）", () => {
   it("生图/海报类目标 → 视觉岗位优先", () => {
@@ -50,5 +51,53 @@ describe("派活岗位路由（N-13）", () => {
   ])("AI-PM 目标优先派给职责匹配的 %s", (employee, goal) => {
     expect(preferredDispatchPresets({ goal, industry: "ai-pm" })[0]).toBe(employee);
     expect(preferredDispatchRulePresets({ goal, industry: "ai-pm" })[0]).toBe(employee);
+  });
+});
+
+describe("PM routing keeps requested deliverable ahead of background vocabulary", () => {
+  it.each([
+    ["doc-writer", "请根据用户反馈撰写PRD，包含核心指标、权限矩阵和发布检查"],
+    ["release-guardian", "制作发布检查单，参考红队、评测集和用户反馈结论"],
+    ["chief-pm", "制定项目排期，包含竞品研究、需求分析、代码实现和发布检查"],
+    ["requirement-analyst", "完成需求分析，覆盖权限矩阵、提示词输入和留存指标"],
+    ["eval-master", "设计评测集，覆盖模型选型、用户反馈和知识库问答"],
+  ])("routes requested artifact to %s", (owner, goal) => {
+    expect(preferredDispatchRulePresets({ goal, industry: "ai-pm" })[0]).toBe(owner);
+  });
+
+  it.each(roleCases.cases)("$id routes the unchanged complete goal", (item) => {
+    expect(preferredDispatchPresets({ goal: item.goal, industry: "ai-pm" })[0]).toBe(item.employee);
+  });
+
+  it.each([
+    ["requirement-analyst", "定义工单转交功能的字段、状态与角色约束，包含越权和重复请求验收"],
+    ["competitor-scout", "对比三款协作产品的审计能力与报价，列材料依据和未知项"],
+    ["industry-radar", "撰写技术动态简报，区分发布日、抓取日和未知事项"],
+    ["release-guardian", "审核这次发布包并给出放行判断，材料提到越权缺陷、PR和版本说明"],
+    ["dev-orchestrator", "编制研发分工与文件所有权方案，给出实现、测试和验收的依赖"],
+    ["red-teamer", "针对虚构服务设计防御性测试，验证伪造角色和跨租户访问是否被拒绝"],
+    ["doc-writer", "不要制作发布检查单，只需撰写用户手册，说明升级后的使用方式"],
+  ])("unseen action phrasing chooses %s over contextual keywords", (employee, goal) => {
+    expect(preferredDispatchRulePresets({ goal, industry: "ai-pm" })[0]).toBe(employee);
+  });
+
+  it.each([
+    ["chief-pm", "这轮只有四个人日：请把待办按优先级排好，写明依赖和推迟理由；无需做用户反馈分析。", "user-listener"],
+    ["eval-master", "我需要一套可以判对错的回归用例，请设计固定输入和唯一预期，覆盖错误、边界与权限，不讨论模型选型。", "model-scout"],
+    ["knowledge-curator", "请核对知识条目的来源、生效状态和引用链，列出需要归档或补证的记录；不要写学习周刊。", "doc-writer"],
+    ["doc-writer", "无需撰写发布检查单，请写用户手册，不再做需求分析。", "requirement-analyst"],
+    ["data-insight", "本次不做用户反馈分析，而是计算经营指标。", "user-listener"],
+  ])("%s excludes explicitly unwanted work from semantic fallback", (employee, goal, excluded) => {
+    const candidates = preferredDispatchRulePresets({ goal, industry: "ai-pm" });
+    expect(candidates[0]).toBe(employee);
+    expect(candidates).not.toContain(excluded);
+  });
+
+  it.each([
+    "这次不得不做用户反馈分析，输出代表原声。",
+    "我们不能不做用户反馈分析。",
+    "不做模型选型，但需要整理用户反馈。",
+  ])("keeps double-negated and contrastively required work: %s", (goal) => {
+    expect(preferredDispatchRulePresets({ goal, industry: "ai-pm" })[0]).toBe("user-listener");
   });
 });

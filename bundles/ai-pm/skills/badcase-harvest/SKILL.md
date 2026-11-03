@@ -1,7 +1,13 @@
 ---
 name: badcase-harvest
-version: 3.0.0
+version: 3.0.1
 description: 坏例回收。从用户反馈、线上 trace、审批驳回记录中挖掘失败案例，脱敏后人审归入 eval 集——失败即生产资料，同样的坑不踩第二次。
+delivery_contract:
+  schema: workloom.pm.skill-evidence/v1
+  sourceTraceRequired: true
+  redactBeforePersistence: true
+  deduplicateBeforeCounting: true
+  regressionRunRequiresReceipt: true
 ---
 
 # badcase 采撷回流
@@ -19,6 +25,9 @@ description: 坏例回收。从用户反馈、线上 trace、审批驳回记录�
 3. 归因初分：prompt 问题/模型能力/数据问题/需求歧义，附处置建议；
 4. 产出候选 badcase 清单 → 人审批准后增补进对应 eval 集（R-PM10）；
 5. 入库后触发一次该 eval 集回归，确认案例能被正确判负。
+
+6. 每个案例记录脱敏后的 sourceId/traceId、原始任务、触发条件、预期与实际、失败归因及证据等级；根因尚不明确时列候选原因，不把推测定为模型能力缺陷。
+7. 按同一用户/事件/根因去重，保留合并来源与出现频次；失败输入和期望判定独立核对，修复版需正例通过、旧问题需能被判负。未运行回归时标待执行，不能写已入库或已回归。
 
 ## 四、边界与围栏
 - 权限面：来源数据只读；badcase 写库（脱敏是入库前置硬条件）。

@@ -188,6 +188,7 @@ for f in node_modules/tsx/package.json node_modules/hono/package.json scripts/mi
   [ -f "$R/$f" ] || { echo "❌ 应急载荷自检失败：runtime/$f 缺失"; exit 1; }
 done
 node scripts/payload-policy.mjs assert-runtime "$R"
+node scripts/verify-runtime-deepseek.mjs "$R" "$R/node_modules"
 node scripts/verify-runtime-preview.mjs "$R" "$NM_STAGE/node_modules" --target-os win32 --target-cpu x64
 
 # ---------- 7. 打包 + 校验和 ----------

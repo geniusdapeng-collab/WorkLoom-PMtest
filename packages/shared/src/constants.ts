@@ -47,13 +47,15 @@ export const OBJECT_LOCK_TIMEOUT_MS = 10_000;
 export const AWARENESS_WEEKLY_THRESHOLD = 3;
 
 /**
- * 意图路由超时（P1 超时态）：>3s 显「识别中…」可取消。
+ * 意图路由超时（P1 超时态）：分类等待有界，超时取消底层请求并显式标规则回退。
+ * 2026-11-03 PM 实测：默认 3s 会在预算代理/tokenizer 前置与模型往返合计完成前回退。
+ * 默认端到端窗口改为 10s；同步交互和正式派遣仍可显式选择各自窗口。
  * GR-06（2026-09-28 压测）：分场景——
  *  - 同步交互路径（对话框即时问答类）保持 3s，宁可规则兜底也不让用户等；
  *  - 交付型派遣（dispatch）放宽到 12s：实测 15+ 次派发 100% 落 timeout_fallback，
  *    因为真实模型 3s 内根本回不来，等于"意图分类形同虚设"。
  */
-export const INTENT_ROUTE_TIMEOUT_MS = 3_000;
+export const INTENT_ROUTE_TIMEOUT_MS = 10_000;
 export const INTENT_ROUTE_TIMEOUT_SYNC_MS = 3_000;
 export const INTENT_ROUTE_TIMEOUT_DISPATCH_MS = 12_000;
 

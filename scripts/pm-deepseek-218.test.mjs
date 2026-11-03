@@ -11,6 +11,7 @@ import {
   parseStrictJsonResponse,
   planShards,
   remainingCostBudget,
+  renderMarkdownReport,
   summarizeResults,
   validateCatalog,
 } from "./pm-deepseek-218-lib.mjs";
@@ -25,7 +26,7 @@ test("catalog is a checked 218-case, 14-role snapshot with search and executable
   assert.equal(readFileSync(CATALOG_PATH, "utf8"), serializeCatalog());
 });
 
-test("shards never exceed the per-run 40 physical-call contract", () => {
+test("resumable work batches preserve all cases and their independent physical-call count", () => {
   const { catalog } = loadCatalog(CATALOG_PATH);
   const plan = planShards(catalog.tasks, DEFAULT_SHARD_REQUEST_CAP);
   assert.ok(plan.shards.length > 1);
@@ -195,6 +196,9 @@ test("summary exposes incomplete runs, category metrics and failure codes withou
   assert.equal(summary.failuresByCode.ASSERTION_FAILED, 1);
   assert.equal(summary.usage.totalTokens, 15);
   assert.equal(summary.byCategory[task.category].failed, 1);
+  const report = renderMarkdownReport(summary, [result]);
+  assert.match(report, /本次未覆盖 217/);
+  assert.doesNotMatch(report, /最终 100%/);
 });
 
 test("catalog builder is deterministic and rejects accidental count drift", () => {

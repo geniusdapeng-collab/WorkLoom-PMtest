@@ -36,7 +36,7 @@ describe("意图路由（F3.2）", () => {
     expect(r.kind).toBe("routed");
   });
 
-  it("意图路由 3s 超时降级（可取消口径）", async () => {
+  it("意图路由遵循显式超时并降级（可取消口径）", async () => {
     const slow: IntentClassifier = { classify: () => new Promise(() => setTimeout(() => undefined, 10_000)) };
     const r = await routeIntent("查一下昨天差评", slow, 50);
     expect(r.via).toBe("timeout_fallback");

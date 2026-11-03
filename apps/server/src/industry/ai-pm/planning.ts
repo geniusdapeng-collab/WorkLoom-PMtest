@@ -55,7 +55,7 @@ const PATH_RULES: Array<{ match: RegExp; ownership: PathOwnership }> = [
     ownership: { owners: ["release-guardian"], preferred: "release-guardian", reason: "发布检查单与回滚资料由发布护航官拥有" },
   },
   {
-    match: /(?:^|[/_.-])(?:feedback|review|user[-_]?insight|voice[-_]?of[-_]?customer)(?:[/_.-]|$)/i,
+    match: /(?:^|[/_.-])(?:feedback|user[-_]?review|user[-_]?insight|voice[-_]?of[-_]?customer)(?:[/_.-]|$)/i,
     ownership: { owners: ["user-listener"], preferred: "user-listener", reason: "用户反馈聚类与回复建议由用户倾听官拥有" },
   },
   {
@@ -89,7 +89,50 @@ const PATH_RULES: Array<{ match: RegExp; ownership: PathOwnership }> = [
 ];
 
 function ruleFor(path: string): PathOwnership | undefined {
-  return PATH_RULES.find((rule) => rule.match.test(path))?.ownership;
+  // Code is a capability boundary. For documents, the deliverable name is more
+  // specific than a project directory (security/prd.md is still a PRD).
+  if (PATH_RULES[0]!.match.test(path)) return PATH_RULES[0]!.ownership;
+  const basename = path.split("/").at(-1)!;
+  const genericName = /^(?:summary|report|review|result)(?:\.[^.]+)?$/i.test(basename);
+  const matches = genericName ? [] : PATH_RULES.slice(1).filter((rule) => rule.match.test(basename));
+  if (matches.length > 0) {
+    const owners = matches[0]!.ownership.owners.filter((owner) => matches.every((rule) => rule.ownership.owners.includes(owner)));
+    // model-eval.md is ambiguous, not evidence to overrule the planner.
+    if (!owners.length) return undefined;
+    const preferred = matches.map((rule) => rule.ownership.preferred).find((owner) => owners.includes(owner)) ?? owners[0]!;
+    return { ...matches[0]!.ownership, owners, preferred };
+  }
+  // A generic review is not a customer-feedback-role hint.
+  // Only use a specific nearest directory when the filename gives no signal.
+  const directory = path.split("/").slice(0, -1).reverse();
+  for (const part of directory) {
+    const match = PATH_RULES.slice(1, -2).find((rule) => rule.match.test(part));
+    if (match) return match.ownership;
+  }
+  return undefined;
+}
+
+function requireEvidenceDependencies(plan: PmTaskPlan[]): void {
+  const byId = new Map(plan.map((task) => [task.id, task]));
+  for (const task of plan) {
+    const ancestors = new Set<string>();
+    const visit = (id: string) => {
+      if (ancestors.has(id)) return;
+      ancestors.add(id);
+      byId.get(id)?.dependsOn.forEach(visit);
+    };
+    task.dependsOn.forEach(visit);
+    const text = [task.goal, ...task.acceptance].join("\n");
+    for (const producer of plan) {
+      if (producer.id === task.id || ancestors.has(producer.id)) continue;
+      for (const path of producer.outputRefs) {
+        const escaped = path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        if (new RegExp(`(?<![A-Za-z0-9_./-])${escaped}(?![A-Za-z0-9_./-])`).test(text)) {
+          throw new PmError("PLAN_EVIDENCE_DEPENDENCY_MISSING", `任务 ${task.id} 引用了 ${producer.id} 的产物 ${path}，但缺少前置依赖，未派发员工`);
+        }
+      }
+    }
+  }
 }
 
 /**
@@ -103,6 +146,7 @@ export function reconcilePmTeamPlan(
   plan: PmTaskPlan[],
   options: { primaryOwner?: string; allowedEmployees: readonly string[] } = { allowedEmployees: [] },
 ): { plan: PmTaskPlan[]; corrections: PmOwnerCorrection[] } {
+  requireEvidenceDependencies(plan);
   const allowed = new Set(options.allowedEmployees);
   const corrections: PmOwnerCorrection[] = [];
   const reconciled = plan.map((task) => {

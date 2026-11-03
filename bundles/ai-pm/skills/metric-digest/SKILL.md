@@ -1,13 +1,21 @@
 ---
 name: metric-digest
-version: 1.0.1
+version: 1.0.6
 description: 指标序列计算（同比/环比/阈值异动），产出日报/周报骨架。
 delivery_contract:
   schema: workloom.pm.skill-evidence/v1
+  analysisScope: requested-descriptive-before-optional-experiment
+  conditionConsistency: one-exhaustive-decision-rule
   claimTypes: [calculation, observation, hypothesis]
   denominatorAndWindowRequired: true
   zeroDenominator: undefined
   pointThresholdAloneFalsifies: false
+  intervalDecision: direction-and-prespecified-effect
+  missingWindow: explicit-computation-assumption
+  quantitativeClaims: recompute-every-comparison
+  sampleSize: formula-or-explicitly-not-calculated
+  relativeChange: same-metric-same-unit
+  experimentAudit: allocation-attrition-window-denominator
   experimentFields: [effect, allocation, sampleSizeOrPower, statisticalDecision, uncertainty, guardrails]
 ---
 
@@ -25,6 +33,15 @@ delivery_contract:
 3. 报告分开三类陈述：可复算的 calculation、材料直接支持的 observation、待验证的 hypothesis。阈值异动只能提示排查；跨周汇总不能推出新/存量用户或渠道的个体表现，点估计相同不能声称无显著影响，没有因果设计不能写成原因已证实。
 4. 提出可证伪实验时，预先写清效应/最小有意义变化、随机分配、样本量或功效依据、统计判定规则、置信区间/不确定性与护栏；样本不足时结论为「证据不足」，不是假设已被证伪。不能仅凭观测提升低于一个百分点阈值就否定效应，也不能把随机实验对某个干预的作用直接等同于历史下降的成因。
 5. 交付前交叉核对结论与表格公式，检查每个“说明/导致/显著/无影响”是否超出材料；所有疑似原因、实验参数假设和待核实混杂因素明确标出，生成可读的日报/周报。
+6. 对正向效应 Δ 的预设双侧置信区间 [L,U]，先固定最小有意义效应 δ>0 与判定目标：L>0 才支持正向效应；U≤0 才与“Δ>0”方向相反；U<δ 只能在该置信水平下排除“Δ≥δ”的目标，不能据此排除小于 δ 的正效应。区间同时包含 0 与 δ 属证据不足；L≤0 只是未证明正向效应，绝不等于证伪。若要证明等效/无实质影响，另预设等效界限与相应检验，不能偷换为不显著。
+7. 只有“本周/上周”的汇总数字不能证明时间窗完整、cohort 相同或口径一致。可复算所给计数的比例，但须在计算前写明“仅按给定汇总计算；同窗口/同口径比较是待确认假设”；全文不得前面称已确认可比、后面又说未知。
+8. 所有数字描述必须从计算表逐项派生：绝对人数、比率及相对变化是不同指标；分别计算本期减上期的正负后再说上升/下降，不用“均下降/都不高于”等概括掩盖方向不一致。最终逐句把正文数字和比较符号对回表格，不允许表格正确、观察段落却算反。
+9. 不为显得专业而增加未计算的样本量/功效数字。资料没有现成样本量时，先给基线、目标效应、分配、α、功效与计算方法，样本量明确“待公式/工具计算，未得出数值”；确实输出数值时必须同时给完整公式、代入、单双侧/连续性校正等口径与向上取整过程，复算不一致则删掉数值并标未计算。仅写“约”或“估算”不能证明功效已达标。
+10. 变化表的每一行锁定同一指标与单位。转化率 r=分子/分母：百分点差=(r本期−r上期)×100，转化率相对变化=(r本期/r上期−1)×100%；两者都必须使用同两个率。人数相对变化=(n本期/n上期−1)×100%，只可放独立“人数变化”列/表，不能拿人数变化填到转化率变化列；上期率或人数为零时对应相对变化未定义。交付前把每个公式操作数的指标名和单位对回列标题，不能只验算术而漏掉指标偷换。
+11. 实验评审的补证计划逐项包含分流/随机化及跨组污染、样本去重与分组后剔除/流失、固定分母和同一观察窗、风险护栏与复核准入门槛；每项说明需取得的日志或数据及判据。先从题内明确条件推导集合关系，不把已经给定或可严格推出的事实降为未知；例如已知被排除集合与成功集合不相交，就不得又质疑成功者是否都在剩余集合。现实日志复核另列，不撤销材料条件下的计算结论。
+
+12. 先完成用户要求的描述统计、分层/权重分解与决策解释；只有明确要求实验或因果验证确属任务必需时才展开实验设计，不将完整实验模板强加给汇总分析。可选后续验证保持简短，不新增无依据的阈值或复杂判定树。材料明确给定的去重、同窗、口径作为本题计算条件，现实回执缺失另列，不撤销该条件。
+13. 需要条件判定时，先定义每个符号、正负方向和唯一逻辑式，再从同一规则推导所有分支，检查正/零/负与边界组合是否互斥穷尽；任何分支不得省略原式的符号条件或同时得到相反结论。算术分解只说明所选分解法下的贡献，不自动证明因果或全部归因；摘要、表格和后续验证共用同一口径。
 
 ## 四、边界与围栏
 - 权限面：只读指标库（R-PM4）；报告写库（L1）。

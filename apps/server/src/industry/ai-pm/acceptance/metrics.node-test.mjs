@@ -98,3 +98,11 @@ test("active intent capacity retains three physical calls for model-planned sear
   assert.equal(intentSlotAvailable(boundary(0, 3, ["unknown usage"]), {}).allowed, false);
   assert.equal(intentSlotAvailable({}, {}).allowed, false);
 });
+
+test("explicit PM unlimited calls admit intent work while unknown policy and frozen usage remain blocked", () => {
+  const boundary = { budget: { schema: "workloom.pm-task-budget/v1", used: { llmCalls: 1000 }, budgets: { maxLlmCalls: null }, frozenBy: [], exceeded: [] } };
+  assert.deepEqual(intentSlotAvailable(boundary, { searchSelected: true }), { allowed: true, searchReserve: 3 });
+  assert.equal(intentSlotAvailable({ budget: { ...boundary.budget, schema: "unknown" } }, {}).allowed, false);
+  assert.equal(intentSlotAvailable({ budget: { ...boundary.budget, frozenBy: ["usage unknown"] } }, {}).allowed, false);
+  assert.equal(intentSlotAvailable({ budget: { ...boundary.budget, exceeded: ["llmTokens"] } }, {}).allowed, false);
+});

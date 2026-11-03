@@ -19,13 +19,15 @@ function fixture(t, behavior = "success") {
     writeFileSync(vite, `const fs = require('node:fs');
 const record = value => fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(value) + '\\n');
 const phase = process.argv[2];
-record({ phase, args: process.argv.slice(2), cwd: process.cwd(), nodeEnv: process.env.NODE_ENV, diagnostics: process.env.VITE_ENABLE_UI_DIAGNOSTICS });
-if (${JSON.stringify(behavior)} === 'build-failure' && phase === 'build') process.exit(7);
-if (${JSON.stringify(behavior)} === 'preview-failure' && phase === 'preview') process.exit(9);
 if (${JSON.stringify(behavior)} === 'wait-build' || ${JSON.stringify(behavior)} === 'wait-preview' && phase === 'preview') {
   process.on('SIGTERM', () => { record({ signal: 'SIGTERM', phase }); process.exit(0); });
   setInterval(() => {}, 1000);
 }
+// The parent treats this record as readiness to receive termination. Install
+// the handler first so its signal cannot arrive in the registration gap.
+record({ phase, args: process.argv.slice(2), cwd: process.cwd(), nodeEnv: process.env.NODE_ENV, diagnostics: process.env.VITE_ENABLE_UI_DIAGNOSTICS });
+if (${JSON.stringify(behavior)} === 'build-failure' && phase === 'build') process.exit(7);
+if (${JSON.stringify(behavior)} === 'preview-failure' && phase === 'preview') process.exit(9);
 `);
     mkdirSync(join(root, "apps", client, "dist"));
     writeFileSync(join(root, "apps", client, "dist", "sentinel"), "original production dist");
