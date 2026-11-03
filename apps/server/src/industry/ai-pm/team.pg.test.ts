@@ -415,6 +415,46 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
     expect(completed.tasks[0]!.usage).toEqual({ promptTokens: 40, completionTokens: 21 });
   });
 
+  it("resumes a reviewed document with its anchored failure observations, keeping the saved plan and completed ancestor", async () => {
+    let rejectDocument = true;
+    const calls: EmployeeExecutionInput[] = [];
+    const planning = provider();
+    const current = service({ providerFactory: () => planning, employeeExecutor: async (input) => {
+      calls.push(input);
+      if (input.task.id === "prd" && rejectDocument) {
+        rejectDocument = false;
+        throw Object.assign(new PmError("SEMANTIC_REVIEW_FAILED", "完整审稿未放行", 409), {
+          usage: { promptTokens: 9, completionTokens: 4 }, modelId: "fixture-deepseek", receipt: {
+            adapter: "deepseek-completion", semanticReviewPolicy: "workloom.pm.semantic-review/v1", final: false,
+            usageComplete: true, modelRequestsComplete: true, reconciliationRequired: false, stages: [
+              { stage: "review", status: "completed", verdict: "repair", findings: [{ id: "same-input", kind: "contradiction",
+                outputPath: "prd.md", sourceQuoteSha256: "a".repeat(64), outputQuoteSha256: "b".repeat(64),
+                verificationSummary: "同一验收同时写为通过与未执行", correctionSummary: "只保留能由已知证据推出的状态" }] },
+            ],
+          },
+        });
+      }
+      return fixtureResult(input);
+    } });
+    const created = await create(current);
+    await current.start(scopeA, created.run.id);
+    const failed = await current.waitForRun(scopeA, created.run.id);
+    expect(failed.run.errorCode).toBe("SEMANTIC_REVIEW_FAILED");
+    expect(failed.artifacts.map((artifact) => artifact.path)).toEqual(["requirements.md"]);
+    expect(calls[1]!.semanticRetryObservation).toBeUndefined();
+    await current.start(scopeA, created.run.id, true);
+    const completed = await current.waitForRun(scopeA, created.run.id);
+    expect(calls.map((call) => call.task.id)).toEqual(["requirements", "prd", "prd"]);
+    expect(calls[2]!.semanticRetryObservation).toContain("同一验收同时写为通过与未执行");
+    expect(calls[2]!.semanticRetryObservation).not.toContain("a".repeat(64));
+    expect(calls[2]!.task.acceptance).toEqual(failed.tasks[1]!.acceptance);
+    expect(completed.run.status).toBe("completed");
+    expect(completed.run.planVersion).toBe(1);
+    expect(completed.tasks[1]!.acceptance).toEqual(failed.tasks[1]!.acceptance);
+    expect(completed.artifacts.find((artifact) => artifact.path === "requirements.md")?.sha256).toBe(failed.artifacts[0]!.sha256);
+    expect(planning.complete).toHaveBeenCalledTimes(1);
+  });
+
   it("code verification blocks handoff before completion and explicit resume repairs only the failed owner with feedback", async () => {
     const codingPlan: PmTaskPlan[] = [plan[0]!,
       { id: "code", presetKey: "dev-orchestrator", goal: "依据requirements.md实现模块与测试", dependsOn: ["requirements"],

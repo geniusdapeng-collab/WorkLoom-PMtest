@@ -52,6 +52,8 @@ export interface EmployeeExecutionInput {
   /** Optional only for trusted test/adapter injection compatibility. */
   assetBinding?: PmAssetBinding;
   dependencyArtifacts: DependencyArtifact[];
+  /** Server-owned, metered prior review observations. They are input data, not saved plan requirements. */
+  semanticRetryObservation?: string;
   /** Server-controlled, newly created private scratch directory, never supplied by the HTTP client. */
   outputDir: string;
   signal: AbortSignal;
