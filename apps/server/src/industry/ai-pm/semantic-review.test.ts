@@ -195,11 +195,36 @@ describe("same canonical model review and targeted repair", () => {
     expect(sent).not.toContain("case.person@example.test"); expect(sent).toContain("[PII:EMAIL:");
     expect(result.receipt).toMatchObject({ semanticAnchorView: "provider-masked", modelRequests: 4 });
   });
-  it("rejects unanchored critique without repair and blocks an unresolved source contradiction", async () => {
-    const wrong = review("repair"); wrong.issues[0]!.sourceQuote = "外部新规则";
-    const provider = providerWith([completion(JSON.stringify(wrong))]);
-    await expect(createReviewedEmployeeExecutor(provider, async () => generated("合计7"))(input())).rejects.toMatchObject({ code: "SEMANTIC_REVIEW_INVALID" });
-    expect(provider.complete).toHaveBeenCalledOnce();
+  it("allows one metered anchor correction on the same immutable draft without applying the invalid critique", async () => {
+    const invalid = review("repair"); invalid.issues[0]!.outputQuote = "未写入的段落";
+    const provider = providerWith([completion(JSON.stringify(invalid), { responseId: "bad-anchor" }),
+      completion(JSON.stringify(review("repair")), { responseId: "anchored" }),
+      completion("合计6", { responseId: "revised" }), completion(JSON.stringify(review()), { responseId: "final-review" })]);
+    const result = await createReviewedEmployeeExecutor(provider, async () => generated("合计7"))(input());
+    expect(result.files[0]!.content).toBe("合计6");
+    expect(result.usage).toEqual({ promptTokens: 60, completionTokens: 30 });
+    expect(result.receipt).toMatchObject({ modelRequests: 5, usageComplete: true, stages: [
+      { stage: "generation" }, { stage: "review", status: "failed", anchorError: "candidate", responseId: "bad-anchor" },
+      { stage: "review", anchorCorrection: "candidate", verdict: "repair" }, { stage: "revision" }, { stage: "review", verdict: "pass" },
+    ] });
+    const [first, retry] = provider.complete.mock.calls;
+    expect(first![0][1]!.content).toBe(retry![0][1]!.content);
+    expect(retry![0][0]!.content).not.toContain(invalid.issues[0]!.outputQuote);
+    expect(retry![1]).toMatchObject({ thinking: "enabled", reasoningEffort: "high", requireUsage: true });
+  });
+  it("stops if a settled anchor correction fails again, and never retries unknown usage", async () => {
+    const invalid = review("repair"); invalid.issues[0]!.sourceQuote = "外部新规则";
+    const bad = completion(JSON.stringify(invalid));
+    const provider = providerWith([bad, bad]);
+    const error = await createReviewedEmployeeExecutor(provider, async () => generated("合计7"))(input()).catch(e => e);
+    expect(error).toMatchObject({ code: "SEMANTIC_REVIEW_INVALID", receipt: { modelRequests: 3, usageComplete: true } });
+    expect(provider.complete).toHaveBeenCalledTimes(2);
+    const unmetered = providerWith([{ ...bad, usage: undefined }]);
+    const unknown = await createReviewedEmployeeExecutor(unmetered, async () => generated("合计7"))(input()).catch(e => e);
+    expect(unknown).toMatchObject({ code: "MODEL_RECEIPT_MISSING", receipt: { usageComplete: false, reconciliationRequired: true } });
+    expect(unmetered.complete).toHaveBeenCalledOnce();
+  });
+  it("blocks an unresolved source contradiction without anchor correction", async () => {
     const blocked = providerWith([completion(JSON.stringify(review("blocked")))]);
     await expect(createReviewedEmployeeExecutor(blocked, async () => generated())(input())).rejects.toMatchObject({ code: "SEMANTIC_REVIEW_BLOCKED" });
     expect(blocked.complete).toHaveBeenCalledOnce();

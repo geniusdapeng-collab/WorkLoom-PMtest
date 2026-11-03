@@ -12,7 +12,8 @@ import { promisify } from "node:util";
 const run = promisify(execFile);
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const TOKENIZER_SHA256 = "81f64d1248a68ce3663e07ab3ee48b851e5df0e32d27cb98e4c9a268151e8d99";
-const FILES = ["deepseek-window.ts", "assets/deepseek-v41/tokenizer.json", "assets/deepseek-v41/provenance.json",
+const SMOKE = "deepseek-window.runtime-smoke.mjs";
+const FILES = ["deepseek-window.ts", SMOKE, "assets/deepseek-v41/tokenizer.json", "assets/deepseek-v41/provenance.json",
   "assets/deepseek-v41/LICENSE-RECIPE.txt", "assets/deepseek-v41/LICENSE-TOKENIZER.txt", "assets/deepseek-v41/README.md"];
 
 export async function verifyRuntimeDeepSeek({ runtimeRoot, nodeModulesRoot }) {
@@ -52,32 +53,12 @@ export async function verifyRuntimeDeepSeek({ runtimeRoot, nodeModulesRoot }) {
     }
     await writeFile(join(fixture, "package.json"), '{"type":"module"}\n');
     await symlink(modules, join(fixture, "node_modules"), process.platform === "win32" ? "junction" : "dir");
-    const smoke = `import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
-import { encodeDeepSeekRequest, planDeepSeekWindow } from './deepseek-window.ts';
-globalThis.fetch = () => { throw new Error('Tokenizer must not use the network'); };
-const p = JSON.parse(await readFile(new URL('./assets/deepseek-v41/provenance.json', import.meta.url), 'utf8'));
-const checks = [];
-assert.ok(p.verification.smokeCases.length >= 2);
-for (const c of p.verification.smokeCases) {
-  const encoded = await encodeDeepSeekRequest(c.body);
-  assert.equal(encoded.tokenIds.length, c.inputTokens);
-  assert.equal(createHash('sha256').update(JSON.stringify(encoded.tokenIds)).digest('hex'), c.tokenIdsSha256);
-  const plan = await planDeepSeekWindow(c.body);
-  assert.equal(plan.fullInputTokens, c.inputTokens);
-  assert.equal(plan.maxOutputTokens, Math.min(393216, 1048576 - c.inputTokens));
-  checks.push({ id: c.id, inputTokens: c.inputTokens, maxOutputTokens: plan.maxOutputTokens });
-}
-console.log(JSON.stringify(checks));
-`;
-    await writeFile(join(fixture, "smoke.mjs"), smoke);
     const env = { ...process.env };
     delete env.NODE_PATH; delete env.NODE_OPTIONS;
     // Node 24's native type stripping executes this erasable TypeScript module.
     // No build-machine compiler or target-specific esbuild binary is involved,
     // so the same pure-JS smoke also works for foreign-platform payloads.
-    const result = await run(process.execPath, [join(fixture, "smoke.mjs")],
+    const result = await run(process.execPath, [join(fixture, SMOKE)],
       { cwd: fixture, env, timeout: 30_000, maxBuffer: 1024 * 1024 });
     return { schemaVersion: "workloom.runtime-deepseek/v1", tokenizerSha256: TOKENIZER_SHA256,
       engine: `${engine.name}@${engine.version}`, offline: true, checks: JSON.parse(result.stdout.trim()) };

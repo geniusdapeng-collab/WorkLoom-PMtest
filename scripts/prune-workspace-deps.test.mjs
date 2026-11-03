@@ -77,7 +77,9 @@ function tokenizerPayload(t) {
   const source = resolve(dirname(fileURLToPath(import.meta.url)), "../packages/base/model-router");
   for (const target of ["packages/base/model-router", "node_modules/@workloom/base/model-router"]) {
     mkdirSync(join(root, target), { recursive: true });
-    cpSync(join(source, "deepseek-window.ts"), join(root, target, "deepseek-window.ts"));
+    for (const file of ["deepseek-window.ts", "deepseek-window.runtime-smoke.mjs"]) {
+      cpSync(join(source, file), join(root, target, file));
+    }
     cpSync(join(source, "assets"), join(root, target, "assets"), { recursive: true });
   }
   const engine = realpathSync(resolve(source, "../node_modules/@huggingface/tokenizers"));

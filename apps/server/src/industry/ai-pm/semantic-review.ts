@@ -15,6 +15,10 @@ const MAX_REPAIRS = 2;
 const sha = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
 const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 const fail = (message: string): never => { throw new PmError("SEMANTIC_REVIEW_INVALID", message, 502); };
+type AnchorLocation = "source" | "candidate";
+class ReviewAnchorError extends PmError {
+  constructor(readonly location: AnchorLocation, message: string) { super("SEMANTIC_REVIEW_INVALID", message, 502); }
+}
 
 export interface ReviewSource { id: string; content: string }
 const CalculationSchema = z.object({
@@ -92,17 +96,17 @@ export function parsePmSemanticReview(text: string, sources: readonly ReviewSour
   const byPath = new Map(files.map((file) => [file.path, file.content]));
   for (const issue of review.issues) {
     const reported = bySource.get(issue.sourceId);
-    if (reported === undefined) return fail("审稿引文引用了本次未提供的来源编号");
+    if (reported === undefined) throw new ReviewAnchorError("source", "审稿引文引用了本次未提供的来源编号");
     if (!reported.includes(issue.sourceQuote)) {
       // The same goal can occur under several IDs. Recover a label error only
       // when the literal exists in one distinct source, including exact aliases.
       const matches = sources.filter((source) => source.content.includes(issue.sourceQuote));
       const [match] = matches;
-      if (!match || matches.some((source) => source.content !== match.content)) return fail("审稿来源引文缺失或在不同来源中有歧义");
+      if (!match || matches.some((source) => source.content !== match.content)) throw new ReviewAnchorError("source", "审稿来源引文缺失或在不同来源中有歧义");
       issue.reportedSourceId = issue.sourceId;
       issue.sourceId = match.id;
     }
-    if (!byPath.get(issue.outputPath)?.includes(issue.outputQuote)) fail("审稿产物引文不存在或文件不属于本任务");
+    if (!byPath.get(issue.outputPath)?.includes(issue.outputQuote)) throw new ReviewAnchorError("candidate", "审稿产物引文不存在或文件不属于本任务");
     if (issue.kind === "arithmetic" && !issue.calculation) fail("算术问题缺少独立可复算的数值证据");
     if (issue.calculation) verifyCalculation(issue.calculation, issue.sourceQuote, issue.outputQuote);
   }
@@ -143,6 +147,8 @@ interface StageReceipt {
   responseSha256?: string;
   evidence?: { path: string; sha256: string };
   verdict?: PmSemanticReview["verdict"];
+  anchorError?: AnchorLocation;
+  anchorCorrection?: AnchorLocation;
   issueCount?: number;
   findings?: Array<{ id: string; kind: string; sourceId: string; reportedSourceId?: string; outputPath: string; sourceQuoteSha256: string; outputQuoteSha256: string; verificationSummary: string; correctionSummary: string; summaryTruncated: boolean }>;
   findingsOmitted?: number;
@@ -247,16 +253,33 @@ export function createReviewedEmployeeExecutor(provider: CompletionProvider, gen
       activeStage.responseSha256 = typeof generated.receipt?.rawResponseSha256 === "string" ? generated.receipt.rawResponseSha256 : sha(initialEvidence);
       await saveEvidence(activeStage, initialEvidence);
       activeStage.status = "completed";
-      for (let repair = 0; ; repair++) {
-        const reviewStage: StageReceipt = { stage: "review", ordinal: stages.length, mode: "enabled", effort: "high", status: "pending", dispatch: "blocked_before_send" };
+      let anchorCorrection: AnchorLocation | undefined;
+      let usedAnchorCorrection = false;
+      for (let repair = 0; ;) {
+        const reviewStage: StageReceipt = { stage: "review", ordinal: stages.length, mode: "enabled", effort: "high", status: "pending", dispatch: "blocked_before_send",
+          ...(anchorCorrection ? { anchorCorrection } : {}) };
         // Match the provider's masking of the serialized message, including its
         // boundaries. Validate anchors against exactly what the reviewer sees.
         const reviewMessage = maskText(JSON.stringify({ ...context, candidate: candidate.files })).text;
         const reviewView = JSON.parse(reviewMessage) as { sources: ReviewSource[]; candidate: PmFile[] };
-        const response = await call(reviewStage, [{ role: "system", content: PM_SEMANTIC_REVIEW_PROMPT },
+        const guidance = anchorCorrection ? `\n上次审稿的${anchorCorrection === "source" ? "来源" : "产物"}定位未通过服务端逐字校验，整份意见未被采用。请基于下方同一份完整输入独立复核。优先复制各自文件中不跨行的短片段，仔细核对编号、路径、空白和标点；不要尝试补写文件中不存在的句子。所有原判据仍适用。` : "";
+        const response = await call(reviewStage, [{ role: "system", content: PM_SEMANTIC_REVIEW_PROMPT + guidance },
           { role: "user", content: reviewMessage }],
         { thinking: "enabled", reasoningEffort: "high", responseFormat: { type: "json_object" } });
-        const review = parsePmSemanticReview(response.text, reviewView.sources, reviewView.candidate);
+        let review: PmSemanticReview;
+        try { review = parsePmSemanticReview(response.text, reviewView.sources, reviewView.candidate); }
+        catch (error) {
+          if (!(error instanceof ReviewAnchorError)) throw error;
+          reviewStage.anchorError = error.location;
+          if (usedAnchorCorrection || !reviewStage.usage || reviewStage.dispatch !== "response_received") throw error;
+          // The original call is already metered, with a response ID and stop.
+          // Correct only the review protocol; never apply an unanchored critique.
+          reviewStage.status = "failed";
+          usedAnchorCorrection = true;
+          anchorCorrection = error.location;
+          continue;
+        }
+        anchorCorrection = undefined;
         reviewStage.status = "completed"; reviewStage.verdict = review.verdict; reviewStage.issueCount = review.issues.length;
         reviewStage.findings = review.issues.slice(0, 5).map((issue) => ({ id: issue.id, kind: issue.kind, sourceId: issue.sourceId,
           ...(issue.reportedSourceId ? { reportedSourceId: issue.reportedSourceId } : {}),
@@ -283,6 +306,7 @@ export function createReviewedEmployeeExecutor(provider: CompletionProvider, gen
         candidate = validateEmployeeResult({ ...payload, usage: revisionStage.usage!, modelId: revised.model, responseId: revised.responseId }, outputRefs);
         await saveEvidence(revisionStage, JSON.stringify({ files: candidate.files, summary: candidate.summary }));
         revisionStage.status = "completed";
+        repair++;
       }
     } catch (error) {
       if (activeStage) {
