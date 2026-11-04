@@ -96,8 +96,9 @@ export interface CompletionOptions {
   responseFormat?: { type: "text" | "json_object" };
   /** 预算预留/治理闸门必须在网络请求之前完成；异常直接终止，不降级至 mock。 */
   beforeRequest?: (request: BeforeCompletionRequest) => void | Promise<void>;
-  /** Last durable dispatch marker, after quota admission and before fetch. */
-  beforeDispatch?: (receipt: CompletionDispatchReceipt) => void | Promise<void>;
+  /** Last durable dispatch marker, after quota admission and before fetch.
+   * The hook must bound its I/O and settle any in-flight write before returning. */
+  beforeDispatch?: (receipt: CompletionDispatchReceipt, signal: AbortSignal) => void | Promise<void>;
   /** 旧 chat 网关可能没有 usage；真实工具执行默认拒绝缺失计量。 */
   requireUsage?: boolean;
 }
@@ -373,7 +374,13 @@ export class OpenAiCompatibleProvider implements ModelProvider {
       if (this.cfg.beforeRequest) await abortable(Promise.resolve(this.cfg.beforeRequest(request)), deadline.signal);
       if (opts.beforeRequest && opts.beforeRequest !== this.cfg.beforeRequest) await abortable(Promise.resolve(opts.beforeRequest(request)), deadline.signal);
       deadline.signal.throwIfAborted();
-      if (opts.beforeDispatch) await abortable(Promise.resolve(opts.beforeDispatch(structuredClone({ ...dispatch, dispatchState: "possibly-sent", usageComplete: false }))), deadline.signal);
+      if (opts.beforeDispatch) {
+        // Await the ledger write even if cancellation wins. Its caller must
+        // see the marker before receiving a terminal no-send receipt.
+        const pending = structuredClone({ ...dispatch, dispatchState: "possibly-sent", usageComplete: false } as const);
+        try { await opts.beforeDispatch(pending, deadline.signal); }
+        catch (error) { deadline.signal.throwIfAborted(); throw error; }
+      }
       deadline.signal.throwIfAborted();
       let res: Response;
       dispatch.dispatchState = "possibly-sent";
@@ -392,6 +399,7 @@ export class OpenAiCompatibleProvider implements ModelProvider {
           && res.headers.get("x-workloom-model-dispatch") === "not-sent"
           && res.headers.get("x-workloom-request-sha256") === dispatch.requestSha256) {
           dispatch.dispatchState = "blocked-before-send";
+          dispatch.usageComplete = true;
         }
         // 清理失败不能覆盖已知的 HTTP 状态，也不能把上游正文/密钥放进异常。
         void res.body?.cancel().catch(() => undefined);

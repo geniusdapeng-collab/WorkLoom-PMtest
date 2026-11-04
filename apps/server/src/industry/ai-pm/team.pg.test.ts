@@ -7,6 +7,7 @@ import { join } from "node:path";
 import type { AssembledPreset } from "@workloom/runtime";
 import { bundlesRoot, loadVerifiedBundleManifest, loadVerifiedBundleWorkforcePresets } from "@workloom/base/bundles";
 import { OpenAiCompatibleProvider, type CompletionProvider, type CompletionResult } from "@workloom/base/model-router";
+import { closeAllPools } from "@workloom/db";
 import { ArtifactStore } from "./artifacts.js";
 import { PmTeamService, createOneShotEmployeeExecutor } from "./service.js";
 import { PgPmStore } from "./store.js";
@@ -85,7 +86,7 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
     app = new pg.Pool({ connectionString: database.appUrl, max: 20 });
     // Migration setup must finish before parallel PG suites start. Reapplying
     // its ALTER TABLE / policy DDL here can deadlock another suite's run update.
-    for (const name of ["0043_pm_team.sql", "0060_pm_thread_events.sql"]) {
+    for (const name of ["0043_pm_team.sql", "0060_pm_thread_events.sql", "0061_pm_superagent_search.sql", "0062_pm_superagent_search_attempts.sql"]) {
       const migration = await readFile(new URL(`../../../../../packages/db/migrations/${name}`, import.meta.url), "utf8");
       const applied = await owner.query<{ checksum: string }>("SELECT checksum FROM _migrations WHERE name=$1", [name]);
       expect(applied.rows[0]?.checksum, `run pnpm db:migrate before PG tests; ${name} must already match this source`)
@@ -101,7 +102,7 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
   afterAll(async () => {
     await Promise.allSettled(services.map((value) => value.close()));
     if (artifactRoot) await rm(artifactRoot, { recursive: true, force: true });
-    await Promise.allSettled([owner?.end(), app?.end()]);
+    await Promise.allSettled([owner?.end(), app?.end(), closeAllPools()]);
     // Do not delete append-only lifecycle evidence. UUID fixture rows remain in this isolated DB.
   });
 
@@ -129,11 +130,12 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
       goal: "从事件发起正式产物交付", employee: "doc-writer",
     } };
     const actor = "MEM-PM-FIXTURE";
-    const followup = { kind: "followup", eventId: randomUUID(), threadId: request.threadId, text: "补充字".repeat(600) };
+    const followup = { kind: "followup", eventId: randomUUID(), threadId: request.threadId, runId: "", text: "补充字".repeat(600) };
     let runId = "";
     try {
       const receipts = await Promise.all(Array.from({ length: 8 }, (_, i) => (i % 2 ? first : second).receiveEvent(scopeA, request, actor)));
       runId = receipts[0]!.runId;
+      followup.runId = runId;
       expect(new Set(receipts.map((receipt) => receipt.runId))).toEqual(new Set([runId]));
       expect(receipts.filter((receipt) => !receipt.replayed)).toHaveLength(1);
       expect((await first.detail(scopeA, runId)).run.threadId).toBe(request.threadId);
@@ -178,6 +180,40 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
     expect(next.runId).not.toBe(runId);
     await first.waitForRun(scopeA, next.runId);
     expect(await first.getThreadEvent(scopeA, request.threadId, request.eventId)).toMatchObject({ runId, eventId: request.eventId });
+  });
+
+  it("cannot append a delayed followup to a replacement run in the same thread", async () => {
+    const current = service();
+    const actor = "MEM-PM-FIXTURE";
+    const threadId = randomUUID();
+    const request = { kind: "request", threadId, eventId: randomUUID(), input: { goal: "第一轮补充的目的" }, start: false };
+    const first = await current.receiveEvent(scopeA, request, actor);
+    const delayed = { kind: "followup", threadId, eventId: randomUUID(), runId: first.runId, text: "只用于第一轮" };
+    await current.cancel(scopeA, first.runId, actor);
+    const second = await current.receiveEvent(scopeA, { ...request, eventId: randomUUID(), input: { goal: "第二轮新的任务" } }, actor);
+    await expect(current.receiveEvent(scopeA, delayed, actor)).rejects.toMatchObject({ code: "PM_FOLLOWUP_RUN_MISMATCH" });
+    await expect(current.getThreadEvent(scopeA, threadId, delayed.eventId)).rejects.toMatchObject({ code: "PM_EVENT_NOT_FOUND" });
+    const { runId: _stale, ...withoutTarget } = delayed;
+    await expect(current.receiveEvent(scopeA, withoutTarget, actor)).rejects.toMatchObject({ code: "PM_FOLLOWUP_RUN_REQUIRED" });
+    await expect(current.receiveEvent(scopeA, { ...delayed, runId: second.runId }, actor))
+      .resolves.toMatchObject({ runId: second.runId, decision: "attached", replayed: false });
+    expect((await store.listThreadEvents(scopeA, threadId, 1, first.runId)).map((event) => event.runId)).toEqual([first.runId]);
+    await expect(store.listThreadEvents(scopeB, threadId, 1, first.runId)).rejects.toMatchObject({ code: "PM_THREAD_NOT_FOUND" });
+  });
+
+  it("replays a legacy followup without a run target only when its persisted identity is exact", async () => {
+    const current = service();
+    const actor = "MEM-PM-FIXTURE";
+    const request = { kind: "request", eventId: randomUUID(), threadId: randomUUID(), input: { goal: "兼容已经保存的旧版补充" }, start: false };
+    const { runId } = await current.receiveEvent(scopeA, request, actor);
+    const legacy = { kind: "followup", eventId: randomUUID(), threadId: request.threadId, text: "旧版内容" };
+    const body = JSON.stringify(legacy);
+    await owner.query(`INSERT INTO pm_thread_events(tenant_id,workspace_id,event_id,thread_id,run_id,actor_id,kind,fingerprint,body)
+      VALUES($1,$2,$3,$4,$5,$6,'followup',$7,$8::jsonb)`,
+    [scopeA.tenantId, scopeA.workspaceId, legacy.eventId, request.threadId, runId, actor, createHash("sha256").update(body).digest("hex"), body]);
+    expect(await current.receiveEvent(scopeA, legacy, actor)).toMatchObject({ runId, replayed: true });
+    await expect(current.receiveEvent(scopeA, { ...legacy, text: "已修改的旧版内容" }, actor)).rejects.toMatchObject({ code: "PM_EVENT_CONFLICT" });
+    await expect(current.receiveEvent(scopeA, legacy, "MEM-DIFFERENT")).rejects.toMatchObject({ code: "PM_EVENT_CONFLICT" });
   });
 
   it("event, run, and audit rolls back together when the admission event cannot be journaled", async () => {
@@ -627,7 +663,8 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
 
     expect(failed.run.status).toBe("failed");
     expect(failed.artifacts).toEqual([]);
-    const artifactPath = await artifactStore.resolveFile(scopeA, detail.run.id, "result.md");
+    const unregistered = complete.mock.calls[0]![5][0]!;
+    const artifactPath = await artifactStore.resolveArtifactFile(scopeA, detail.run.id, unregistered);
     await expect(readFile(artifactPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 
     await current.start(scopeA, detail.run.id, true);
@@ -636,6 +673,74 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
     expect(recovered.artifacts).toHaveLength(1);
     expect(await artifactStore.read(scopeA, detail.run.id, recovered.artifacts[0]!)).toContain("生成可核验的恢复测试文档");
     expect(complete).toHaveBeenCalledTimes(2);
+  });
+
+  it("recovers the declared artifact after interruption between fsync and the database receipt", async () => {
+    let entered!: () => void, proceed!: () => void;
+    const active = new Promise<void>((resolve) => { entered = resolve; });
+    const continuation = new Promise<void>((resolve) => { proceed = resolve; });
+    const restarted = service({ employeeExecutor: async (input) => {
+      entered();
+      await continuation;
+      return fixtureResult(input);
+    } });
+    const { run: { id } } = await create(restarted, { employee: "doc-writer" });
+    const crashedOwner = "fixture-crashed-after-fsync";
+    await store.claimRun(scopeA, id, crashedOwner, false);
+    const task: PmTaskPlan = { id: "document", presetKey: "doc-writer", goal: "交付可核验的中断恢复文档",
+      dependsOn: [], acceptance: ["正文可复查"], outputRefs: ["result.md"] };
+    await store.savePlan(scopeA, id, crashedOwner, [task],
+      { modelId: "fixture-deepseek", promptTokens: 0, completionTokens: 0, source: "explicit-employee" });
+    await store.claimTask(scopeA, id, task.id, crashedOwner);
+    const result = fixtureResult({ task, dependencyArtifacts: [] } as unknown as EmployeeExecutionInput);
+    const [orphan] = await artifactStore.persist(scopeA, id, task.id, result.files);
+    expect((await store.detail(scopeA, id)).artifacts).toEqual([]);
+    // Simulate loss of the first process precisely after disk fsync and before completeTask.
+    await owner.query("UPDATE pm_runs SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [id]);
+    expect((await restarted.detail(scopeA, id)).run.status).toBe("paused");
+
+    await restarted.start(scopeA, id, true);
+    try {
+      await active;
+      await expect(store.completeTask(scopeA, id, task.id, crashedOwner, result, [orphan!], [], "documents.write"))
+        .rejects.toMatchObject({ code: "RUN_LEASE_LOST" });
+    } finally { proceed(); }
+    const finished = await restarted.waitForRun(scopeA, id);
+    expect(finished.run.status, finished.run.errorCode ?? undefined).toBe("completed");
+    expect(finished.artifacts).toHaveLength(1);
+    const receipt = finished.artifacts[0]!;
+    expect(receipt.path).toBe(orphan!.path);
+    expect(receipt.id).not.toBe(orphan!.id);
+    expect(receipt.sha256).toBe(orphan!.sha256);
+    // The first owner can delete only its unregistered object even with identical content.
+    expect(await artifactStore.discardUncommitted(scopeA, id, [orphan!])).toBe(1);
+    await expect(artifactStore.read(scopeA, id, orphan!)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await artifactStore.read(scopeA, id, receipt)).toBe(result.files[0]!.content);
+  });
+
+  it("retains a committed artifact when the database completion acknowledgement is lost", async () => {
+    const recoveryStore = new PgPmStore(app);
+    const actualComplete = recoveryStore.completeTask.bind(recoveryStore);
+    const complete = vi.spyOn(recoveryStore, "completeTask").mockImplementationOnce(async (...args) => {
+      await actualComplete(...args);
+      throw new Error("fixture acknowledgement lost after COMMIT");
+    });
+    const worker = vi.fn(async (input: EmployeeExecutionInput) => fixtureResult(input));
+    const current = service({ store: recoveryStore, employeeExecutor: worker });
+    const { run: { id } } = await create(current, { employee: "doc-writer", goal: "回读已提交的产物回执" });
+    await current.start(scopeA, id);
+    const stopped = await current.waitForRun(scopeA, id);
+    expect(stopped.run.status).toBe("failed");
+    expect(stopped.tasks[0]!.status).toBe("completed");
+    expect(stopped.artifacts).toHaveLength(1);
+    const committed = stopped.artifacts[0]!;
+    expect(committed.id).toBe(complete.mock.calls[0]![5][0]!.id);
+    expect(await artifactStore.read(scopeA, id, committed)).toContain("回读已提交的产物回执");
+    await current.start(scopeA, id, true);
+    const recovered = await current.waitForRun(scopeA, id);
+    expect(recovered.run.status).toBe("completed");
+    expect(recovered.artifacts).toEqual([committed]);
+    expect(worker).toHaveBeenCalledTimes(1);
   });
 
   it("server-owned catalog provenance survives worker forgery, mutation, paid failure and a later asset version on resume", async () => {
@@ -825,6 +930,77 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
     expect((await store.detail(scopeA, id)).run.goal).toBe(initial.run.goal);
   });
 
+  it("blocks an interrupted run with a pending public search until its durable receipt is settled", async () => {
+    const query = "synthetic public search";
+    const querySha256 = createHash("sha256").update(query).digest("hex");
+    const providerFactory = vi.fn(() => { throw new Error("fixture provider reached after recovery checks"); });
+    const current = service({ providerFactory });
+    const input = { goal: "核对搜索请求在进程中断后的恢复状态", searchQuery: query };
+    const admit = () => store.receiveEvent(scopeA, {
+      kind: "request", eventId: randomUUID(), threadId: randomUUID(), input, start: false,
+    }, "MEM-PM-FIXTURE", { modelId: "fixture-deepseek", policyVersion: "fixture" });
+    const pending = await admit();
+    const unstarted = await admit();
+    for (const { runId } of [pending, unstarted]) await store.claimRun(scopeA, runId, "interrupted-search-worker", false);
+    await scoped(scopeA, (client) => client.query(
+      "INSERT INTO pm_superagent_search(run_id,tenant_id,workspace_id,query_sha256) VALUES($1,$2,$3,$4)",
+      [pending.runId, scopeA.tenantId, scopeA.workspaceId, querySha256],
+    ));
+    await owner.query("UPDATE pm_runs SET lease_expires_at=now()-interval '1 second' WHERE id=ANY($1::text[])", [[pending.runId, unstarted.runId]]);
+
+    const paused = await current.detail(scopeA, pending.runId);
+    expect(paused.run).toMatchObject({ status: "paused", errorCode: "INTERRUPTED" });
+    await expect(current.resumeBlock(scopeA, paused)).resolves.toBe("SEARCH_RECEIPT_UNSETTLED");
+    await expect(current.start(scopeA, pending.runId, true)).rejects.toMatchObject({ code: "SEARCH_RECEIPT_UNSETTLED", httpStatus: 409 });
+    expect(providerFactory).not.toHaveBeenCalled();
+    expect((await store.detail(scopeA, pending.runId)).run.status).toBe("paused");
+    await expect(current.searchEvidence(scopeA, pending.runId)).rejects.toMatchObject({ code: "SEARCH_EVIDENCE_NOT_FOUND" });
+
+    const untouched = await current.detail(scopeA, unstarted.runId);
+    expect(untouched.run).toMatchObject({ status: "paused", errorCode: "INTERRUPTED" });
+    await expect(current.resumeBlock(scopeA, untouched)).resolves.toBeNull();
+    await expect(current.resumeBlock(scopeB, paused)).resolves.toBeNull();
+    await expect(current.start(scopeA, unstarted.runId, true)).rejects.toThrow("fixture provider reached after recovery checks");
+
+    const evidence = { provider: "deepseek", querySha256, search: { resultCount: 1 },
+      fetch: { url: "https://example.com/fixture", title: "公开夹具来源", contentSha256: "a".repeat(64), excerpt: "公开夹具正文" } };
+    await scoped(scopeA, (client) => client.query(
+      "UPDATE pm_superagent_search SET completed_at=now(),evidence=$4::jsonb WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3",
+      [pending.runId, scopeA.tenantId, scopeA.workspaceId, JSON.stringify(evidence)],
+    ));
+    await expect(current.resumeBlock(scopeA, paused)).resolves.toBeNull();
+    await expect(current.searchEvidence(scopeA, pending.runId)).resolves.toEqual(evidence);
+    await expect(current.start(scopeA, pending.runId, true)).rejects.toThrow("fixture provider reached after recovery checks");
+    expect(providerFactory).toHaveBeenCalledTimes(2);
+  });
+
+  it("forwards the dispatch signal and avoids a durable marker after an upstream hook aborts", async () => {
+    const request = vi.fn(async () => Response.json({ unexpected: true }));
+    const physical = new OpenAiCompatibleProvider("fixture-deepseek", { baseUrl: "https://synthetic.invalid", fetch: request });
+    const controller = new AbortController();
+    let callbackSignal: AbortSignal | undefined;
+    const current = service({ providerFactory: () => physical, employeeExecutor: undefined,
+      employeeReview: (wrapped) => async (input) => {
+        await wrapped.complete([{ role: "user", content: "fixture cancellation before dispatch" }], {
+          signal: controller.signal,
+          beforeDispatch: async (_receipt, signal) => {
+            callbackSignal = signal;
+            controller.abort(new Error("fixture cancelled before ledger admission"));
+            await Promise.resolve();
+          },
+        });
+        return fixtureResult(input);
+      },
+    });
+    const initial = await create(current, { employee: "doc-writer" });
+    await current.start(scopeA, initial.run.id);
+    const failed = await current.waitForRun(scopeA, initial.run.id);
+    expect(callbackSignal?.aborted).toBe(true);
+    expect(request).not.toHaveBeenCalled();
+    expect(failed.run.errorCode).not.toBe("MODEL_USAGE_RECONCILIATION_REQUIRED");
+    expect(failed.tasks[0]!.attemptReceipts.filter((entry) => entry.kind === "model-attempt")).toEqual([]);
+  });
+
   it("tampered completed artifact forbids resume, rather than falsely skipping work", async () => {
     const initial = await create(service()); const id = initial.run.id;
     await store.claimRun(scopeA, id, "crashed", false);
@@ -834,7 +1010,7 @@ run("MC-PM-002 isolated PostgreSQL + real artifact state machine (model fixtures
     const [artifact] = await artifactStore.persist(scopeA, id, "requirements", first.files);
     await store.completeTask(scopeA, id, "requirements", "crashed", first, [artifact!], [], "requirements.write");
     await owner.query("UPDATE pm_runs SET lease_expires_at=now()-interval '1 second' WHERE id=$1", [id]);
-    await writeFile(await artifactStore.resolveFile(scopeA, id, artifact!.path), "tampered bytes");
+    await writeFile(await artifactStore.resolveArtifactFile(scopeA, id, artifact!), "tampered bytes");
     const current = service();
     expect((await current.detail(scopeA, id)).run.status).toBe("paused");
     await expect(current.start(scopeA, id, true)).rejects.toMatchObject({ code: "ARTIFACT_HASH_MISMATCH" });

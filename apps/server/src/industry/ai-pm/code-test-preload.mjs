@@ -4,7 +4,39 @@ import assert from "node:assert";
 import strict from "node:assert/strict";
 import test from "node:test";
 import buffer from "node:buffer";
-import Module, { builtinModules, syncBuiltinESMExports } from "node:module";
+import Module, { builtinModules, registerHooks, syncBuiltinESMExports } from "node:module";
+import { AsyncResource, AsyncLocalStorage } from "node:async_hooks";
+
+// The entrypoint keeps this reference before importing any project code. A
+// project must not start another runner with a setup hook that receives a stream.
+const runTests = test.run;
+let started = false;
+export function run(options) {
+  if (started) throw new Error("PM_TEST_RUNNER_LOCKED");
+  started = true;
+  return runTests(options);
+}
+Object.defineProperty(test, "run", {
+  value() { throw new Error("PM_TEST_RUNNER_LOCKED"); },
+  writable: false, configurable: false,
+});
+// Node does not synchronize named ESM exports of node:-only builtins through
+// syncBuiltinESMExports(). Route project imports to the locked test API too.
+const testApi = `import nodeProcess from "node:process";
+const api = nodeProcess.getBuiltinModule("node:test");
+export default api;
+${Object.keys(test).map((name) => `export const ${name} = api.${name};`).join("\n")}`;
+const testApiUrl = `data:text/javascript,${encodeURIComponent(testApi)}`;
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier === "node:test" && context.conditions.includes("import")) {
+      return { url: testApiUrl, shortCircuit: true };
+    }
+    return nextResolve(specifier, context);
+  },
+});
+Object.freeze(AsyncResource.prototype);
+Object.freeze(AsyncLocalStorage.prototype);
 
 const seen = new WeakSet();
 function freezeGraph(value) {

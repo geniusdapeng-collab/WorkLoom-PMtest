@@ -10,7 +10,7 @@ import { createSandboxCodeVerifier } from "./code-verifier.js";
 import { createPmEmployeeCatalog, type PmEmployeeCatalog } from "./employees.js";
 import { oneShotResponseReceipt, parseOneShotEmployeeResponse, type OneShotResponseReceipt } from "./one-shot-response.js";
 import { judgePmPublicSearch, judgeSandboxArtifact, judgeSandboxAssignment, PM_SANDBOX_POLICY_VERSION } from "./policy.js";
-import { collectPmSearchEvidence, readPmSearchEvidence, type SearchReceipt } from "./search-context.js";
+import { collectPmSearchEvidence, readPmSearchEvidence, readPmSearchReservation, type SearchReceipt } from "./search-context.js";
 import { reconcilePmTeamPlan, type PmOwnerCorrection } from "./planning.js";
 import { PgPmStore, requiresPmUsageReconciliation, type FailureMetering, type PlanningReceipt, type PmStore } from "./store.js";
 import { snapshotPmAssetBinding, withPmAssetBinding } from "./asset-binding.js";
@@ -284,8 +284,8 @@ export class PmTeamService {
     return receipt;
   }
 
-  listThreadEvents(scope: PmScope, threadId: string, limit: number) {
-    return this.store.listThreadEvents(scope, threadId, limit);
+  listThreadEvents(scope: PmScope, threadId: string, limit: number, runId?: string) {
+    return this.store.listThreadEvents(scope, threadId, limit, runId);
   }
 
   getThreadEvent(scope: PmScope, threadId: string, eventId: string) {
@@ -314,6 +314,18 @@ export class PmTeamService {
     return evidence;
   }
 
+  async resumeBlock(scope: PmScope, detail: PmRunDetail) {
+    if (!["paused", "failed", "blocked"].includes(detail.run.status)) return null;
+    if (requiresPmUsageReconciliation(detail)) return "MODEL_USAGE_RECONCILIATION_REQUIRED";
+    const searchErrorRecorded = detail.run.errorCode === "SEARCH_RECEIPT_UNSETTLED";
+    // Public search comes from the request event. A crash can leave a durable
+    // reservation even when lease recovery records only a generic interruption.
+    if (!detail.run.threadId && !searchErrorRecorded) return null;
+    const reservation = await readPmSearchReservation(scope, detail.run.id);
+    if (reservation) return reservation.evidence ? null : "SEARCH_RECEIPT_UNSETTLED";
+    return searchErrorRecorded ? "SEARCH_RECEIPT_UNSETTLED" : null;
+  }
+
   async artifact(scope: PmScope, id: string, path: string) {
     const detail = await this.detail(scope, id);
     const artifact = detail.artifacts.find((item) => item.path === path);
@@ -328,7 +340,10 @@ export class PmTeamService {
     if (!resume && (current.run.status === "running" || current.run.status === "planning" || current.run.status === "completed")) return current;
     if (resume) {
       if (!["paused", "failed", "blocked"].includes(current.run.status)) throw new PmError("RUN_STATE_CONFLICT", "只有暂停、失败或阻断的任务可以显式恢复", 409);
-      if (requiresPmUsageReconciliation(current)) throw new PmError("MODEL_USAGE_RECONCILIATION_REQUIRED", "上次模型请求尚未完成用量对账，禁止盲目重试或显式恢复", 409);
+      const block = await this.resumeBlock(scope, current);
+      if (block) throw new PmError(block, block === "MODEL_USAGE_RECONCILIATION_REQUIRED"
+        ? "上次模型请求尚未完成用量对账，禁止盲目重试或显式恢复"
+        : "上次公开检索尚无已核验回执，已阻止重复调用", 409);
       await this.verifyCompleted(scope, current);
     } else if (current.run.status !== "created") throw new PmError("RUN_STATE_CONFLICT", "该任务需要显式恢复或已经取消", 409);
     let provider = this.providerFactory();
@@ -490,8 +505,9 @@ export class PmTeamService {
       let observed: CompletionResult | undefined;
       const taskId = currentTask;
       try {
-        const response = await physicalProvider.complete(messages, { ...options, beforeDispatch: async (receipt) => {
-          if (options.beforeDispatch) await options.beforeDispatch(receipt);
+        const response = await physicalProvider.complete(messages, { ...options, beforeDispatch: async (receipt, signal) => {
+          if (options.beforeDispatch) await options.beforeDispatch(receipt, signal);
+          signal.throwIfAborted();
           // The same transaction verifies the active lease and records a physical attempt.
           await this.store.recordModelAttempt(scope, id, owner, taskId, receipt);
           dispatched = receipt;

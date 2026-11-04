@@ -18,13 +18,17 @@ export interface ConversationTool {
   execute(args: Record<string, unknown>, context: { signal: AbortSignal }): Promise<unknown>;
 }
 
+type DeepSeekToolRequest = { operation: "search" | "fetch"; body: Record<string, unknown>; signal: AbortSignal };
+
 export interface DeepSeekToolsConfig {
   apiKey?: string;
   timeoutMs?: number;
   fetch?: typeof fetch;
   /** 仅供受控测试/网络环境；生产默认检查全部 DNS 地址。 */
   resolveHost?: (hostname: string) => Promise<string[]>;
-  beforeRequest?: (request: { operation: "search" | "fetch"; body: Record<string, unknown>; signal: AbortSignal }) => void | Promise<void>;
+  beforeRequest?: (request: DeepSeekToolRequest) => void | Promise<void>;
+  /** Final durable marker. Bound its I/O and await any pending write before returning. */
+  beforeDispatch?: (request: DeepSeekToolRequest) => void | Promise<void>;
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -109,7 +113,12 @@ export function createDeepSeekTools(cfg: DeepSeekToolsConfig = {}): Conversation
     try {
       const masked = maskDeep(body).value;
       deadline.signal.throwIfAborted();
-      if (cfg.beforeRequest) await abortable(Promise.resolve(cfg.beforeRequest({ operation, body: masked, signal: deadline.signal })), deadline.signal);
+      const request = { operation, body: masked, signal: deadline.signal };
+      if (cfg.beforeRequest) await abortable(Promise.resolve(cfg.beforeRequest(request)), deadline.signal);
+      deadline.signal.throwIfAborted();
+      // Cancellation cannot detach an in-flight durable reservation from its owner.
+      if (cfg.beforeDispatch) await cfg.beforeDispatch(request);
+      deadline.signal.throwIfAborted();
       let response: Response;
       try {
         response = await abortable((cfg.fetch ?? fetch)(`https://api.deepseek.com/v1/tools/${operation}`, {

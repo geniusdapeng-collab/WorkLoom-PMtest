@@ -1,7 +1,8 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createDeepSeekTools, type DeepSeekToolsConfig } from "@workloom/base/model-router";
 import { getAppPool, withWorkspace } from "@workloom/db";
 import { assertNoSecrets } from "./contract.js";
+import { lockActivePmRunLease } from "./store.js";
 import { PmError, type PmScope } from "./types.js";
 
 export interface SearchReceipt {
@@ -45,23 +46,23 @@ async function liveSearch(query: string, signal: AbortSignal, config: DeepSeekTo
   return receipt;
 }
 
-async function requireLease(scope: PmScope, runId: string, owner: string): Promise<void> {
-  const active = await withWorkspace(getAppPool(), scope, async (_db, client) => client.query(
-    `SELECT id FROM pm_runs WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND lease_owner=$4
-      AND status IN ('planning','running') AND lease_expires_at > now()`,
-    [runId, scope.tenantId, scope.workspaceId, owner],
-  ));
-  if (active.rowCount !== 1) throw new PmError("RUN_LEASE_LOST", "搜索前执行租约已失效", 409);
+class SettledPmSearch extends Error {
+  constructor(readonly evidence: SearchReceipt) { super("已有同一检索的持久化回执"); }
+}
+
+export async function readPmSearchReservation(scope: PmScope, runId: string): Promise<{ evidence: SearchReceipt | null } | null> {
+  return withWorkspace(getAppPool(), scope, async (_db, client) => {
+    const result = await client.query<{ evidence: SearchReceipt | null }>(
+      `SELECT evidence FROM pm_superagent_search
+       WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3 AND blocked_before_send_at IS NULL`,
+      [runId, scope.tenantId, scope.workspaceId],
+    );
+    return result.rows[0] ?? null;
+  });
 }
 
 export async function readPmSearchEvidence(scope: PmScope, runId: string): Promise<SearchReceipt | null> {
-  return withWorkspace(getAppPool(), scope, async (_db, client) => {
-    const result = await client.query<{ evidence: SearchReceipt | null }>(
-      "SELECT evidence FROM pm_superagent_search WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3",
-      [runId, scope.tenantId, scope.workspaceId],
-    );
-    return result.rows[0]?.evidence ?? null;
-  });
+  return (await readPmSearchReservation(scope, runId))?.evidence ?? null;
 }
 
 function searchTransport(): Pick<DeepSeekToolsConfig, "apiKey" | "fetch"> {
@@ -95,50 +96,78 @@ export async function collectPmSearchEvidence(scope: PmScope, runId: string, own
   const transport = searchTransport();
   await authorize();
   const querySha256 = digest(query);
+  const attemptId = randomUUID();
   const keys = [runId, scope.tenantId, scope.workspaceId] as const;
-  const reservation = await withWorkspace(getAppPool(), scope, async (_db, client) => {
-    const run = await client.query(
-      `SELECT id FROM pm_runs WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND lease_owner=$4
-        AND status IN ('planning','running') AND lease_expires_at > now() FOR UPDATE`,
-      [...keys, owner],
-    );
-    if (run.rowCount !== 1) throw new PmError("RUN_LEASE_LOST", "搜索前执行租约已失效", 409);
-    const inserted = await client.query(
-      `INSERT INTO pm_superagent_search(run_id, tenant_id, workspace_id, query_sha256) VALUES ($1,$2,$3,$4)
-       ON CONFLICT DO NOTHING RETURNING run_id`,
-      [...keys, querySha256],
-    );
-    if (inserted.rowCount === 1) return { created: true as const };
-    const saved = await client.query<{ query_sha256: string; evidence: SearchReceipt | null }>(
-      "SELECT query_sha256, evidence FROM pm_superagent_search WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3",
-      [...keys],
-    );
-    return { created: false as const, prior: saved.rows[0] };
-  });
-  if (!reservation.created) {
-    if (reservation.prior?.query_sha256 === querySha256 && reservation.prior.evidence) return reservation.prior.evidence;
-    throw new PmError("SEARCH_RECEIPT_UNSETTLED", "此前搜索尚无已核验回执，已冻结重复调用", 409);
-  }
+  let reservationCommitted = false;
+  let transportStarted = false;
+  let toolSignal: AbortSignal | undefined;
   let receipt: SearchReceipt;
   try {
     receipt = await liveSearch(query, signal, {
       ...transport, timeoutMs: 60_000,
-      beforeRequest: async () => {
-        signal.throwIfAborted();
-        await authorize();
-        await requireLease(scope, runId, owner);
+      beforeRequest: ({ signal: requestSignal }) => { toolSignal = requestSignal; return authorize(); },
+      fetch: (url, init) => {
+        transportStarted = true;
+        return (transport.fetch ?? fetch)(url, init);
+      },
+      beforeDispatch: async ({ operation, signal: requestSignal }) => {
+        await withWorkspace(getAppPool(), scope, async (_db, client) => {
+          if (!await lockActivePmRunLease(client, scope, runId, owner)) throw new PmError("RUN_LEASE_LOST", "搜索前执行租约已失效", 409);
+          requestSignal.throwIfAborted();
+          if (operation !== "search") return;
+          // Admission belongs to the last pre-dispatch boundary. A denied
+          // authorization or expired lease must not create a billable ambiguity.
+          const inserted = await client.query(
+            `INSERT INTO pm_superagent_search(run_id, tenant_id, workspace_id, query_sha256, attempt_id) VALUES ($1,$2,$3,$4,$5)
+             ON CONFLICT DO NOTHING RETURNING run_id`,
+            [...keys, querySha256, attemptId],
+          );
+          requestSignal.throwIfAborted();
+          if (inserted.rowCount === 1) return;
+          const { rows: [prior] } = await client.query<{ query_sha256: string; evidence: SearchReceipt | null }>(
+            `SELECT query_sha256, evidence FROM pm_superagent_search
+             WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3 AND blocked_before_send_at IS NULL`, [...keys],
+          );
+          if (prior?.query_sha256 === querySha256 && prior.evidence) throw new SettledPmSearch(prior.evidence);
+          throw new PmError("SEARCH_RECEIPT_UNSETTLED", "此前搜索尚无已核验回执，已冻结重复调用", 409);
+        });
+        if (operation === "search") reservationCommitted = true;
       },
     });
   } catch (error) {
+    // Only an acknowledged reservation from this invocation can be closed as
+    // no-send. An uncertain commit or any entered transport remains pending.
+    if (reservationCommitted && !transportStarted) {
+      try {
+        await withWorkspace(getAppPool(), scope, async (_db, client) => {
+          const closed = await client.query(
+            `UPDATE pm_superagent_search SET blocked_before_send_at=clock_timestamp()
+             WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3 AND query_sha256=$4 AND attempt_id=$5
+               AND completed_at IS NULL AND blocked_before_send_at IS NULL`, [...keys, querySha256, attemptId]);
+          if (closed.rowCount !== 1) throw new Error("Missing original pending search reservation");
+        });
+      } catch {
+        throw new PmError("SEARCH_RECEIPT_UNSETTLED", "搜索未发送，但本次预留未能可靠结算，已阻止重复调用", 503);
+      }
+      signal.throwIfAborted();
+      throw new PmError("INTERRUPTED", "搜索在发送前中止，已结算未发送记录，可显式恢复", 504);
+    }
     signal.throwIfAborted();
+    // A deadline raised by the connector before COMMIT/transport is distinct
+    // from a database exception whose COMMIT outcome may be unknown.
+    if (!transportStarted && toolSignal?.aborted && error === toolSignal.reason) {
+      throw new PmError("INTERRUPTED", "搜索在发送前中止，可显式恢复", 504);
+    }
+    if (error instanceof SettledPmSearch) return error.evidence;
     if (error instanceof PmError) throw error;
     throw new PmError("SEARCH_RECEIPT_UNSETTLED", "DeepSeek 搜索或抓取未取得完整回执，已保留执行记录", 502);
   }
   await withWorkspace(getAppPool(), scope, async (_db, client) => {
     const result = await client.query(
       `UPDATE pm_superagent_search SET evidence=$4::jsonb,completed_at=now()
-       WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3 AND completed_at IS NULL`,
-      [...keys, JSON.stringify(receipt)],
+       WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3 AND query_sha256=$5 AND attempt_id=$6
+         AND completed_at IS NULL AND blocked_before_send_at IS NULL`,
+      [...keys, JSON.stringify(receipt), querySha256, attemptId],
     );
     if (result.rowCount !== 1) throw new PmError("SEARCH_RECEIPT_UNSETTLED", "DeepSeek 搜索回执未能可靠落库", 503);
   });

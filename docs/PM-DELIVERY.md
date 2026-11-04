@@ -93,24 +93,24 @@ flowchart TD
 
 运行状态为 created/planning/running/paused/blocked/failed/completed/cancelled。任务只有 CAS 认领成功才执行；并发开始不会生成第二个 worker。租约过期仅转 paused，恢复需显式触发并重新验证既有完成文件，不静默重发收费请求。代码员工先通过服务端沙箱测试才发布并解锁下游；失败时保留实际观测和用量，恢复只重派未完成的责任节点。下游可引用服务端对具体文件摘要的验证记录。取消与完成加锁串行，取消后的迟到已计费响应只保留计量，不发布产物。[A+B]
 
-文件系统与数据库不共享事务。员工产物先以 no-clobber 文件写入并核验摘要，再由 `completeTask` 提交数据库回执；若后者失败，服务端会重新读取 `pm_artifacts`，仅在数据库确认这些产物未登记且文件哈希仍匹配时清理本次未提交文件。数据库不可回读、产物已登记或文件被替换时一律保留，等待人工对账，避免删除证据，也避免恢复被永久 `EEXIST` 卡死。[A+B]
+文件系统与数据库不共享事务。服务端把新产物写入运行目录下的 `artifact-objects/pma-v2-…`，核对摘要后由 `completeTask` 登记回执。数据库仍按运行和逻辑路径唯一登记，旧回执继续从 `artifacts/<逻辑路径>` 回读。进程在文件同步后、登记前中断时，遗留文件不会占用下一次尝试。若提交失败，服务端先回读 `pm_artifacts`，仅清理已证实未登记且哈希仍匹配的本次 ID。数据库无法回读、回执已登记、字节被替换或归属无法核对时保留文件等待对账。旧版程序无法读取已登记的 v2 对象，保留这些新产物的回滚版本须包含 v2 读取逻辑。[A+B]
 
 已知失败用量按 attempt 去重保留，恢复后累计。缺少 usage 的调用不能被伪造为零。物理 API 费用仍以供应商回执和评测代理账本为权威，应用聚合不是供应商账单。[A+B]
 
 ## HTTP 合同
 
-所有接口均要求当前工作区有效成员；guest、partner、readonly 被拒。写操作还要求 task.dispatch、workspace.write 与 quest 套餐能力。不会因旧 JWT 声称 owner 就跳过实时权限复核。[A+B]
+所有接口均要求当前工作区的有效成员、已验证活动 Bundle 的开发场域授权以及 `tasks.read`。游客、伙伴和只读角色会被拒绝。写操作还要求 `task.dispatch`、`workspace.write` 与 `quest` 套餐能力。每次请求都重新校验当前权限。[A+B]
 
 装配 HTTP 路由本身不会创建数据库池或 worker。服务在实际请求通过成员中间件后才按需创建，并在同一路由实例中复用；未配置数据库也能加载通用认证入口并拒绝匿名 PM 请求。[A+B]
 
 | 方法与路径 | 参数 / 返回 |
 |---|---|
-| `GET /api/pm/status` | 配置、实际后端、模型、已就绪员工、检查范围和明确边界 |
+| `GET /api/pm/status` | 配置、实际后端、模型、已就绪员工、检查范围、明确边界和 `canDispatch` |
 | `GET /api/pm/runs?limit=20` | 当前 scope 的运行列表 |
 | `POST /api/pm/runs` | `{goal,idempotencyKey,employee?,checks?}`；首次201，完全相同幂等200，冲突409；仅创建 |
-| `GET /api/pm/runs/:id` | run、tasks、artifacts，以及用量、依赖和各次回执 |
+| `GET /api/pm/runs/:id` | run、tasks、artifacts、用量、依赖、各次回执及 `resumeBlock` |
 | `POST /api/pm/runs/:id/start` | 空对象；202，后台执行 |
-| `POST /api/pm/runs/:id/resume` | 空对象；只允许paused/failed/blocked，先验证已完成产物 |
+| `POST /api/pm/runs/:id/resume` | 空对象。可申请恢复的状态为 paused、failed、blocked。用量待对账或已预留检索仍待回执时返回 409，进程中断后仍生效。其余请求先验证已完成产物 |
 | `POST /api/pm/runs/:id/cancel` | 空对象；持久化取消，后续禁止发布新文件 |
 | `GET /api/pm/runs/:id/artifacts?path=...` | 服务端核验摘要后返回内容、SHA256、大小与任务归属 |
 
@@ -132,9 +132,9 @@ goal 上限32000字符、请求体256KiB、八任务、单员工十二文件、�
 
 生成代码在 macOS Seatbelt 的 deny-default OS profile 下执行，叠加 Node24 权限、清环境、无网络、宿主文件隔离、超时、内存与输出限额。当前支持零依赖 JavaScript；其它代码语言没有对应 OS 验证器时失败关闭，不以文件存在替代运行。macOS `sandbox-exec` 已被系统标为 deprecated；这是本轮本机验收后端，跨平台生产部署需要经过独立验证的容器或 OS 后端。[A+B]
 
-固定 supervisor 不导入项目代码；Node 测试在受限子进程运行。普通 stdout 是不可信日志，不能靠打印 TAP“通过”伪造检查。监督进程消费真正测试事件并以一次性随机回执返回结构化计数，未运行测试、skip-only、取消、超时、输出洪泛或失败均不通过。[A+B]
+服务端为每个测试文件分别启动受限 Node 进程，共用总时限和输出上限。各进程的固定入口消费本进程内的真实测试事件，以一次性随机凭据返回结构化计数。标准输出只承载日志与经核验的回执。打印 TAP 或 Node 序列化事件无法替代实际测试。没有真实测试通过，或出现仅跳过、取消、超时、输出超限和断言失败时，交付检查不通过。[A+B]
 
-可信 child preload 在项目导入前锁定断言库、测试断言注册、相关语言对象及内置模块加载出口；真实负向用例覆盖 ESM/CJS 断言替换、反射修改、`Module._load`、builtin cache 和加载 hook。修复前确实出现过错误代码假通过，原回执保留；修复后对应实际断言失败。这是所测攻击向量的回归，不是对任意恶意 JavaScript 的形式化隔离证明，支持范围仍限于已声明的 Node 后端。[A+B/D]
+可信 preload 在项目导入前锁定断言库、测试断言注册、相关语言对象及内置模块加载出口。首个测试钩子锁定断言上下文的原型。回归覆盖 ESM/CJS 断言替换、反射修改、`Module._load`、内置模块缓存、加载钩子、伪造测试事件和篡改断言上下文。候选模块和断言会在同一个受限 JavaScript 进程内运行，所测场景的独立断言结果可用作该任务的验收证据。[A+B]
 
 模型生成的测试仍可能遗漏业务要求，因此回执标为 generated。复杂项目另用事先编写、未交给模型改写的 trusted-evaluator 断言验证接口、边界、状态不变性和长目标尾部要求。这个有限任务集的成功不能外推为任意软件均能自主交付。[A+B/D]
 
@@ -157,9 +157,9 @@ DeepSeek 文本入口使用固定的官方 V4.1 请求模板、BPE 词表和协�
 
 PMtest 保留 PM 的岗位、沙箱和交付回执。事件路由参考 DeepSeek Harness 团队的 [Super-agent 设计](https://mp.weixin.qq.com/s/zoS7GlReWPhfCjENGxXCdg) 与 [公开原型](https://github.com/deepseek-ai/dsh-superagent-prototype/tree/8c32a9dc5d72c033816c6a8110b37f40cf94fba4)，按 WorkLoom 的现有租户权限和事务实现。
 
-- `POST /api/pm/events` 接受 `{kind:"request",eventId,threadId,input:{goal,employee?,checks?,searchQuery?},start?}`。默认接单后自动启动。需要先录入补充时，设 `start:false` 并沿用任务的 `/start` 接口。相同事件可重放，同 ID 换正文或发起人返回 409。
-- `{kind:"followup",eventId,threadId,text}` 直达同一活动任务。单轮最多三条，最后一个执行器被认领后返回 409，请在该轮结束后用同一线程 ID 开启下一轮。接单与补充回执均记录到 WorkData。
-- `GET /api/pm/threads/:id/events` 提供有界摘要，`GET /api/pm/threads/:id/events/:eventId` 按需读取原文。每条摘要最多 512 个 UTF-8 字节。研发执行器可通过既有 `read_file` 读取本任务长补充的只读副本。普通文档员工使用摘要。
+- `POST /api/pm/events` 接受 `{kind:"request",eventId,threadId,input:{goal,employee?,checks?,searchQuery?},start?}`。默认接单后自动启动。需要先录入补充时，设 `start:false` 并沿用任务的 `/start` 接口。相同事件可重放，同 ID 换正文或发起人返回 409。页面在同一浏览会话内刷新后重试相同输入，会复用尚未确认的提交编号。
+- 新补充使用 `{kind:"followup",eventId,threadId,runId,text}` 并绑定当前活动任务。活动任务已更换或最后一个执行器已认领时返回 409。单轮最多三条，结束后可用同一线程 ID 开启下一轮。接单与补充回执均记录到 WorkData。
+- `GET /api/pm/threads/:id/events?runId=…` 提供指定任务的有界摘要。省略 `runId` 时读取线程中的最近事件。使用 `GET /api/pm/threads/:id/events/:eventId` 按需读取原文。每条摘要最多 512 个 UTF-8 字节。研发执行器可通过既有 `read_file` 读取本任务长补充的只读副本。普通文档员工使用摘要。
 - `searchQuery` 只适合公开检索词，最多 128 个字符。服务器单独调用 DeepSeek Search 和 Fetch，持久保存来源、摘录与摘要。通过 `GET /api/pm/runs/:id/search-evidence` 查看核验结果。PM 的模型凭据和地址可分别通过 `PM_MODEL_API_KEY`、`PM_MODEL_BASE_URL` 注入。与本机预算代理连用时，显式设置 `PM_SEARCH_USE_LOOPBACK=1`，搜索和推理共用同一个本机预算边界。云端推理不持有本机执行器权限。
 - Watchdog 是独立进程，以明确配置的单个租户和工作区运行。它通过既有账本事务回收过期租约。有未结算的模型调用时保留阻断状态，否则转为暂停，已核验产物继续保留。恢复由成员触发。轮询失败记错误并继续后续扫描。
 
@@ -168,4 +168,4 @@ export PM_WATCHDOG_TENANT=demo PM_WATCHDOG_WORKSPACE=ws-aipm-demo
 pnpm -C apps/server exec tsx --env-file=../../.env src/industry/ai-pm/watchdog.ts
 ```
 
-添加 `--once` 可运行一次并读取已处理的租约数量。默认间隔 15 秒，可用 `PM_WATCHDOG_INTERVAL_MS` 配置。搜索结果未知时冻结原尝试，避免自动发起第二次收费请求；查询结果仍可对账，或由成员在原任务结束后发起下一轮。外部渠道接入和多项目调度另有独立授权与交付范围。
+添加 `--once` 可运行一次并读取已处理的租约数量。默认间隔 15 秒，可用 `PM_WATCHDOG_INTERVAL_MS` 配置。检索可能已发送且结果未知时冻结原尝试。只有收到预留事务的确认，并确定尚未开始外部请求，才将本次预留登记为未发送，允许成员显式恢复。旧的待核验预留继续阻止重复调用，已核验回执可复用。外部渠道接入和多项目调度另有独立授权与交付范围。
