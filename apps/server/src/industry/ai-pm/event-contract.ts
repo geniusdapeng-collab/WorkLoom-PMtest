@@ -14,7 +14,9 @@ const RequestInput = z.object({
 
 export const PmThreadEventSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("request"), eventId: PmEventId, threadId: PmEventId, input: RequestInput, start: z.boolean().optional() }).strict(),
-  z.object({ kind: z.literal("followup"), eventId: PmEventId, threadId: PmEventId, text: z.string().trim().min(1).max(8000) }).strict(),
+  // Older persisted events lack runId. The store allows that shape only for an exact replay.
+  z.object({ kind: z.literal("followup"), eventId: PmEventId, threadId: PmEventId, runId: PmEventId.optional(),
+    text: z.string().trim().min(1).max(8000) }).strict(),
 ]).superRefine((value, context) => {
   try { assertNoSecrets(value); }
   catch { context.addIssue({ code: "custom", message: "事件疑似包含秘密，不能保存或发送给模型" }); }

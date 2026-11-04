@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { createHash } from "node:crypto";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router";
@@ -39,6 +40,11 @@ async function submit(selector = "form") { await act(async () => host.querySelec
 beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   host = document.createElement("div"); document.body.append(host); history = []; calls = []; activeToken = "fixture-session";
+  sessionStorage.clear();
+  vi.stubGlobal("crypto", {
+    randomUUID: crypto.randomUUID.bind(crypto),
+    subtle: { digest: async (_algorithm: string, bytes: Uint8Array) => Uint8Array.from(createHash("sha256").update(bytes).digest()).buffer },
+  });
   handler = (path) => path.endsWith("/status") ? { status: 200, body: configuration } : path.endsWith("/runs") ? { status: 200, body: { runs: history } } : { status: 200, body: detail() };
   vi.stubGlobal("fetch", vi.fn(async (url: string, options: RequestInit = {}) => {
     calls.push({ path: url, options }); const result = await handler(url, options);
@@ -101,9 +107,41 @@ describe("产品交付页面的中文边界与原交互", () => {
     expect(host.textContent).toContain("尾号 567890"); expect(host.textContent).not.toContain("internal-run-private");
   }, 30_000);
 
+  it("提交回执丢失后重新打开页面仍使用原事件编号，收到回执后清掉暂存编号", async () => {
+    const goal = "仅用于验收的草稿原文";
+    let posts = 0;
+    handler = (path, options) => {
+      if (path.endsWith("/status")) return { status: 200, body: configuration };
+      if (path.endsWith("/runs")) return { status: 200, body: { runs: [] } };
+      if (path.endsWith("/events")) {
+        posts++;
+        if (posts === 1) return { status: 503, body: { error: "提交回执暂不可用。" } };
+        const { eventId, threadId } = JSON.parse(String(options.body));
+        return { status: 200, body: { eventId, threadId, runId: run().id, decision: "admitted", replayed: true } };
+      }
+      return { status: 200, body: detail("planning") };
+    };
+    await mount(); await input("pm-goal", goal); await submit();
+    expect(host.textContent).toContain("提交回执暂不可用");
+    expect(sessionStorage).toHaveLength(1);
+    const key = sessionStorage.key(0)!;
+    expect(key).toMatch(/pm-pending-v1:[0-9a-f]{64}$/);
+    expect(sessionStorage.getItem(key)).toMatch(/^[0-9a-f-]{36}:[0-9a-f-]{36}$/);
+    expect(key).not.toContain(activeToken);
+    expect(key).not.toContain(goal);
+    await act(async () => root!.unmount());
+    await mount(); await input("pm-goal", goal); await submit();
+    const bodies = calls.filter((call) => call.options.method === "POST").map((call) => call.options.body);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).toEqual(bodies[1]);
+    expect(sessionStorage).toHaveLength(0);
+  });
+
   it("从历史恢复任务线程，按需读取原文并将补充说明直送同一线程", async () => {
     const threadId = "thread-first";
-    const first = { eventId: "first-event", kind: "request", createdAt: run().createdAt, excerpt: "公开任务摘要", bodyTruncated: true };
+    const runId = run().id;
+    const first = { eventId: "first-event", runId, kind: "request", createdAt: run().createdAt, excerpt: "公开任务摘要", bodyTruncated: true };
+    const neighbor = { ...first, eventId: "neighbor-event", runId: "other-run", excerpt: "另一次任务的摘要" };
     const fullGoal = '<script>alert("不执行")</script>\n核验公开文档';
     let followup: Json | null = null;
     let failOnce = true;
@@ -111,7 +149,7 @@ describe("产品交付页面的中文边界与原交互", () => {
     handler = (path, options) => {
       if (path.endsWith("/status")) return { status: 200, body: configuration };
       if (path.endsWith("/runs")) return { status: 200, body: { runs: history } };
-      if (path.endsWith(`/threads/${threadId}/events?limit=20`)) return { status: 200, body: { events: followup ? [first, { eventId: followup.eventId, kind: "followup", createdAt: run().createdAt, excerpt: followup.text, bodyTruncated: false }] : [first] } };
+      if (path.endsWith(`/threads/${threadId}/events?limit=20&runId=${runId}`)) return { status: 200, body: { events: followup ? [first, neighbor, { eventId: followup.eventId, runId, kind: "followup", createdAt: run().createdAt, excerpt: followup.text, bodyTruncated: false }] : [first, neighbor] } };
       if (path.endsWith(`/threads/${threadId}/events/${first.eventId}`)) return { status: 200, body: { event: { ...first, input: { goal: fullGoal } } } };
       if (path.endsWith("/events") && options.method === "POST") {
         if (failOnce) { failOnce = false; return { status: 503, body: { error: "Internal Server Error" } }; }
@@ -122,6 +160,7 @@ describe("产品交付页面的中文边界与原交互", () => {
     };
     await mount(); await click("交付中文待办功能");
     expect(host.textContent).toContain("公开任务摘要"); expect(host.textContent).not.toContain(fullGoal);
+    expect(host.textContent).not.toContain("另一次任务的摘要");
     await click("查看完整消息");
     expect(host.textContent).toContain(fullGoal); expect(host.querySelector("script")).toBeNull();
     await click("关闭原文"); expect(host.textContent).not.toContain(fullGoal);
@@ -130,7 +169,7 @@ describe("产品交付页面的中文边界与原交互", () => {
     await submit(".pm-thread-compose"); expect(host.textContent).toContain("只补充公开来源和验证步骤");
     const bodies = calls.filter((item) => item.options.method === "POST").map((item) => JSON.parse(String(item.options.body)));
     expect(bodies).toHaveLength(2); expect(bodies[0]).toEqual(bodies[1]);
-    expect(bodies[1]).toMatchObject({ kind: "followup", threadId, text: "只补充公开来源和验证步骤" });
+    expect(bodies[1]).toMatchObject({ kind: "followup", threadId, runId, text: "只补充公开来源和验证步骤" });
     expect(host.querySelector<HTMLTextAreaElement>("#pm-followup")?.value).toBe("");
   }, 30_000);
 
@@ -141,7 +180,7 @@ describe("产品交付页面的中文边界与原交互", () => {
     handler = (path, options) => {
       if (path.endsWith("/status")) return { status: 200, body: configuration };
       if (path.endsWith("/runs")) return { status: 200, body: { runs: history } };
-      if (path.endsWith(`/threads/${threadId}/events?limit=20`)) return { status: 200, body: { events: [] } };
+      if (path.includes(`/threads/${threadId}/events?`)) return { status: 200, body: { events: [] } };
       if (path.endsWith("/events") && options.method === "POST") {
         current = "completed";
         return { status: 409, body: { error: { code: "PM_FOLLOWUP_WINDOW_CLOSED", message: "Followup is closed" } } };
@@ -155,6 +194,26 @@ describe("产品交付页面的中文边界与原交互", () => {
     expect(host.querySelector(".pm-thread-compose")).toBeNull();
     expect(host.querySelector<HTMLTextAreaElement>(".pm-thread textarea[readonly]")?.value).toBe("补充一条新的验收细节");
   }, 30_000);
+
+  it("拒绝同线程新任务替换当前目标，保留未提交草稿", async () => {
+    const threadId = "thread-reused";
+    history = [{ ...run("running"), threadId }];
+    handler = (path, options) => {
+      if (path.endsWith("/status")) return { status: 200, body: configuration };
+      if (path.endsWith("/runs")) return { status: 200, body: { runs: history } };
+      if (path.includes(`/threads/${threadId}/events?`)) return { status: 200, body: { events: [] } };
+      if (path.endsWith("/events") && options.method === "POST") {
+        expect(JSON.parse(String(options.body))).toMatchObject({ threadId, runId: run().id });
+        return { status: 409, body: { error: { code: "PM_FOLLOWUP_RUN_MISMATCH", message: "run changed" } } };
+      }
+      return { status: 200, body: { ...detail("running"), run: { ...run("running"), threadId } } };
+    };
+    await mount(); await click("交付中文待办功能");
+    await input("pm-followup", "仅属于当前任务的验收细节"); await submit(".pm-thread-compose");
+    expect(host.textContent).toContain("线程的当前任务已变化，这条补充未提交");
+    expect(host.querySelector<HTMLTextAreaElement>(".pm-thread textarea[readonly]")?.value).toBe("仅属于当前任务的验收细节");
+    expect(host.querySelector(".pm-thread-compose")).toBeNull();
+  });
 
   it("身份切换中止前一工作区读取，晚返回的目标和草稿不会出现在新会话", async () => {
     let release: (() => void) | undefined;
@@ -212,11 +271,82 @@ describe("产品交付页面的中文边界与原交互", () => {
       if (options.method === "POST") { current = path.endsWith("/start") ? "paused" : path.endsWith("/resume") ? "blocked" : "cancelled"; return { status: 200, body: {} }; }
       return { status: 200, body: detail(current) };
     };
-    await mount(); await click("交付中文待办功能"); await click("开始执行"); expect(host.textContent).toContain("已暂停，可恢复");
+    await mount(); await click("交付中文待办功能"); await click("开始执行"); expect(host.textContent).toContain("已暂停");
     await click("校验并恢复"); expect(host.textContent).toContain("遇到边界，已阻断");
     await click("取消任务"); expect(host.textContent).toContain("已取消");
     expect(calls.filter((item) => item.options.method === "POST").map((item) => item.path.split("/").at(-1))).toEqual(["start", "resume", "cancel"]);
   }, 30_000);
+
+  it.each([
+    ["MODEL_USAGE_RECONCILIATION_REQUIRED", "用量还未对账"],
+    ["SEARCH_RECEIPT_UNSETTLED", "缺少已核验回执"],
+  ])("不对 %s 提供无法执行的恢复按钮", async (resumeBlock, message) => {
+    history = [run("paused")];
+    handler = (path) => ({ status: 200, body: path.endsWith("/status") ? configuration : path.endsWith("/runs") ? { runs: history } : { ...detail("paused"), resumeBlock } });
+    await mount(); await click("交付中文待办功能");
+    expect(host.textContent).toContain(message);
+    expect(host.textContent).not.toContain("校验并恢复");
+    expect(host.textContent).not.toContain("已暂停，可恢复");
+  });
+
+  it("详情暂时断线时标明旧状态并自动恢复到实际终态", async () => {
+    vi.useFakeTimers();
+    let detailCalls = 0;
+    history = [run("running")];
+    handler = (path) => {
+      if (path.endsWith("/status")) return { status: 200, body: configuration };
+      if (path.endsWith("/runs")) return { status: 200, body: { runs: history } };
+      detailCalls += 1;
+      if (detailCalls === 2) return { status: 503, body: { error: "请稍后重试。" } };
+      return { status: 200, body: detail(detailCalls === 1 ? "running" : "completed") };
+    };
+    await mount(); await click("交付中文待办功能");
+    expect(host.querySelector(".pm-run-heading")?.textContent).toContain("团队执行中");
+    await act(async () => vi.advanceTimersByTimeAsync(2100)); await flush();
+    expect(host.textContent).toContain("以下是上次读取的状态");
+    expect(button("取消任务").disabled).toBe(true);
+    await act(async () => vi.advanceTimersByTimeAsync(2100)); await flush();
+    expect(detailCalls).toBe(3);
+    expect(host.querySelector(".pm-run-heading")?.textContent).toContain("产物已交齐");
+    expect(host.textContent).not.toContain("请稍后重试");
+  });
+
+  it("手动刷新记录和再次选择同一行都会读取已停止轮询的详情", async () => {
+    let current = "paused";
+    history = [run(current)];
+    handler = (path) => ({ status: 200, body: path.endsWith("/status") ? configuration : path.endsWith("/runs") ? { runs: history } : detail(current) });
+    await mount(); await click("交付中文待办功能");
+    current = "failed"; await click("刷新记录");
+    expect(host.querySelector(".pm-run-heading")?.textContent).toContain("本次未交付");
+    current = "completed"; await click("交付中文待办功能");
+    expect(host.querySelector(".pm-run-heading")?.textContent).toContain("产物已交齐");
+  });
+
+  it("详情永久拒绝后停止轮询并移除旧工作区内容", async () => {
+    vi.useFakeTimers();
+    let denied = false;
+    history = [run("running")];
+    handler = (path) => denied ? { status: 403, body: { error: "当前成员没有开发场域权限。" } }
+      : { status: 200, body: path.endsWith("/status") ? configuration : path.endsWith("/runs") ? { runs: history } : detail("running") };
+    await mount(); await click("交付中文待办功能");
+    denied = true;
+    await act(async () => vi.advanceTimersByTimeAsync(6100)); await flush();
+    expect(host.textContent).toContain("当前成员没有开发场域权限");
+    expect(host.textContent).not.toContain("交付中文待办功能");
+    expect(calls.filter((call) => call.path.endsWith(run().id))).toHaveLength(2);
+    expect(button("交给团队执行").disabled).toBe(true);
+  });
+
+  it("任务派发权限被撤回时仍可读记录，禁止执行及新提交", async () => {
+    history = [run("paused")];
+    handler = (path) => ({ status: 200, body: path.endsWith("/status") ? { ...configuration, canDispatch: false } : path.endsWith("/runs") ? { runs: history } : detail("paused") });
+    await mount(); await click("交付中文待办功能");
+    expect(host.textContent).toContain("只允许查看交付记录");
+    expect(host.querySelector(".pm-run-heading")?.textContent).toContain("已暂停");
+    expect(button("校验并恢复").disabled).toBe(true);
+    expect(button("取消任务").disabled).toBe(true);
+    expect(button("交给团队执行").disabled).toBe(true);
+  });
 
   it("文件摘要不符时同时拒绝预览和下载", async () => {
     history = [run("completed")];

@@ -8,8 +8,9 @@ import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
+import { setTimeout as wait } from "node:timers/promises";
 import YAML from "yaml";
-import { OpenAiCompatibleProvider, type CompletionProvider, type CompletionResult, type FunctionToolCall, type ProviderMessage } from "@workloom/base/model-router";
+import { OpenAiCompatibleProvider, type CompletionDispatchReceipt, type CompletionProvider, type CompletionResult, type FunctionToolCall, type ProviderMessage } from "@workloom/base/model-router";
 import { createDshEmployeeExecutor, type DshEmployeeOptions } from "../dsh-adapter.js";
 import type { EmployeeExecutionInput } from "../types.js";
 
@@ -315,6 +316,42 @@ for (const mode of ["cancel", "timeout"] as const) {
     }
   });
 }
+
+test("real DSH drains the original dispatch marker before reporting cancellation accounting", { timeout: 45000 }, async () => {
+  const directory = await scratch("pm-dsh-drain-dispatch-");
+  const controller = new AbortController();
+  let fixtureTransportCalls = 0;
+  let marker: CompletionDispatchReceipt | undefined;
+  const physical = new OpenAiCompatibleProvider("fixture-model", { baseUrl: "https://synthetic.invalid",
+    fetch: async () => { fixtureTransportCalls++; throw new Error("cancelled fixture must never dispatch"); } });
+  const provider: CompletionProvider = { modelId: physical.modelId, complete: (messages, options) => physical.complete(messages, {
+    ...options, async beforeDispatch(receipt) {
+      controller.abort();
+      // Allow the pinned child to exit before simulating durable commit.
+      await wait(1_000);
+      marker = receipt;
+    },
+  }) };
+  try {
+    await assert.rejects(executor({ provider, timeoutMs: 30_000 })(input(directory, controller.signal)), (error: unknown) => {
+      const failure = error as { code: string; receipt: Record<string, unknown>; usage: unknown };
+      assert.ok(marker, "the worker must wait until the in-flight marker settles");
+      assert.equal(failure.code, "DSH_CANCELLED");
+      assert.equal(failure.receipt.modelCalls, 1);
+      assert.equal(failure.receipt.blockedBeforeSendCalls, 1);
+      assert.equal(failure.receipt.usageComplete, true);
+      assert.deepEqual(failure.receipt.requestReceipt, { ...marker, dispatchState: "blocked-before-send", usageComplete: true });
+      assert.deepEqual(failure.usage, { promptTokens: 0, completionTokens: 0 });
+      return true;
+    });
+    assert.equal(fixtureTransportCalls, 0);
+    const [home] = await readdir(directory);
+    const failure = JSON.parse(await readFile(join(directory, home!, "failure.json"), "utf8"));
+    assert.equal(failure.receipt.usageComplete, true);
+    assert.equal(failure.receipt.requestReceipt.attemptId, marker?.attemptId);
+    await assert.rejects(readFile(join(directory, home!, "workspace/report.md")), { code: "ENOENT" });
+  } finally { await cleanup(directory); }
+});
 
 for (const fault of ["model", "length", "response-id", "thinking"] as const) {
   test(`DSH rejects intermediate ${fault} receipt faults before any tool writes`, { timeout: 45000 }, async () => {

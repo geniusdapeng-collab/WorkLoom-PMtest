@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
-import { createDeepSeekProvider, MockProvider, OpenAiCompatibleProvider, providerFromEnv } from "./providers.js";
+import { createDeepSeekProvider, MockProvider, OpenAiCompatibleProvider, providerFromEnv, type CompletionDispatchReceipt } from "./providers.js";
 import { countDeepSeekInputTokens } from "./deepseek-window.js";
 
 function completion(message: Record<string, unknown> = { role: "assistant", content: "done" }, extra: Record<string, unknown> = {}) {
@@ -143,17 +143,23 @@ describe("DeepSeek provider protocol", () => {
   });
 
   it.each([
-    { baseUrl: "http://127.0.0.1:19999", matches: true, expected: "blocked-before-send" },
-    { baseUrl: "http://127.0.0.1:19999", matches: false, expected: "possibly-sent" },
-    { baseUrl: "https://api.deepseek.com", matches: true, expected: "possibly-sent" },
-  ])("only trusts the definitive local denial for $baseUrl with matching exact body=$matches", async ({ baseUrl, matches, expected }) => {
+    { baseUrl: "http://127.0.0.1:19999", matches: true, expected: "blocked-before-send", usageComplete: true },
+    { baseUrl: "http://127.0.0.1:19999", matches: false, expected: "possibly-sent", usageComplete: false },
+    { baseUrl: "https://api.deepseek.com", matches: true, expected: "possibly-sent", usageComplete: false },
+  ])("only trusts the definitive local denial for $baseUrl with matching exact body=$matches", async ({ baseUrl, matches, expected, usageComplete }) => {
     const request = vi.fn(async (_url: unknown, init?: RequestInit) => new Response("private raw reason must not escape", { status: 429, headers: {
       "x-workloom-model-dispatch": "not-sent",
       "x-workloom-request-sha256": matches ? createHash("sha256").update(String(init?.body)).digest("hex") : "f".repeat(64),
     } }));
     const provider = new OpenAiCompatibleProvider("deepseek-flash", { baseUrl, fetch: request });
-    const error = await provider.complete([{ role: "user", content: "quota diagnostic" }]).catch(value => value);
-    expect(error).toMatchObject({ httpStatus: 429, dispatchState: expected, receipt: { usageComplete: false } });
+    const beforeDispatch = vi.fn<(receipt: CompletionDispatchReceipt) => void>();
+    const error = await provider.complete([{ role: "user", content: "quota diagnostic" }], { beforeDispatch }).catch(value => value);
+    expect(beforeDispatch).toHaveBeenCalledOnce();
+    const pending = beforeDispatch.mock.calls[0]![0];
+    expect(pending).toMatchObject({ dispatchState: "possibly-sent", usageComplete: false });
+    const settlement = { ...pending, dispatchState: expected, usageComplete };
+    expect(error).toMatchObject({ httpStatus: 429, dispatchState: expected, requestReceipt: settlement,
+      receipt: { dispatchState: expected, usageComplete, requestReceipt: settlement } });
     expect(error.message).not.toContain("private raw reason");
     expect(request).toHaveBeenCalledOnce();
   });
@@ -228,6 +234,48 @@ describe("DeepSeek provider protocol", () => {
     }).catch((error: unknown) => error);
     expect(blocked).toMatchObject({ dispatchState: "blocked-before-send", requestReceipt: { usageComplete: true } });
     expect(beforeDispatch).toHaveBeenCalledTimes(1); expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["caller cancellation", "deadline"])("waits for an in-flight dispatch marker when %s arrives, then records a definite no-send", async (kind) => {
+    const request = vi.fn(async () => completion());
+    const provider = new OpenAiCompatibleProvider("fixture-model", { baseUrl: "https://synthetic.invalid", fetch: request });
+    const controller = new AbortController();
+    let markEntered!: (entry: { receipt: CompletionDispatchReceipt; signal: AbortSignal }) => void;
+    const entered = new Promise<{ receipt: CompletionDispatchReceipt; signal: AbortSignal }>((resolve) => { markEntered = resolve; });
+    let releaseWrite!: () => void;
+    const finishWrite = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    const events: string[] = [];
+    const result = provider.complete([{ role: "user", content: "fixture" }], {
+      signal: controller.signal, timeoutMs: kind === "deadline" ? 25 : 1_000,
+      async beforeDispatch(receipt, signal) {
+        markEntered({ receipt, signal });
+        await finishWrite;
+        events.push("marker settled");
+      },
+    }).catch((error: unknown) => { events.push("terminal error returned"); return error; });
+    const { receipt, signal } = await entered;
+    const aborted = new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+    try {
+      if (kind === "caller cancellation") controller.abort();
+      await aborted;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(events).toEqual([]);
+      expect(request).not.toHaveBeenCalled();
+    } finally { releaseWrite(); }
+    expect(await result).toMatchObject({ message: kind === "deadline" ? "模型调用超时" : expect.stringContaining("取消"),
+      requestReceipt: { ...receipt, dispatchState: "blocked-before-send", usageComplete: true } });
+    expect(events).toEqual(["marker settled", "terminal error returned"]);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("returns a dispatch marker failure without starting transport", async () => {
+    const request = vi.fn(async () => completion());
+    const provider = new OpenAiCompatibleProvider("fixture-model", { baseUrl: "https://synthetic.invalid", fetch: request });
+    await expect(provider.complete([{ role: "user", content: "fixture" }], {
+      async beforeDispatch() { throw new Error("fixture marker write failed"); },
+    })).rejects.toMatchObject({ message: "fixture marker write failed",
+      requestReceipt: { dispatchState: "blocked-before-send", usageComplete: true } });
+    expect(request).not.toHaveBeenCalled();
   });
 
   it.each(["network", "json", "usage", "timeout"])("marks %s failure after fetch as possibly sent, never as zero usage", async (kind) => {

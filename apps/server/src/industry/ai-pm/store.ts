@@ -100,14 +100,32 @@ function samePhysicalRequest(left: CompletionDispatchReceipt, right: CompletionD
     && isDeepStrictEqual(left.modelRequest, right.modelRequest);
 }
 
-function hasUnsettledAccounting(rows: Row[], attempt: number, meteredAttempt: number): boolean {
+function hasUnsettledAccounting(rows: Row[], attempt: number, meteredAttempt: number, incoming?: FailureMetering): boolean {
   const physical = [...physicalAttempts(rows, attempt).values()];
   if (physical.some((receipt) => receipt.dispatchState === "possibly-sent" || !receipt.usageComplete)) return true;
   if (!physical.some((receipt) => receipt.dispatchState === "sent-usage-known")) return false;
-  if (meteredAttempt < attempt) return true;
+  if (meteredAttempt < attempt) return !incoming?.usage
+    || incoming.receipt?.usageComplete === false || incoming.receipt?.reconciliationRequired === true;
   const aggregate = [...rows].reverse().find((row) => row.kind !== "model-attempt" && (row.attempt === undefined || row.attempt === attempt));
   const receipt = aggregate?.receipt as Row | undefined;
   return aggregate?.usageComplete === false || receipt?.usageComplete === false || receipt?.reconciliationRequired === true;
+}
+
+async function hasActivePmRunLease(client: PoolClient, scope: PmScope, id: string, owner: string): Promise<boolean> {
+  const result = await client.query(
+    `SELECT 1 FROM pm_runs WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND lease_owner=$4
+      AND status IN ('planning','running') AND lease_expires_at>clock_timestamp()`,
+    [id, scope.tenantId, scope.workspaceId, owner]);
+  return result.rowCount === 1;
+}
+
+/** Acquire the scoped row first: a time predicate evaluated before waiting cannot fence a lease. */
+export async function lockActivePmRunLease(client: PoolClient, scope: PmScope, id: string, owner: string): Promise<boolean> {
+  const row = await client.query(
+    `SELECT id FROM pm_runs WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND lease_owner=$4
+      AND status IN ('planning','running') FOR UPDATE`,
+    [id, scope.tenantId, scope.workspaceId, owner]);
+  return row.rowCount === 1 && await hasActivePmRunLease(client, scope, id, owner);
 }
 
 export function requiresPmUsageReconciliation(detail: PmRunDetail): boolean {
@@ -142,7 +160,7 @@ export interface PmStore {
   create(scope: PmScope, input: PmCreateInput, actor: string, modelId: string, policyVersion: string): Promise<{ detail: PmRunDetail; created: boolean }>;
   findEvent(scope: PmScope, event: PmThreadEvent, actor: string): Promise<PmEventReceipt | null>;
   receiveEvent(scope: PmScope, event: PmThreadEvent, actor: string, request?: { modelId: string; policyVersion: string }): Promise<PmEventReceipt>;
-  listThreadEvents(scope: PmScope, threadId: string, limit: number): Promise<PmEventSummary[]>;
+  listThreadEvents(scope: PmScope, threadId: string, limit: number, runId?: string): Promise<PmEventSummary[]>;
   getThreadEvent(scope: PmScope, threadId: string, eventId: string): Promise<PmEventRecord>;
   requestEventForRun(scope: PmScope, runId: string): Promise<PmRequestEvent | null>;
   followupsForRun(scope: PmScope, runId: string): Promise<PmEventSummary[]>;
@@ -216,14 +234,17 @@ export class PgPmStore implements PmStore {
     return { run: runRow(run.rows[0]), tasks: tasks.rows.map(taskRow), artifacts: artifacts.rows.map(artifactRow) };
   }
 
-  private async unsettledAccountingOn(client: PoolClient, scope: PmScope, id: string): Promise<boolean> {
+  private async unsettledAccountingOn(client: PoolClient, scope: PmScope, id: string,
+    incoming?: { taskId: string | undefined; metering: FailureMetering }): Promise<boolean> {
     const run = await client.query<{ planning_receipts: Row[]; planning_attempt: number; planning_metered_attempt: number }>(
       "SELECT planning_receipts,planning_attempt,planning_metered_attempt FROM pm_runs WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3", [id, scope.tenantId, scope.workspaceId]);
-    const tasks = await client.query<{ attempt_receipts: Row[]; attempt: number; metered_attempt: number }>(
-      "SELECT attempt_receipts,attempt,metered_attempt FROM pm_tasks WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3", [id, scope.tenantId, scope.workspaceId]);
+    const tasks = await client.query<{ id: string; attempt_receipts: Row[]; attempt: number; metered_attempt: number }>(
+      "SELECT id,attempt_receipts,attempt,metered_attempt FROM pm_tasks WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3", [id, scope.tenantId, scope.workspaceId]);
     const row = run.rows[0]!;
-    return hasUnsettledAccounting(row.planning_receipts, row.planning_attempt, row.planning_metered_attempt)
-      || tasks.rows.some((task) => hasUnsettledAccounting(task.attempt_receipts, task.attempt, task.metered_attempt));
+    return hasUnsettledAccounting(row.planning_receipts, row.planning_attempt, row.planning_metered_attempt,
+      incoming?.taskId === undefined ? incoming?.metering : undefined)
+      || tasks.rows.some((task) => hasUnsettledAccounting(task.attempt_receipts, task.attempt, task.metered_attempt,
+        incoming?.taskId === task.id ? incoming.metering : undefined));
   }
 
   async create(scope: PmScope, input: PmCreateInput, actor: string, modelId: string, policyVersion: string) {
@@ -274,6 +295,9 @@ export class PgPmStore implements PmStore {
       await client.query("SELECT pg_advisory_xact_lock(6041, hashtext($1))", [JSON.stringify([...scopeKey, event.eventId])]);
       const existing = await this.findEventOn(client, scope, event, actor);
       if (existing) return existing;
+      if (event.kind === "followup" && !event.runId) {
+        throw new PmError("PM_FOLLOWUP_RUN_REQUIRED", "新补充事件必须指定当前任务标识");
+      }
       await client.query("SELECT pg_advisory_xact_lock(6042, hashtext($1))", [JSON.stringify([...scopeKey, event.threadId])]);
       // Row lock coordinates with cancellation and completion. Failed/blocked/paused runs remain resumable.
       const active = await client.query<{ id: string; status: PmRunStatus; plan_version: number }>(
@@ -291,6 +315,7 @@ export class PgPmStore implements PmStore {
       }
       if (!runId) throw new PmError("PM_THREAD_NOT_ACTIVE", "该线程没有可续接任务", 409);
       if (event.kind === "followup") {
+        if (event.runId !== runId) throw new PmError("PM_FOLLOWUP_RUN_MISMATCH", "补充事件指定的任务已不是当前轮次", 409);
         const run = active.rows[0]!;
         // claimTask and this check both take the run row lock. Once the last
         // worker is claimed, a new message cannot be presented as incorporated.
@@ -321,11 +346,12 @@ export class PgPmStore implements PmStore {
     });
   }
 
-  listThreadEvents(scope: PmScope, threadId: string, limit: number): Promise<PmEventSummary[]> {
+  listThreadEvents(scope: PmScope, threadId: string, limit: number, runId?: string): Promise<PmEventSummary[]> {
     return this.tx(scope, async (client) => {
       const result = await client.query<Row>(
-        `SELECT ${EVENT_SUMMARY} FROM pm_thread_events WHERE tenant_id=$1 AND workspace_id=$2 AND thread_id=$3 ORDER BY ordinal DESC LIMIT $4`,
-        [scope.tenantId, scope.workspaceId, threadId, limit]);
+        `SELECT ${EVENT_SUMMARY} FROM pm_thread_events WHERE tenant_id=$1 AND workspace_id=$2 AND thread_id=$3
+          AND ($5::text IS NULL OR run_id=$5) ORDER BY ordinal DESC LIMIT $4`,
+        [scope.tenantId, scope.workspaceId, threadId, limit, runId ?? null]);
       if (!result.rowCount) throw new PmError("PM_THREAD_NOT_FOUND", "线程不存在或无权访问", 404);
       return result.rows.map(eventSummary);
     });
@@ -378,9 +404,9 @@ export class PgPmStore implements PmStore {
 
   async claimRun(scope: PmScope, id: string, owner: string, resume: boolean): Promise<PmRunDetail | null> {
     return this.tx(scope, async (client) => {
+      await client.query("SELECT id FROM pm_runs WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 FOR UPDATE", [id, scope.tenantId, scope.workspaceId]);
       if (resume) {
-        await client.query("SELECT id FROM pm_runs WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 FOR UPDATE", [id, scope.tenantId, scope.workspaceId]);
-        if (requiresPmUsageReconciliation(await this.detailOn(client, scope, id))) {
+        if (requiresPmUsageReconciliation(await this.detailOn(client, scope, id)) || await this.unsettledAccountingOn(client, scope, id)) {
           throw new PmError("MODEL_USAGE_RECONCILIATION_REQUIRED", "上次模型请求可能已经送出且尚未完成用量对账，禁止重复收费调用", 409);
         }
       }
@@ -388,9 +414,9 @@ export class PgPmStore implements PmStore {
       const claimed = await client.query(
         `UPDATE pm_runs SET status=CASE WHEN plan_version=0 THEN 'planning' ELSE 'running' END,
           planning_attempt=planning_attempt+CASE WHEN plan_version=0 THEN 1 ELSE 0 END,
-          lease_owner=$4,lease_expires_at=now()+($5::integer*interval '1 second'),error=NULL,error_code=NULL,updated_at=now()
+          lease_owner=$4,lease_expires_at=clock_timestamp()+($5::integer*interval '1 second'),error=NULL,error_code=NULL,updated_at=clock_timestamp()
          WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND status=ANY($6::text[])
-          AND (lease_owner IS NULL OR lease_expires_at<now()) RETURNING id`,
+          AND (lease_owner IS NULL OR lease_expires_at<=clock_timestamp()) RETURNING id`,
         [id, scope.tenantId, scope.workspaceId, owner, this.leaseSeconds, statuses]);
       if (!claimed.rowCount) return null;
       if (resume) await client.query(
@@ -402,17 +428,20 @@ export class PgPmStore implements PmStore {
   }
 
   heartbeat(scope: PmScope, id: string, owner: string): Promise<boolean> {
-    return this.tx(scope, async (client) => !!(await client.query(
-      `UPDATE pm_runs SET lease_expires_at=now()+($5::integer*interval '1 second'),updated_at=now()
-       WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND lease_owner=$4
-         AND status IN ('planning','running') AND lease_expires_at>now()`, [id, scope.tenantId, scope.workspaceId, owner, this.leaseSeconds])).rowCount);
+    return this.tx(scope, async (client) => {
+      if (!await lockActivePmRunLease(client, scope, id, owner)) return false;
+      const renewed = await client.query(
+        `UPDATE pm_runs SET lease_expires_at=clock_timestamp()+($5::integer*interval '1 second'),updated_at=clock_timestamp()
+         WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND lease_owner=$4 AND lease_expires_at>clock_timestamp()`,
+        [id, scope.tenantId, scope.workspaceId, owner, this.leaseSeconds]);
+      return renewed.rowCount === 1;
+    });
   }
 
   private async lockOwned(client: PoolClient, scope: PmScope, id: string, owner: string): Promise<void> {
-    const row = await client.query(
-      `SELECT id FROM pm_runs WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND lease_owner=$4
-       AND status IN ('planning','running') AND lease_expires_at>now() FOR UPDATE`, [id, scope.tenantId, scope.workspaceId, owner]);
-    if (!row.rowCount) throw new PmError("RUN_LEASE_LOST", "运行已取消、暂停或租约失效，拒绝提交结果", 409);
+    if (!await lockActivePmRunLease(client, scope, id, owner)) {
+      throw new PmError("RUN_LEASE_LOST", "运行已取消、暂停或租约失效，拒绝提交结果", 409);
+    }
   }
 
   savePlan(scope: PmScope, id: string, owner: string, plan: PmTaskPlan[], receipt: PlanningReceipt): Promise<void> {
@@ -425,11 +454,13 @@ export class PgPmStore implements PmStore {
         `INSERT INTO pm_tasks(run_id,id,tenant_id,workspace_id,ordinal,preset_key,goal,depends_on,acceptance,output_refs)
          VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb)`,
         [id, task.id, scope.tenantId, scope.workspaceId, ordinal, task.presetKey, task.goal, JSON.stringify(task.dependsOn), JSON.stringify(task.acceptance), JSON.stringify(task.outputRefs)]);
-      await client.query(
+      const saved = await client.query(
         `UPDATE pm_runs SET status='running',plan_version=1,planning_receipt=$4::jsonb,
           planning_metered_attempt=planning_attempt,planning_receipts=planning_receipts||jsonb_build_array($4::jsonb),
           prompt_tokens=prompt_tokens+$5,completion_tokens=completion_tokens+$6,updated_at=now()
-          WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3`, [id, scope.tenantId, scope.workspaceId, JSON.stringify(receipt), receipt.promptTokens, receipt.completionTokens]);
+          WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND lease_expires_at>clock_timestamp()`,
+        [id, scope.tenantId, scope.workspaceId, JSON.stringify(receipt), receipt.promptTokens, receipt.completionTokens]);
+      if (saved.rowCount !== 1) throw new PmError("RUN_LEASE_LOST", "计划保存期间租约已失效", 409);
       await this.journal(client, scope, id, "pm.sandbox.assign", { tasks: plan, planningReceipt: receipt, executionKind: "sandbox-artifact-generation" }, {
         rule_impact: [], ...(receipt.source === "model" ? { model_trace: { model_id: receipt.modelId, prompt_tokens: receipt.promptTokens, completion_tokens: receipt.completionTokens } } : {}),
       });
@@ -442,9 +473,13 @@ export class PgPmStore implements PmStore {
       const detail = await this.detailOn(client, scope, id);
       const task = detail.tasks.find((item) => item.id === taskId);
       if (!task || task.status !== "pending" || !task.dependsOn.every((dependency) => detail.tasks.some((item) => item.id === dependency && item.status === "completed"))) return false;
-      return !!(await client.query(
+      const claimed = await client.query(
         `UPDATE pm_tasks SET status='running',attempt=attempt+1,lease_owner=$5,started_at=now(),finished_at=NULL
-         WHERE run_id=$1 AND id=$2 AND tenant_id=$3 AND workspace_id=$4 AND status='pending'`, [id, taskId, scope.tenantId, scope.workspaceId, owner])).rowCount;
+         WHERE run_id=$1 AND id=$2 AND tenant_id=$3 AND workspace_id=$4 AND status='pending'`, [id, taskId, scope.tenantId, scope.workspaceId, owner]);
+      if (claimed.rowCount && !await hasActivePmRunLease(client, scope, id, owner)) {
+        throw new PmError("RUN_LEASE_LOST", "认领员工任务期间租约已失效", 409);
+      }
+      return claimed.rowCount === 1;
     });
   }
 
@@ -459,23 +494,26 @@ export class PgPmStore implements PmStore {
       throw new PmError("MODEL_RECEIPT_INVALID", "模型请求回执缺少有效的身份或终态");
     }
     return this.tx(scope, async (client) => {
-      const owned = await client.query<{ active: boolean; planning_attempt: number; planning_receipts: Row[] }>(
-        `SELECT status IN ('planning','running') AND lease_expires_at>now() AS active,planning_attempt,planning_receipts
+      const owned = await client.query<{ status: PmRunStatus; planning_attempt: number; planning_receipts: Row[] }>(
+        `SELECT status,planning_attempt,planning_receipts
          FROM pm_runs WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND lease_owner=$4
          AND (status IN ('planning','running','cancelled') OR
            (status='blocked' AND error_code='MODEL_USAGE_RECONCILIATION_REQUIRED' AND lease_expires_at IS NULL)) FOR UPDATE`,
         [id, scope.tenantId, scope.workspaceId, owner]);
       if (!owned.rowCount) throw new PmError("RUN_LEASE_LOST", "运行归属已变化，拒绝新的模型请求或回执", 409);
       let attempt = owned.rows[0]!.planning_attempt, receipts = owned.rows[0]!.planning_receipts;
+      let targetActive = owned.rows[0]!.status === "planning";
       if (taskId) {
-        const task = await client.query<{ attempt: number; attempt_receipts: Row[] }>(
-          "SELECT attempt,attempt_receipts FROM pm_tasks WHERE run_id=$1 AND id=$2 AND tenant_id=$3 AND workspace_id=$4 FOR UPDATE",
+        const task = await client.query<{ attempt: number; attempt_receipts: Row[]; status: string; lease_owner: string | null }>(
+          "SELECT attempt,attempt_receipts,status,lease_owner FROM pm_tasks WHERE run_id=$1 AND id=$2 AND tenant_id=$3 AND workspace_id=$4 FOR UPDATE",
           [id, taskId, scope.tenantId, scope.workspaceId]);
         if (!task.rows[0]) throw new PmError("TASK_LEASE_LOST", "员工任务不存在，拒绝模型调用", 409);
         attempt = task.rows[0].attempt; receipts = task.rows[0].attempt_receipts;
+        targetActive = task.rows[0].status === "running" && task.rows[0].lease_owner === owner;
       }
       const previous = physicalAttempts(receipts, attempt).get(receipt.attemptId);
-      if (!owned.rows[0]!.active && (!previous || receipt.dispatchState === "possibly-sent")) {
+      const requiresActiveLease = !previous || receipt.dispatchState === "possibly-sent";
+      if (requiresActiveLease && (!targetActive || !await hasActivePmRunLease(client, scope, id, owner))) {
         throw new PmError("RUN_LEASE_LOST", "运行已停止，只允许保留原请求的终态计量回执", 409);
       }
       if (previous && (!samePhysicalRequest(previous, receipt)
@@ -493,6 +531,9 @@ export class PgPmStore implements PmStore {
         `UPDATE pm_runs SET planning_receipts=planning_receipts||jsonb_build_array($4::jsonb)
          WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3`, [id, scope.tenantId, scope.workspaceId, row]);
       await this.journal(client, scope, id, "pm.model.attempt", { taskId: taskId ?? null, requestReceipt: receipt });
+      if (requiresActiveLease && !await hasActivePmRunLease(client, scope, id, owner)) {
+        throw new PmError("RUN_LEASE_LOST", "模型请求登记期间租约已失效，未发出请求", 409);
+      }
     });
   }
 
@@ -518,9 +559,11 @@ export class PgPmStore implements PmStore {
          WHERE run_id=$1 AND id=$2 AND tenant_id=$3 AND workspace_id=$4`,
         [id, taskId, scope.tenantId, scope.workspaceId, result.summary, JSON.stringify(result.usage), result.modelId, result.responseId ?? null, JSON.stringify(impacts), JSON.stringify(result.receipt ?? null),
           JSON.stringify({ attempt: task.rows[0].attempt, usage: result.usage, modelId: result.modelId, responseId: result.responseId ?? null, final: true, receipt: result.receipt ?? null })]);
-      await client.query(
+      const committed = await client.query(
         `UPDATE pm_runs SET prompt_tokens=prompt_tokens+$4,completion_tokens=completion_tokens+$5,updated_at=now()
-         WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3`, [id, scope.tenantId, scope.workspaceId, result.usage.promptTokens, result.usage.completionTokens]);
+         WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND lease_expires_at>clock_timestamp()`,
+        [id, scope.tenantId, scope.workspaceId, result.usage.promptTokens, result.usage.completionTokens]);
+      if (committed.rowCount !== 1) throw new PmError("RUN_LEASE_LOST", "核验产物提交期间租约已失效", 409);
       await this.journal(client, scope, id, "pm.sandbox.artifact.write", {
         taskId, employee: task.rows[0].preset_key, declaredCapability, executionKind: "sandbox-artifact-generation",
         artifacts, usage: result.usage, responseId: result.responseId ?? null, adapterReceipt: result.receipt ?? null,
@@ -635,6 +678,24 @@ export class PgPmStore implements PmStore {
         const detail = await this.detailOn(client, scope, id);
         const receipts = taskId ? detail.tasks.find((task) => task.id === taskId)?.attemptReceipts ?? [] : detail.run.planningReceipts;
         if (receipts.some((row) => row.kind === "model-attempt")) return this.settleRecovered(client, scope, id, taskId, metering, true);
+      } else {
+        const leaseActive = await hasActivePmRunLease(client, scope, id, owner);
+        const incoming = leaseActive && metering ? { taskId, metering } : undefined;
+        const unresolved = code === "MODEL_USAGE_RECONCILIATION_REQUIRED" || await this.unsettledAccountingOn(client, scope, id, incoming);
+        if (!leaseActive || unresolved) {
+          // Older injected execution backends can report known partial usage
+          // without a physical request ledger. Retain that usage only under a
+          // currently valid lease, with the same blocked business outcome.
+          const detail = leaseActive && metering ? await this.detailOn(client, scope, id) : undefined;
+          const targetReceipts = taskId ? detail?.tasks.find((task) => task.id === taskId)?.attemptReceipts : detail?.run.planningReceipts;
+          if (!targetReceipts || targetReceipts.some((row) => row.kind === "model-attempt")) {
+            await this.pauseRecoveredOn(client, scope, id, unresolved);
+            if (unresolved && metering) await this.settleRecovered(client, scope, id, taskId, metering);
+            return true;
+          }
+          status = "blocked";
+          code = "MODEL_USAGE_RECONCILIATION_REQUIRED";
+        }
       }
       let addMetering = metering !== undefined;
       if (taskId) {
@@ -671,7 +732,8 @@ export class PgPmStore implements PmStore {
         return true;
       }
       const updated = await client.query(
-        `UPDATE pm_runs SET status=$5,error_code=$6,error=$7,lease_owner=NULL,lease_expires_at=NULL,
+        `UPDATE pm_runs SET status=$5,error_code=$6,error=$7,
+          lease_owner=CASE WHEN $6='MODEL_USAGE_RECONCILIATION_REQUIRED' THEN lease_owner ELSE NULL END,lease_expires_at=NULL,
           verification=COALESCE($8::jsonb,verification),updated_at=now()
          WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND lease_owner=$4 AND status IN ('planning','running') RETURNING id`,
         [id, scope.tenantId, scope.workspaceId, owner, status, code, message.slice(0, 1000),
@@ -706,9 +768,11 @@ export class PgPmStore implements PmStore {
         || detail.tasks.some((task) => !detail.artifacts.some((artifact) => artifact.taskId === task.id))) {
         throw new PmError("INCOMPLETE_DELIVERY", "仍有员工未交付已核验产物，不能标记完成", 409);
       }
-      await client.query(
+      const finished = await client.query(
         `UPDATE pm_runs SET status='completed',lease_owner=NULL,lease_expires_at=NULL,error=NULL,error_code=NULL,verification=$4::jsonb,updated_at=now()
-         WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3`, [id, scope.tenantId, scope.workspaceId, JSON.stringify({ checks: checkResults, verifiedAt: new Date().toISOString() })]);
+         WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3 AND lease_expires_at>clock_timestamp()`,
+        [id, scope.tenantId, scope.workspaceId, JSON.stringify({ checks: checkResults, verifiedAt: new Date().toISOString() })]);
+      if (finished.rowCount !== 1) throw new PmError("RUN_LEASE_LOST", "完成任务时租约已失效", 409);
       await this.journal(client, scope, id, "pm.run.completed", { artifacts: detail.artifacts, checkResults }, {
         rule_impact: [], receipt: { synced: true, mode: "real", snapshot_uri: `workloom-pm://runs/${id}`, verified_at: new Date().toISOString() },
       });
@@ -734,29 +798,34 @@ export class PgPmStore implements PmStore {
     });
   }
 
+  private async pauseRecoveredOn(client: PoolClient, scope: PmScope, id: string, unresolved: boolean): Promise<void> {
+    // Null expiry and blocked status preserve only the previous owner's accounting authority.
+    const status = unresolved ? "blocked" : "paused";
+    const code = unresolved ? "MODEL_USAGE_RECONCILIATION_REQUIRED" : "INTERRUPTED";
+    await client.query(
+      `UPDATE pm_runs SET status=$4,lease_owner=CASE WHEN $5 THEN lease_owner ELSE NULL END,lease_expires_at=NULL,
+        error_code=$6,error=$7,updated_at=now() WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3`,
+      [id, scope.tenantId, scope.workspaceId, status, unresolved, code, unresolved
+        ? "原模型请求仍须完成终态和用量对账，已冻结重复派发"
+        : "执行进程中断且租约已过期，已完成产物保留；需显式恢复并重新校验摘要"]);
+    await client.query(
+      `UPDATE pm_tasks SET status=$4,lease_owner=NULL,error_code=$5,error='进程中断；未取得完整产物与计量回执'
+        WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3 AND status='running'`,
+      [id, scope.tenantId, scope.workspaceId, status, code]);
+    await this.journal(client, scope, id, `pm.run.${status}`,
+      { code, requiresExplicitResume: !unresolved, requiresUsageReconciliation: unresolved });
+  }
+
   recoverExpired(scope: PmScope): Promise<number> {
     return this.tx(scope, async (client) => {
       const stale = await client.query<{ id: string }>(
         `SELECT id FROM pm_runs WHERE tenant_id=$1 AND workspace_id=$2 AND status IN ('planning','running')
-          AND lease_expires_at<=now() FOR UPDATE`, [scope.tenantId, scope.workspaceId]);
-      for (const row of stale.rows) {
-        const unresolved = requiresPmUsageReconciliation(await this.detailOn(client, scope, row.id))
-          || await this.unsettledAccountingOn(client, scope, row.id);
-        // Retain the old owner only as an accounting identity. Null expiry and
-        // blocked status cannot pass heartbeat, dispatch admission or publishing.
-        await client.query(
-          `UPDATE pm_runs SET status=$4,lease_owner=CASE WHEN $5 THEN lease_owner ELSE NULL END,lease_expires_at=NULL,
-            error_code=$6,error=$7,updated_at=now() WHERE id=$1 AND tenant_id=$2 AND workspace_id=$3`,
-          [row.id, scope.tenantId, scope.workspaceId, unresolved ? "blocked" : "paused", unresolved,
-            unresolved ? "MODEL_USAGE_RECONCILIATION_REQUIRED" : "INTERRUPTED", unresolved
-              ? "执行租约已过期；原模型请求仍须完成终态和用量对账"
-              : "执行进程中断且租约已过期，已完成产物保留；需显式恢复并重新校验摘要"]);
-        await client.query(
-          `UPDATE pm_tasks SET status=$4,lease_owner=NULL,error_code=$5,error='进程中断；未取得完整产物与计量回执'
-           WHERE run_id=$1 AND tenant_id=$2 AND workspace_id=$3 AND status='running'`,
-          [row.id, scope.tenantId, scope.workspaceId, unresolved ? "blocked" : "paused", unresolved ? "MODEL_USAGE_RECONCILIATION_REQUIRED" : "INTERRUPTED"]);
-        await this.journal(client, scope, row.id, unresolved ? "pm.run.blocked" : "pm.run.paused",
-          { code: unresolved ? "MODEL_USAGE_RECONCILIATION_REQUIRED" : "INTERRUPTED", requiresExplicitResume: !unresolved, requiresUsageReconciliation: unresolved });
+          AND lease_expires_at<=clock_timestamp() ORDER BY lease_expires_at,id FOR UPDATE SKIP LOCKED`,
+        [scope.tenantId, scope.workspaceId]);
+      for (const { id } of stale.rows) {
+        const unresolved = requiresPmUsageReconciliation(await this.detailOn(client, scope, id))
+          || await this.unsettledAccountingOn(client, scope, id);
+        await this.pauseRecoveredOn(client, scope, id, unresolved);
       }
       return stale.rowCount ?? 0;
     });

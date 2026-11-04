@@ -310,8 +310,10 @@ export function createDshEmployeeExecutor(options: DshEmployeeOptions): Employee
     const controller = new AbortController();
     const signal = AbortSignal.any([input.signal, controller.signal]);
     const deadline = setTimeout(() => controller.abort(new PmError("DSH_TIMEOUT", "DSH 员工任务超时", 504)), timeoutMs);
+    const pendingRequests = new Set<Promise<void>>();
     const server = createServer((request, response) => {
-      void (async () => {
+      const pending = (async () => {
+        if (signal.aborted) { response.writeHead(503); response.end(); return; }
         if (request.method !== "POST" || request.url !== "/v1/chat/completions" || request.headers.authorization !== `Bearer ${proxyKey}`) {
           response.writeHead(403); response.end(); return;
         }
@@ -369,19 +371,32 @@ export function createDshEmployeeExecutor(options: DshEmployeeOptions): Employee
         writeCompletion(response, completion, body.stream === true);
       })().catch((error: unknown) => {
         proxyError ??= error;
+        if (response.destroyed) return;
         if (!response.headersSent) response.writeHead(502, { "content-type": "application/json" });
         response.end(JSON.stringify({ error: { message: "WorkLoom PM guarded model request failed", type: "pm_model_error" } }));
       });
+      pendingRequests.add(pending);
+      const remove = () => { pendingRequests.delete(pending); };
+      void pending.then(remove, remove);
     });
     try {
-      await new Promise<void>((done, fail) => { server.once("error", fail); server.listen(0, "127.0.0.1", () => { server.removeListener("error", fail); done(); }); });
-      const address = server.address();
-      if (!address || typeof address === "string") reject("DSH_PROXY", "无法绑定本地受控模型代理");
-      const endpoint = `http://127.0.0.1:${address.port}/v1`;
-      await writeFile(join(profile, "cordis.patch.yml"), await profilePatch(packageRoot, home, workspace, input, endpoint, options.provider.modelId, { maxTokens, maxToolCalls }), { mode: 0o600 });
-      const task = `完成员工任务 ${input.task.id}：${input.task.goal}\n完整输入数据：${JSON.stringify({ context,
-        dependencyArtifacts: input.dependencyArtifacts.map(({ taskId, path, sha256, content }) => ({ taskId, path, sha256, content })) })}。\n来源可回查：inputs/context.json，${JSON.stringify(dependencies)}。可以同一轮用多个write_file写齐全部文件；不要重新读取已经附齐的输入。写齐并核对工具成功回执后直接结束，不请求shell或声称测试已运行。严格写齐 outputRefs：${JSON.stringify(input.task.outputRefs)}。\n验收标准：${JSON.stringify(input.task.acceptance)}。`;
-      const processResult = await runProcess(join(packageRoot, "lib/bin.js"), workspace, home, proxyKey, task, signal, timeoutMs);
+      let processResult: ProcessEvidence;
+      try {
+        await new Promise<void>((done, fail) => { server.once("error", fail); server.listen(0, "127.0.0.1", () => { server.removeListener("error", fail); done(); }); });
+        const address = server.address();
+        if (!address || typeof address === "string") reject("DSH_PROXY", "无法绑定本地受控模型代理");
+        const endpoint = `http://127.0.0.1:${address.port}/v1`;
+        await writeFile(join(profile, "cordis.patch.yml"), await profilePatch(packageRoot, home, workspace, input, endpoint, options.provider.modelId, { maxTokens, maxToolCalls }), { mode: 0o600 });
+        const task = `完成员工任务 ${input.task.id}：${input.task.goal}\n完整输入数据：${JSON.stringify({ context,
+          dependencyArtifacts: input.dependencyArtifacts.map(({ taskId, path, sha256, content }) => ({ taskId, path, sha256, content })) })}。\n来源可回查：inputs/context.json，${JSON.stringify(dependencies)}。可以同一轮用多个write_file写齐全部文件；不要重新读取已经附齐的输入。写齐并核对工具成功回执后直接结束，不请求shell或声称测试已运行。严格写齐 outputRefs：${JSON.stringify(input.task.outputRefs)}。\n验收标准：${JSON.stringify(input.task.acceptance)}。`;
+        processResult = await runProcess(join(packageRoot, "lib/bin.js"), workspace, home, proxyKey, task, signal, timeoutMs);
+      } finally {
+        // Child exit can precede the parent provider's durable receipt. Stop
+        // proxy I/O and wait for accounting before constructing either result.
+        controller.abort();
+        server.closeAllConnections();
+        await Promise.allSettled(pendingRequests);
+      }
       await writeFile(join(home, "stdout.jsonl"), processResult.stdout, { mode: 0o600 });
       await writeFile(join(home, "stderr.log"), processResult.stderr, { mode: 0o600 });
       if (proxyError) throw proxyError;
@@ -432,8 +447,7 @@ export function createDshEmployeeExecutor(options: DshEmployeeOptions): Employee
       }
       throw failure;
     } finally {
-      clearTimeout(deadline); controller.abort();
-      server.closeAllConnections();
+      clearTimeout(deadline);
       await new Promise<void>((done) => server.close(() => done()));
     }
   };

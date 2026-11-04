@@ -1,9 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { randomUUID } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
+import { createServer } from "node:http";
+import { setTimeout as wait } from "node:timers/promises";
 import pg from "pg";
 import { OpenAiCompatibleProvider, type CompletionDispatchReceipt } from "@workloom/base/model-router";
+import { closeAllPools } from "@workloom/db";
 import { requireIsolatedPgTestConfig } from "../../test-support/isolated-pg.js";
+import { collectPmSearchEvidence, readPmSearchReservation } from "./search-context.js";
 import { PgPmStore, requiresPmUsageReconciliation } from "./store.js";
+import { PmError } from "./types.js";
 
 const run = process.env.RUN_DB_TESTS === "1" ? describe : describe.skip;
 
@@ -23,7 +28,7 @@ run("PM dispatch admission and late settlement use distinct lease rules", () => 
       [scope.workspaceId, scope.tenantId]);
     store = new PgPmStore(app);
   });
-  afterAll(async () => { await Promise.allSettled([owner?.end(), app?.end()]); });
+  afterAll(async () => { await Promise.allSettled([owner?.end(), app?.end(), closeAllPools()]); });
 
   async function claimed(stage: "planner" | "employee", followingTask = false) {
     const leaseOwner = randomUUID();
@@ -44,6 +49,257 @@ run("PM dispatch admission and late settlement use distinct lease rules", () => 
     if (state === "cancelled") await store.cancel(scope, id, "MEM-PM-LEASE-FIXTURE");
     else await owner.query("UPDATE pm_runs SET lease_expires_at=now()-interval '1 second' WHERE id=$1", [id]);
   }
+
+  async function releaseAfterExpiry<T>(id: string, perform: () => Promise<T>): Promise<T> {
+    const lock = await owner.connect();
+    try {
+      const { rows: [expiry] } = await lock.query<{ lease_expires_at: Date }>(
+        "UPDATE pm_runs SET lease_expires_at=clock_timestamp()+interval '1500 milliseconds' WHERE id=$1 RETURNING lease_expires_at", [id],
+      );
+      await lock.query("BEGIN");
+      const { rows: [backend] } = await lock.query<{ pid: number }>("SELECT pg_backend_pid() AS pid FROM pm_runs WHERE id=$1 FOR UPDATE", [id]);
+      const pending = perform();
+      void pending.catch(() => undefined); // Attach before waiting for the DB lock to prevent unhandled rejection.
+      let waiting = false;
+      for (let i = 0; i < 40 && !waiting; i++) {
+        waiting = Boolean((await owner.query("SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid))", [backend!.pid])).rowCount);
+        if (!waiting) await wait(20);
+      }
+      expect(waiting).toBe(true);
+      expect((await lock.query("SELECT clock_timestamp() < $1 AS active", [expiry!.lease_expires_at])).rows[0]?.active).toBe(true);
+      await lock.query("SELECT pg_sleep(GREATEST(0, extract(epoch FROM $1::timestamptz-clock_timestamp())) + 0.05)", [expiry!.lease_expires_at]);
+      await lock.query("COMMIT");
+      return pending;
+    } finally {
+      await lock.query("ROLLBACK");
+      lock.release();
+    }
+  }
+
+  function controlSearchDeadline() {
+    const setTimer = globalThis.setTimeout;
+    let fire: (() => void) | undefined;
+    const timerSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+      if (ms !== 60_000) return setTimer(callback, ms, ...args);
+      fire = () => callback(...args);
+      return setTimer(() => undefined, ms);
+    }) as typeof setTimeout);
+    return { fire() { expect(fire).toBeTypeOf("function"); fire!(); }, restore() { timerSpy.mockRestore(); } };
+  }
+
+  it("does not admit a model request whose lease expired while waiting for the run lock", async () => {
+    const { id, leaseOwner } = await claimed("planner");
+    const send = vi.fn(async () => Response.json({ id: "late", model: "fixture-provider",
+      choices: [{ finish_reason: "stop", message: { content: "fixture" } }],
+      usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } }));
+    const provider = new OpenAiCompatibleProvider("fixture-provider", { baseUrl: "https://synthetic.invalid", fetch: send });
+    await expect(releaseAfterExpiry(id, () => provider.complete([{ role: "user", content: "must not be dispatched" }], {
+      beforeDispatch: (receipt) => store.recordModelAttempt(scope, id, leaseOwner, undefined, receipt),
+    }))).rejects.toMatchObject({ code: "RUN_LEASE_LOST", dispatchState: "blocked-before-send" });
+    expect(send).not.toHaveBeenCalled();
+    expect((await store.detail(scope, id)).run.planningReceipts).toEqual([]);
+  });
+
+  it("rejects a heartbeat and a planning write if their lease expires while awaiting the run lock", async () => {
+    const heartbeat = await claimed("planner");
+    await expect(releaseAfterExpiry(heartbeat.id, () => store.heartbeat(scope, heartbeat.id, heartbeat.leaseOwner))).resolves.toBe(false);
+    const planning = await claimed("planner");
+    await expect(releaseAfterExpiry(planning.id, () => store.savePlan(scope, planning.id, planning.leaseOwner,
+      [{ id: "late", presetKey: "doc-writer", goal: "错误时序下不应发布计划", dependsOn: [], acceptance: ["测试"], outputRefs: ["late.md"] }],
+      { modelId: "fixture-provider", promptTokens: 0, completionTokens: 0, source: "explicit-employee" })))
+      .rejects.toMatchObject({ code: "RUN_LEASE_LOST" });
+    expect((await store.detail(scope, planning.id)).tasks).toEqual([]);
+  }, 10_000);
+
+  it("leaves no durable search reservation when its lease expires while awaiting the run lock", async () => {
+    const { id, leaseOwner } = await claimed("planner");
+    vi.stubEnv("PM_MODEL_BASE_URL", "http://127.0.0.1:1");
+    vi.stubEnv("PM_MODEL_API_KEY", "synthetic-fixture");
+    vi.stubEnv("PM_SEARCH_USE_LOOPBACK", "1");
+    try {
+      await expect(releaseAfterExpiry(id, () => collectPmSearchEvidence(scope, id, leaseOwner, "公开资料",
+        new AbortController().signal, async () => undefined))).rejects.toMatchObject({ code: "RUN_LEASE_LOST" });
+      expect((await owner.query("SELECT 1 FROM pm_superagent_search WHERE run_id=$1", [id])).rowCount).toBe(0);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("leaves no search reservation after revoked pre-dispatch authorization, then replays only durable evidence", async () => {
+    const { id, leaseOwner } = await claimed("planner");
+    const calls: string[] = [];
+    const sourceUrl = "https://1.1.1.1/fixture-public-research"; // The mocked connector serves all content over loopback.
+    const fixture = createServer((request, response) => {
+      calls.push(request.url ?? "");
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(request.url === "/v1/tools/search"
+        ? { results: [{ title: "公开证据夹具", url: sourceUrl }] }
+        : { title: "公开证据夹具", content: "完整可核验的公开证据夹具。" }));
+    });
+    await new Promise<void>((resolve) => fixture.listen(0, "127.0.0.1", resolve));
+    const address = fixture.address();
+    if (!address || typeof address === "string") throw new Error("fixture address unavailable");
+    vi.stubEnv("PM_MODEL_BASE_URL", `http://127.0.0.1:${address.port}`);
+    vi.stubEnv("PM_MODEL_API_KEY", "synthetic-fixture");
+    vi.stubEnv("PM_SEARCH_USE_LOOPBACK", "1");
+    const signal = new AbortController().signal;
+    try {
+      let checked = 0;
+      await expect(collectPmSearchEvidence(scope, id, leaseOwner, "公开资料", signal, async () => {
+        if (++checked === 2) throw new PmError("FIXTURE_AUTHORIZATION_REVOKED", "fixture revoked", 403);
+      })).rejects.toMatchObject({ code: "FIXTURE_AUTHORIZATION_REVOKED" });
+      expect(calls).toEqual([]);
+      expect((await owner.query("SELECT 1 FROM pm_superagent_search WHERE run_id=$1", [id])).rowCount).toBe(0);
+      const authorized = async () => undefined;
+      const saved = await collectPmSearchEvidence(scope, id, leaseOwner, "公开资料", signal, authorized);
+      expect(saved.fetch.url).toBe(sourceUrl);
+      expect(await collectPmSearchEvidence(scope, id, leaseOwner, "公开资料", signal, authorized)).toEqual(saved);
+      expect(calls).toEqual(["/v1/tools/search", "/v1/tools/fetch"]);
+    } finally {
+      vi.unstubAllEnvs();
+      await new Promise<void>((resolve, reject) => fixture.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it.each(["caller cancellation", "tool deadline"])("settles only its own never-sent search when %s races an acknowledged COMMIT", async (reason) => {
+    const { id, leaseOwner } = await claimed("planner");
+    const lock = await owner.connect();
+    const blockerKey = randomInt(1, 2 ** 31 - 1);
+    const triggerName = `pm_search_commit_${suffix}`;
+    const controller = new AbortController();
+    const sourceUrl = "https://1.1.1.1/fixture-commit-cancel";
+    const transport = vi.fn(async (url: string | URL | Request) => Response.json(String(url).endsWith("/search")
+      ? { results: [{ title: "搜索夹具", url: sourceUrl }] } : { title: "搜索夹具", content: "用于回读的隔离夹具正文。" }));
+    const deadline = reason === "tool deadline" ? controlSearchDeadline() : undefined;
+    vi.stubEnv("PM_MODEL_BASE_URL", "http://127.0.0.1:1");
+    vi.stubEnv("PM_MODEL_API_KEY", "synthetic-fixture");
+    vi.stubEnv("PM_SEARCH_USE_LOOPBACK", "1");
+    vi.stubGlobal("fetch", transport);
+    try {
+      await lock.query("SELECT pg_advisory_lock($1)", [blockerKey]);
+      const { rows: [backend] } = await lock.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+      // Run only for this generated fixture ID and wait only in COMMIT.
+      await lock.query(`CREATE FUNCTION ${triggerName}() RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN PERFORM pg_advisory_xact_lock(${blockerKey}); RETURN NEW; END; $$;
+        CREATE CONSTRAINT TRIGGER ${triggerName} AFTER INSERT ON pm_superagent_search
+          DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.run_id = '${id}') EXECUTE FUNCTION ${triggerName}()`);
+      const query = "合成公开证据";
+      const authorize = async () => undefined;
+      let settled = false;
+      const pending = collectPmSearchEvidence(scope, id, leaseOwner, query, controller.signal, authorize).then(
+        (result) => { settled = true; return result; }, (error: unknown) => { settled = true; return error; });
+      let inCommit = false;
+      for (let i = 0; i < 100 && !inCommit; i++) {
+        inCommit = Boolean((await owner.query("SELECT 1 FROM pg_stat_activity WHERE query='COMMIT' AND $1=ANY(pg_blocking_pids(pid))",
+          [backend!.pid])).rowCount);
+        if (!inCommit) await wait(20);
+      }
+      expect(inCommit).toBe(true);
+      const interrupted = new PmError("INTERRUPTED", "fixture cancellation during COMMIT", 409);
+      if (reason === "caller cancellation") controller.abort(interrupted);
+      else deadline!.fire();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const settledBeforeCommit = settled;
+      await lock.query("SELECT pg_advisory_unlock($1)", [blockerKey]);
+      const failure = await pending;
+      if (reason === "caller cancellation") expect(failure).toBe(interrupted);
+      else { expect(controller.signal.aborted).toBe(false); expect(failure).toMatchObject({ code: "INTERRUPTED", httpStatus: 504 }); }
+      expect(settledBeforeCommit).toBe(false);
+      expect(transport).not.toHaveBeenCalled();
+      expect(await readPmSearchReservation(scope, id)).toBeNull();
+      const initial = await owner.query("SELECT attempt_id,blocked_before_send_at,completed_at,evidence FROM pm_superagent_search WHERE run_id=$1", [id]);
+      expect(initial.rows).toEqual([{ attempt_id: expect.any(String), blocked_before_send_at: expect.any(Date), completed_at: null, evidence: null }]);
+
+      await store.failRun(scope, id, leaseOwner, "paused", "INTERRUPTED", "fixture stopped");
+      const resumedOwner = randomUUID();
+      expect(await store.claimRun(scope, id, resumedOwner, true)).not.toBeNull();
+      const resumed = await collectPmSearchEvidence(scope, id, resumedOwner, query, new AbortController().signal, authorize);
+      expect(resumed.fetch.url).toBe(sourceUrl);
+      expect(transport).toHaveBeenCalledTimes(2);
+      const rows = await owner.query("SELECT attempt_id,blocked_before_send_at,completed_at,evidence FROM pm_superagent_search WHERE run_id=$1 ORDER BY started_at", [id]);
+      expect(rows.rows[0]).toEqual(initial.rows[0]);
+      expect(rows.rows[1]).toEqual({ attempt_id: expect.any(String), blocked_before_send_at: null, completed_at: expect.any(Date), evidence: resumed });
+      expect(rows.rows[1].attempt_id).not.toBe(initial.rows[0].attempt_id);
+    } finally {
+      controller.abort();
+      await lock.query("SELECT pg_advisory_unlock($1)", [blockerKey]);
+      await lock.query(`DROP TRIGGER IF EXISTS ${triggerName} ON pm_superagent_search; DROP FUNCTION IF EXISTS ${triggerName}()`);
+      lock.release();
+      deadline?.restore();
+      vi.unstubAllEnvs(); vi.unstubAllGlobals();
+    }
+  }, 15_000);
+
+  it("reports a pre-reservation tool deadline as retryable without a reservation or transport", async () => {
+    const { id, leaseOwner } = await claimed("planner");
+    const deadline = controlSearchDeadline();
+    const transport = vi.fn();
+    let markChecking!: () => void, releaseCheck!: () => void;
+    const checking = new Promise<void>((resolve) => { markChecking = resolve; });
+    const released = new Promise<void>((resolve) => { releaseCheck = resolve; });
+    vi.stubEnv("PM_MODEL_BASE_URL", "http://127.0.0.1:1");
+    vi.stubEnv("PM_MODEL_API_KEY", "synthetic-fixture");
+    vi.stubEnv("PM_SEARCH_USE_LOOPBACK", "1");
+    vi.stubGlobal("fetch", transport);
+    try {
+      let authorizations = 0;
+      const outcome = collectPmSearchEvidence(scope, id, leaseOwner, "合成工具超时", new AbortController().signal, async () => {
+        if (++authorizations === 2) { markChecking(); await released; }
+      }).catch((error: unknown) => error);
+      await checking;
+      deadline.fire();
+      expect(await outcome).toMatchObject({ code: "INTERRUPTED", httpStatus: 504 });
+      expect(transport).not.toHaveBeenCalled();
+      expect((await owner.query("SELECT 1 FROM pm_superagent_search WHERE run_id=$1", [id])).rowCount).toBe(0);
+    } finally { releaseCheck(); deadline.restore(); vi.unstubAllEnvs(); vi.unstubAllGlobals(); }
+  });
+
+  it("preserves a search reservation once transport may have started, including across retry", async () => {
+    const { id, leaseOwner } = await claimed("planner");
+    const controller = new AbortController();
+    let markSent!: () => void;
+    const sent = new Promise<void>((resolve) => { markSent = resolve; });
+    const transport = vi.fn((_url, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      markSent();
+      init?.signal?.addEventListener("abort", () => reject(new Error("fixture transport aborted")), { once: true });
+    }));
+    vi.stubEnv("PM_MODEL_BASE_URL", "http://127.0.0.1:1");
+    vi.stubEnv("PM_MODEL_API_KEY", "synthetic-fixture");
+    vi.stubEnv("PM_SEARCH_USE_LOOPBACK", "1");
+    vi.stubGlobal("fetch", transport);
+    try {
+      const query = "未收到回执的合成搜索";
+      const authorize = async () => undefined;
+      const outcome = collectPmSearchEvidence(scope, id, leaseOwner, query, controller.signal, authorize).catch((error: unknown) => error);
+      await sent;
+      const interrupted = new PmError("INTERRUPTED", "fixture cancellation after transport start", 409);
+      controller.abort(interrupted);
+      expect(await outcome).toBe(interrupted);
+      expect(await readPmSearchReservation(scope, id)).toEqual({ evidence: null });
+      const original = await owner.query("SELECT attempt_id,blocked_before_send_at,completed_at,evidence FROM pm_superagent_search WHERE run_id=$1", [id]);
+      expect(original.rows).toEqual([{ attempt_id: expect.any(String), blocked_before_send_at: null, completed_at: null, evidence: null }]);
+      await expect(collectPmSearchEvidence(scope, id, leaseOwner, query, new AbortController().signal, authorize))
+        .rejects.toMatchObject({ code: "SEARCH_RECEIPT_UNSETTLED" });
+      expect(transport).toHaveBeenCalledTimes(1);
+      const after = await owner.query("SELECT attempt_id,blocked_before_send_at,completed_at,evidence FROM pm_superagent_search WHERE run_id=$1", [id]);
+      expect(after.rows).toEqual(original.rows);
+    } finally { controller.abort(); vi.unstubAllEnvs(); vi.unstubAllGlobals(); }
+  });
+
+  it("preserves accounting authority when an explicit worker failure leaves a possibly sent request", async () => {
+    const { id, leaseOwner } = await claimed("planner");
+    const pending: CompletionDispatchReceipt = { attemptId: randomUUID(), model: "fixture-provider",
+      dispatchState: "possibly-sent", usageComplete: false, requestSha256: "c".repeat(64) };
+    await store.recordModelAttempt(scope, id, leaseOwner, undefined, pending);
+    await store.failRun(scope, id, leaseOwner, "blocked", "MODEL_USAGE_RECONCILIATION_REQUIRED", "fixture uncertain result");
+    await expect(store.claimRun(scope, id, "wrong-owner", true)).rejects.toMatchObject({ code: "MODEL_USAGE_RECONCILIATION_REQUIRED" });
+    await expect(store.heartbeat(scope, id, leaseOwner)).resolves.toBe(false);
+    const terminal = { ...pending, dispatchState: "sent-usage-known" as const, usageComplete: true };
+    await expect(store.recordModelAttempt(scope, id, leaseOwner, undefined, terminal)).resolves.toBeUndefined();
+    const metering = { modelId: "fixture-provider", usage: { promptTokens: 5, completionTokens: 3 },
+      receipt: { usageComplete: true, requestReceipt: terminal } };
+    await expect(store.failRun(scope, id, leaseOwner, "failed", "LATE_FIXTURE", "fixture settled usage", undefined, [], metering))
+      .resolves.toBe(true);
+    expect((await store.detail(scope, id)).run).toMatchObject({ status: "paused", errorCode: "INTERRUPTED", usage: metering.usage });
+  });
 
   for (const stage of ["planner", "employee"] as const) for (const state of ["expired", "cancelled"] as const) {
     it(`${stage}: ${state} lease forbids a new physical request before network I/O`, async () => {

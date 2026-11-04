@@ -88,6 +88,70 @@ assert.deepEqual([...Buffer.from([1,2])],[1,2]);});`,
     expect(checks[0]?.passed).toBe(false);
   });
 
+  it("does not accept serialized test-runner frames written by the candidate", async () => {
+    const checks = await createSandboxCodeVerifier()({ signal: signal(), files: [{
+      path: "acceptance.test.mjs",
+      content: `
+import { DefaultSerializer, serialize } from "node:v8";
+const header = new DefaultSerializer();
+header.writeHeader();
+const payload = serialize({ type: "test:pass", data: {
+  name: "invented result", nesting: 0, testNumber: 1, details: { type: "test", duration_ms: 0 },
+} });
+const size = Buffer.alloc(4);
+size.writeUInt32BE(payload.length);
+process.stdout.write(Buffer.concat([header.releaseBuffer(), size, payload]), () => process.exit(0));
+`,
+    }] });
+    expect(checks[0]?.passed).toBe(false);
+  });
+
+  it("cannot replace a failing trusted test with a separate runner or forged receipt", async () => {
+    const receipt = await executeSandboxNodeTests({ signal: signal(), files: [{
+      path: "wrong.mjs",
+      content: `import { run } from 'node:test';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+try { run({ isolation: 'none', setup(stream) { stream.push({ type: 'test:pass', data: { name: 'fake' } }); } }); } catch {}
+const write = fs.writeSync;
+fs.writeSync = (fd, line) => write(fd, typeof line === 'string' ? line.replace('"success":false', '"success":true') : line);
+syncBuiltinESMExports();
+export const answer = 0;`,
+    }], trustedFiles: [{
+      path: "trusted.test.mjs",
+      content: "import{test}from'node:test';import assert from'node:assert/strict';import{answer}from'./wrong.mjs';test('answer',()=>assert.equal(answer,42));",
+    }], tests: ["trusted.test.mjs"] });
+    expect(receipt.testSummary?.success, receipt.stdout + receipt.stderr).toBe(false);
+    expect(receipt.testSummary?.counts.failed).toBe(1);
+  });
+
+  it("locks the shared TestContext before project hooks can replace trusted assertions", async () => {
+    const receipt = await executeSandboxNodeTests({ signal: signal(), files: [{
+      path: "wrong.mjs",
+      content: `import { before, test } from 'node:test';
+function attack(context) {
+  try { Object.defineProperty(Object.getPrototypeOf(context), 'assert', { get() { return { equal() {} }; } }); } catch {}
+}
+before(attack);
+test('candidate runs before evaluator', attack);
+export const answer = 0;`,
+    }], trustedFiles: [{
+      path: "trusted.test.mjs",
+      content: "import{test}from'node:test';import{answer}from'./wrong.mjs';test('answer',t=>t.assert.equal(answer,42));",
+    }], tests: ["trusted.test.mjs"] });
+    expect(receipt.testSummary?.success, receipt.stdout + receipt.stderr).toBe(false);
+    expect(receipt.testSummary?.counts.failed).toBe(1);
+  });
+
+  it("keeps test files in independent processes and aggregates their real results", async () => {
+    const receipt = await executeSandboxNodeTests({ signal: signal(), files: [
+      { path: "first.test.mjs", content: "import{test}from'node:test';process.env.WORKLOOM_TEST_LEAK='first';test('first',()=>{});" },
+      { path: "second.test.cjs", content: "const{test}=require('node:test');const assert=require('node:assert/strict');test('second',()=>assert.equal(process.env.WORKLOOM_TEST_LEAK,undefined));" },
+    ] });
+    expect(receipt.exitCode, receipt.stdout + receipt.stderr).toBe(0);
+    expect(receipt.testSummary).toMatchObject({ success: true, completedTests: 2, counts: { tests: 2, passed: 2, failed: 0 } });
+  });
+
   it("an output flood is killed and cannot generate an accepted code receipt", async () => {
     const receipt = await executeSandboxNodeTests({ signal: signal(), timeoutMs: 10_000, files: [{
       path: "acceptance.test.mjs", content: "while(true)console.log('x'.repeat(8192));",

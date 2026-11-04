@@ -7,6 +7,8 @@ import { PmError, type ArtifactCheck, type PmArtifact, type PmFile, type PmScope
 
 const hash = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 const INTERNAL_ID = /^[A-Za-z0-9_-]{1,100}$/;
+const OBJECT_ID_PREFIX = "pma-v2-";
+const OBJECT_DIRECTORY = "artifact-objects";
 function internalId(id: string): string {
   if (!INTERNAL_ID.test(id)) throw new PmError("INVALID_ID", "任务编号格式无效");
   return id;
@@ -17,7 +19,7 @@ async function isDirectory(path: string): Promise<void> {
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new PmError("UNSAFE_ARTIFACT_PATH", "产物目录不是普通目录或含符号链接");
 }
 
-/** Private server-owned directory, immutable O_EXCL/O_NOFOLLOW files, hash-verified reads. */
+/** Private server-owned objects; PostgreSQL receipts own the logical paths and authorize reads. */
 export class ArtifactStore {
   private canonicalRoot?: Promise<string>;
   constructor(private readonly root: string) {}
@@ -62,12 +64,23 @@ export class ArtifactStore {
     return this.safeDirectory(run, ["scratch", internalId(taskId), randomUUID()], true);
   }
 
-  async resolveFile(scope: PmScope, runId: string, path: string): Promise<string> {
+  /** Original storage for receipts issued before artifact IDs became physical object names. */
+  private async resolveLegacyFile(scope: PmScope, runId: string, path: string): Promise<string> {
     const safe = safeArtifactPath(path);
     const run = await this.runDirectory(scope, runId);
     const parts = safe.split("/");
     await this.safeDirectory(join(run, "artifacts"), parts.slice(0, -1), false);
     return join(run, "artifacts", ...parts);
+  }
+
+  async resolveArtifactFile(scope: PmScope, runId: string, artifact: PmArtifact): Promise<string> {
+    if (artifact.runId !== runId) throw new PmError("ARTIFACT_SCOPE_MISMATCH", "产物不属于当前任务", 404);
+    const id = internalId(artifact.id);
+    if (!id.startsWith(OBJECT_ID_PREFIX)) return this.resolveLegacyFile(scope, runId, artifact.path);
+    safeArtifactPath(artifact.path);
+    const run = await this.runDirectory(scope, runId);
+    const directory = await this.safeDirectory(run, [OBJECT_DIRECTORY], false);
+    return join(directory, id);
   }
 
   async persist(scope: PmScope, runId: string, taskId: string, files: PmFile[]): Promise<PmArtifact[]> {
@@ -84,13 +97,16 @@ export class ArtifactStore {
     }
     if (total > MAX_TOTAL_FILE_BYTES) throw new PmError("ARTIFACTS_TOO_LARGE", "员工产物总量超过1MiB");
     const run = await this.runDirectory(scope, runId);
+    const directory = await this.safeDirectory(run, [OBJECT_DIRECTORY], true);
     const written: string[] = [];
     try {
       const artifacts: PmArtifact[] = [];
       for (const file of files) {
-        const parts = file.path.split("/");
-        await this.safeDirectory(join(run, "artifacts"), parts.slice(0, -1), true);
-        const path = join(run, "artifacts", ...parts);
+        // Each attempt gets an independent object, even for an identical
+        // logical path and hash. An interruption before DB commit cannot
+        // occupy a later owner's output or authorize old bytes for readback.
+        const id = `${OBJECT_ID_PREFIX}${randomUUID()}`;
+        const path = join(directory, id);
         let handle;
         try { handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600); }
         catch (error) {
@@ -103,11 +119,11 @@ export class ArtifactStore {
         try { await handle.writeFile(file.content, "utf8"); await handle.sync(); }
         finally { await handle.close(); }
         const row: PmArtifact = {
-          id: `pma-${randomUUID()}`, runId, taskId, path: file.path, sha256: hash(file.content),
+          id, runId, taskId, path: file.path, sha256: hash(file.content),
           sizeBytes: Buffer.byteLength(file.content, "utf8"), mediaType: mediaType(file.path), verifiedAt: new Date().toISOString(),
         };
         // Verify the bytes before returning any receipt; an fs write result alone is insufficient.
-        await this.read(scope, runId, row);
+        await this.readVerifiedFile(path, row);
         artifacts.push(row);
       }
       return artifacts;
@@ -122,8 +138,10 @@ export class ArtifactStore {
   }
 
   async read(scope: PmScope, runId: string, artifact: PmArtifact): Promise<string> {
-    if (artifact.runId !== runId) throw new PmError("ARTIFACT_SCOPE_MISMATCH", "产物不属于当前任务", 404);
-    const path = await this.resolveFile(scope, runId, artifact.path);
+    return this.readVerifiedFile(await this.resolveArtifactFile(scope, runId, artifact), artifact);
+  }
+
+  private async readVerifiedFile(path: string, artifact: PmArtifact): Promise<string> {
     const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
       const stat = await handle.stat();
@@ -139,16 +157,18 @@ export class ArtifactStore {
   /**
    * Roll back files from a completed filesystem write whose database receipt
    * transaction did not commit. The caller must first re-read pm_artifacts and
-   * prove every id is absent. Every file hash/size is verified before any
-   * unlink, so a changed or substituted file is retained for reconciliation.
+   * prove every id is absent. Shared legacy paths cannot establish ownership.
+   * For versioned objects, verify every hash/size before any unlink.
    */
   async discardUncommitted(scope: PmScope, runId: string, artifacts: PmArtifact[]): Promise<number> {
     const paths = new Set<string>();
     for (const artifact of artifacts) {
-      if (artifact.runId !== runId) throw new PmError("ARTIFACT_SCOPE_MISMATCH", "待清理产物不属于当前任务");
-      const path = await this.resolveFile(scope, runId, artifact.path);
+      if (!artifact.id.startsWith(OBJECT_ID_PREFIX)) {
+        throw new PmError("ARTIFACT_RECONCILIATION_REQUIRED", "旧版产物路径不能证明写入归属，保留文件等待对账", 409);
+      }
       try {
-        await this.read(scope, runId, artifact);
+        const path = await this.resolveArtifactFile(scope, runId, artifact);
+        await this.readVerifiedFile(path, artifact);
         paths.add(path);
       } catch (error) {
         // Already absent is the desired end state. Any other mismatch aborts

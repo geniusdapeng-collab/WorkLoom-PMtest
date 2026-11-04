@@ -1,0 +1,502 @@
+{
+  "schema": "workloom.mine-clear/ledger@1",
+  "task_id": "T-2026-1104-0002",
+  "repo": "WorkLoom-PMtest",
+  "title": "PMtest 深度审计与修复",
+  "created_at": "2026-11-04T00:55:24.695Z",
+  "updated_at": "2026-11-04T13:27:22.472040+00:00",
+  "baseline": {
+    "audit": {
+      "commit": "aeac10febdd797ba59338c4234865c872e2bd1eb",
+      "branch": "task/T-2026-1104-0002",
+      "remote": "origin",
+      "fetched_at": "2026-11-04T13:27:22.472040+00:00",
+      "fetch_status": "ok",
+      "notes": [
+        "GitHub owner PAT verified. Git fetch and API ref agree."
+      ]
+    },
+    "repair": {
+      "commit": null,
+      "reverified_problem_ids": []
+    },
+    "acceptance": {
+      "commit": null,
+      "is_descendant_of_repair": null
+    }
+  },
+  "environment": {
+    "kind": "local-preview",
+    "notes": "隔离 PostgreSQL、真实本机操作系统沙箱、Google Chrome 和确定性模型夹具。"
+  },
+  "invariants": [
+    {
+      "id": "INV-1",
+      "text": "租户边界覆盖数据库 RLS、运行时上下文、事件、缓存和外部连接器。",
+      "source": "AGENTS.md#4.1"
+    },
+    {
+      "id": "INV-2",
+      "text": "经营事件、审批和关键回执只增不改；纠正通过新事件表达，不静默覆盖证据。",
+      "source": "AGENTS.md#4.2"
+    },
+    {
+      "id": "INV-3",
+      "text": "所有外部或变更性动作及其子调用，统一经过权限、PII、围栏和审批链路。",
+      "source": "AGENTS.md#4.3"
+    },
+    {
+      "id": "INV-4",
+      "text": "涉钱、敏感数据、群发、公开发布、交易和破坏性变更必须按高风险处理并由人审批。",
+      "source": "AGENTS.md#4.4"
+    },
+    {
+      "id": "INV-5",
+      "text": "没有真实回执就不能标记完成；mock、模拟和体验模式在数据结构与界面上都要明确区分。",
+      "source": "AGENTS.md#4.5"
+    },
+    {
+      "id": "INV-6",
+      "text": "客户原始经营数据不得上行；蜂群只接受白名单化、最小化、匿名化且可审计的元数据或派生经验。",
+      "source": "AGENTS.md#4.6"
+    },
+    {
+      "id": "INV-7",
+      "text": "租户覆盖层只能收紧围栏，不能放宽平台不可变红线。",
+      "source": "AGENTS.md#4.7"
+    },
+    {
+      "id": "INV-8",
+      "text": "模型、提示词、技能、bundle、策略和热更新必须先评测再灰度，且始终可回滚。",
+      "source": "AGENTS.md#4.8"
+    },
+    {
+      "id": "INV-9",
+      "text": "platform-ops、平台账户运营和平台秘密只属于 Andromeda。",
+      "source": "AGENTS.md#4.9"
+    },
+    {
+      "id": "INV-10",
+      "text": "Tiger 在获得单独的合规审查和用户明确授权前，只能模拟或纸面交易。",
+      "source": "AGENTS.md#4.10"
+    },
+    {
+      "id": "INV-11",
+      "text": "令牌、密码、API key、私钥、客户凭证和私密客户数据不得进入源码、文档、上下文、提示词、日志或提交。",
+      "source": "AGENTS.md#4.11"
+    },
+    {
+      "id": "INV-12",
+      "text": "个性化与行业扩展不得形成公共机制的第二事实源。",
+      "source": "AGENTS.md#4.12"
+    }
+  ],
+  "cards": [
+    {
+      "id": "MC-001",
+      "kind": "problem",
+      "title": "工作台访问授权未覆盖 HTTP",
+      "state": "open",
+      "level": "L1",
+      "severity": "P0",
+      "evidence": [
+        {
+          "type": "code",
+          "ref": "apps/server/src/industry/ai-pm/router.ts:78@aeac10febdd797ba59338c4234865c872e2bd1eb",
+          "sha256": "88ca81b14c51d28c806dc5d2d8f0068e8548cd1480cd0aff2b463be706de249d"
+        }
+      ],
+      "root_cause": {
+        "file": "apps/server/src/industry/ai-pm/router.ts",
+        "line": 78,
+        "commit": "aeac10febdd797ba59338c4234865c872e2bd1eb"
+      },
+      "trigger_path": "具有通用任务权限且被拒绝 AI PM 开发槽位的成员直调详情与派发。",
+      "assertions": [
+        {
+          "kind": "sample",
+          "given": "具有通用任务权限且被拒绝 AI PM 开发槽位的成员直调详情与派发。",
+          "expect": "同一权威权限投影控制菜单、详情与写入口；拒绝返回 403。",
+          "command": "pnpm --filter @workloom/server exec vitest run src/industry/ai-pm/router.test.ts",
+          "exec": {
+            "file": "pnpm",
+            "args": [
+              "--filter",
+              "@workloom/server",
+              "exec",
+              "vitest",
+              "run",
+              "src/industry/ai-pm/router.test.ts"
+            ]
+          },
+          "last_result": "not-run"
+        }
+      ],
+      "regression": {
+        "command": "pnpm --filter @workloom/server exec vitest run src/industry/ai-pm/router.test.ts"
+      }
+    },
+    {
+      "id": "MC-002",
+      "kind": "problem",
+      "title": "代码执行回执可由候选输出替代",
+      "state": "open",
+      "level": "L1",
+      "severity": "P0",
+      "evidence": [
+        {
+          "type": "code",
+          "ref": "apps/server/src/industry/ai-pm/code-test-runner.mjs:26@aeac10febdd797ba59338c4234865c872e2bd1eb",
+          "sha256": "499e618252d4c8052bb78552c1a10320203afa40aa09adcd67484cd21de7de53"
+        }
+      ],
+      "root_cause": {
+        "file": "apps/server/src/industry/ai-pm/code-test-runner.mjs",
+        "line": 26,
+        "commit": "aeac10febdd797ba59338c4234865c872e2bd1eb"
+      },
+      "trigger_path": "代码验证运行候选测试、可信断言和一个输出自报结果的测试。",
+      "assertions": [
+        {
+          "kind": "sample",
+          "given": "代码验证运行候选测试、可信断言和一个输出自报结果的测试。",
+          "expect": "输出不能产生可信通过。失败断言仍失败，真实 CJS、ESM、进程隔离及普通断言仍通过。",
+          "command": "pnpm --filter @workloom/server exec vitest run src/industry/ai-pm/code-verifier.test.ts src/industry/ai-pm/code-verifier-independent.test.ts",
+          "exec": {
+            "file": "pnpm",
+            "args": [
+              "--filter",
+              "@workloom/server",
+              "exec",
+              "vitest",
+              "run",
+              "src/industry/ai-pm/code-verifier.test.ts",
+              "src/industry/ai-pm/code-verifier-independent.test.ts"
+            ]
+          },
+          "last_result": "not-run"
+        }
+      ],
+      "regression": {
+        "command": "pnpm --filter @workloom/server exec vitest run src/industry/ai-pm/code-verifier.test.ts src/industry/ai-pm/code-verifier-independent.test.ts"
+      }
+    },
+    {
+      "id": "MC-003",
+      "kind": "problem",
+      "title": "租约等待与迟到计量边界错误",
+      "state": "open",
+      "level": "L2",
+      "severity": "P1",
+      "evidence": [
+        {
+          "type": "code",
+          "ref": "apps/server/src/industry/ai-pm/store.ts:408@aeac10febdd797ba59338c4234865c872e2bd1eb",
+          "sha256": "24eadad920352b2760503836a5399b749ee5a7ed86028dd1618c63fbf1a0748b"
+        }
+      ],
+      "root_cause": {
+        "file": "apps/server/src/industry/ai-pm/store.ts",
+        "line": 408,
+        "commit": "aeac10febdd797ba59338c4234865c872e2bd1eb"
+      },
+      "trigger_path": "执行者等待运行行锁期间过期，或在 Watchdog 处理后才返回原请求的计量。",
+      "assertions": [
+        {
+          "kind": "sample",
+          "given": "执行者等待运行行锁期间过期，或在 Watchdog 处理后才返回原请求的计量。",
+          "expect": "无有效租约不续租、派发或提交；原执行者只能补记同一已发送请求的计量。",
+          "command": "pnpm --filter @workloom/server exec vitest run src/industry/ai-pm/dispatch-lease.pg.test.ts",
+          "exec": {
+            "file": "pnpm",
+            "args": [
+              "--filter",
+              "@workloom/server",
+              "exec",
+              "vitest",
+              "run",
+              "src/industry/ai-pm/dispatch-lease.pg.test.ts"
+            ]
+          },
+          "last_result": "not-run"
+        }
+      ],
+      "regression": {
+        "command": "pnpm --filter @workloom/server exec vitest run src/industry/ai-pm/dispatch-lease.pg.test.ts"
+      }
+    },
+    {
+      "id": "MC-004",
+      "kind": "problem",
+      "title": "延迟补充错绑到同线程的新运行",
+      "state": "open",
+      "level": "L2",
+      "severity": "P1",
+      "evidence": [
+        {
+          "type": "code",
+          "ref": "apps/server/src/industry/ai-pm/store.ts:293@aeac10febdd797ba59338c4234865c872e2bd1eb",
+          "sha256": "24eadad920352b2760503836a5399b749ee5a7ed86028dd1618c63fbf1a0748b"
+        }
+      ],
+      "root_cause": {
+        "file": "apps/server/src/industry/ai-pm/store.ts",
+        "line": 293,
+        "commit": "aeac10febdd797ba59338c4234865c872e2bd1eb"
+      },
+      "trigger_path": "从旧任务提交补充，同时同线程已开始新的运行，并重放旧版持久事件。",
+      "assertions": [
+        {
+          "kind": "sample",
+          "given": "从旧任务提交补充，同时同线程已开始新的运行，并重放旧版持久事件。",
+          "expect": "新补充拒绝错绑；历史精确重放仍命中原运行；读取按运行筛选。",
+          "command": "pnpm --filter @workloom/server exec vitest run src/industry/ai-pm/team.pg.test.ts -t followup|native events",
+          "exec": {
+            "file": "pnpm",
+            "args": [
+              "--filter",
+              "@workloom/server",
+              "exec",
+              "vitest",
+              "run",
+              "src/industry/ai-pm/team.pg.test.ts",
+              "-t",
+              "followup|native events"
+            ]
+          },
+          "last_result": "not-run"
+        }
+      ],
+      "regression": {
+        "command": "pnpm --filter @workloom/server exec vitest run src/industry/ai-pm/team.pg.test.ts -t followup|native events"
+      }
+    },
+    {
+      "id": "MC-005",
+      "kind": "problem",
+      "title": "确定未发出的模型请求被冻结",
+      "state": "open",
+      "level": "L2",
+      "severity": "P1",
+      "evidence": [
+        {
+          "type": "code",
+          "ref": "packages/base/model-router/providers.ts:376@aeac10febdd797ba59338c4234865c872e2bd1eb",
+          "sha256": "61c9b8b99e8f1b0921532a375b0a0957137664a1f55c05cfb6b867f14bdc4f5a"
+        }
+      ],
+      "root_cause": {
+        "file": "packages/base/model-router/providers.ts",
+        "line": 376,
+        "commit": "aeac10febdd797ba59338c4234865c872e2bd1eb"
+      },
+      "trigger_path": "模型预算拒绝或在出站标记仍在写入时取消，覆盖匹配哈希与不可信响应。",
+      "assertions": [
+        {
+          "kind": "sample",
+          "given": "模型预算拒绝或在出站标记仍在写入时取消，覆盖匹配哈希与不可信响应。",
+          "expect": "确定未发送才能结算为已知零用量，保留真实未知出站结果。",
+          "command": "pnpm --filter @workloom/base exec vitest run model-router/providers-deepseek.test.ts",
+          "exec": {
+            "file": "pnpm",
+            "args": [
+              "--filter",
+              "@workloom/base",
+              "exec",
+              "vitest",
+              "run",
+              "model-router/providers-deepseek.test.ts"
+            ]
+          },
+          "last_result": "not-run"
+        }
+      ],
+      "regression": {
+        "command": "pnpm --filter @workloom/base exec vitest run model-router/providers-deepseek.test.ts"
+      }
+    },
+    {
+      "id": "MC-006",
+      "kind": "problem",
+      "title": "DSH 退出早于物理请求结算",
+      "state": "open",
+      "level": "L3",
+      "severity": "P1",
+      "evidence": [
+        {
+          "type": "code",
+          "ref": "apps/server/src/industry/ai-pm/dsh-adapter.ts:314@aeac10febdd797ba59338c4234865c872e2bd1eb",
+          "sha256": "97b0ee4a0d8bfe7348a19a4307375c50326bac0b8a58d58336c42075b67cc4f9"
+        }
+      ],
+      "root_cause": {
+        "file": "apps/server/src/industry/ai-pm/dsh-adapter.ts",
+        "line": 314,
+        "commit": "aeac10febdd797ba59338c4234865c872e2bd1eb"
+      },
+      "trigger_path": "锁定 DSH 子进程取消时仍有代理请求在写入真实请求账本。",
+      "assertions": [
+        {
+          "kind": "sample",
+          "given": "锁定 DSH 子进程取消时仍有代理请求在写入真实请求账本。",
+          "expect": "退出回执等待已登记请求结算；取消的预派发调用不会被误计为未知出站。",
+          "command": "pnpm test:pm-dsh",
+          "exec": {
+            "file": "pnpm",
+            "args": [
+              "test:pm-dsh"
+            ]
+          },
+          "last_result": "not-run"
+        }
+      ],
+      "regression": {
+        "command": "pnpm test:pm-dsh"
+      }
+    },
+    {
+      "id": "MC-007",
+      "kind": "problem",
+      "title": "检索授权与待核验预留错位",
+      "state": "open",
+      "level": "L3",
+      "severity": "P1",
+      "evidence": [
+        {
+          "type": "code",
+          "ref": "apps/server/src/industry/ai-pm/search-context.ts:99@aeac10febdd797ba59338c4234865c872e2bd1eb",
+          "sha256": "e8813df7aae3d200e7acf64a38fb83055ef6e6710fc4f4d6c426d14f3495c78d"
+        }
+      ],
+      "root_cause": {
+        "file": "apps/server/src/industry/ai-pm/search-context.ts",
+        "line": 99,
+        "commit": "aeac10febdd797ba59338c4234865c872e2bd1eb"
+      },
+      "trigger_path": "检索授权撤销、等待租约过期或进程恢复时存在未核验持久预留。",
+      "assertions": [
+        {
+          "kind": "sample",
+          "given": "检索授权撤销、等待租约过期或进程恢复时存在未核验持久预留。",
+          "expect": "已知未派发可重试；未知出站和旧持久预留阻止重试；已有核验回执可续接。",
+          "command": "pnpm --filter @workloom/server exec vitest run src/industry/ai-pm/dispatch-lease.pg.test.ts src/industry/ai-pm/team.pg.test.ts -t search|public search",
+          "exec": {
+            "file": "pnpm",
+            "args": [
+              "--filter",
+              "@workloom/server",
+              "exec",
+              "vitest",
+              "run",
+              "src/industry/ai-pm/dispatch-lease.pg.test.ts",
+              "src/industry/ai-pm/team.pg.test.ts",
+              "-t",
+              "search|public search"
+            ]
+          },
+          "last_result": "not-run"
+        }
+      ],
+      "regression": {
+        "command": "pnpm --filter @workloom/server exec vitest run src/industry/ai-pm/dispatch-lease.pg.test.ts src/industry/ai-pm/team.pg.test.ts -t search|public search"
+      }
+    },
+    {
+      "id": "MC-008",
+      "kind": "problem",
+      "title": "写入后登记前中断使恢复失败",
+      "state": "open",
+      "level": "L3",
+      "severity": "P1",
+      "evidence": [
+        {
+          "type": "code",
+          "ref": "apps/server/src/industry/ai-pm/artifacts.ts:95@aeac10febdd797ba59338c4234865c872e2bd1eb",
+          "sha256": "59fcfe15bf5d2cc0dc791e1950578a9c55f7e718b24f8030ad756739123b2f90"
+        }
+      ],
+      "root_cause": {
+        "file": "apps/server/src/industry/ai-pm/artifacts.ts",
+        "line": 95,
+        "commit": "aeac10febdd797ba59338c4234865c872e2bd1eb"
+      },
+      "trigger_path": "文件已经持久写入，进程在登记数据库回执前中断，另一个执行者恢复。",
+      "assertions": [
+        {
+          "kind": "sample",
+          "given": "文件已经持久写入，进程在登记数据库回执前中断，另一个执行者恢复。",
+          "expect": "同一逻辑路径可由新执行者登记并读回；旧回执可读，无法误删已提交产物。",
+          "command": "pnpm --filter @workloom/server exec vitest run src/industry/ai-pm/artifacts.test.ts src/industry/ai-pm/team.pg.test.ts -t artifact|fsync",
+          "exec": {
+            "file": "pnpm",
+            "args": [
+              "--filter",
+              "@workloom/server",
+              "exec",
+              "vitest",
+              "run",
+              "src/industry/ai-pm/artifacts.test.ts",
+              "src/industry/ai-pm/team.pg.test.ts",
+              "-t",
+              "artifact|fsync"
+            ]
+          },
+          "last_result": "not-run"
+        }
+      ],
+      "regression": {
+        "command": "pnpm --filter @workloom/server exec vitest run src/industry/ai-pm/artifacts.test.ts src/industry/ai-pm/team.pg.test.ts -t artifact|fsync"
+      }
+    },
+    {
+      "id": "MC-009",
+      "kind": "problem",
+      "title": "工作台使用过期状态与重复接单",
+      "state": "open",
+      "level": "L4",
+      "severity": "P1",
+      "evidence": [
+        {
+          "type": "code",
+          "ref": "apps/web/src/extensions/ai-pm/PmDelivery.tsx:166@aeac10febdd797ba59338c4234865c872e2bd1eb",
+          "sha256": "08593d01f1c9359b99d05fd337715dc204d22d2c3cd294441414a6b9627b6069"
+        }
+      ],
+      "root_cause": {
+        "file": "apps/web/src/extensions/ai-pm/PmDelivery.tsx",
+        "line": 166,
+        "commit": "aeac10febdd797ba59338c4234865c872e2bd1eb"
+      },
+      "trigger_path": "详情暂态错误、权限变更，或接单回执丢失后同一标签页刷新重试。",
+      "assertions": [
+        {
+          "kind": "sample",
+          "given": "详情暂态错误、权限变更，或接单回执丢失后同一标签页刷新重试。",
+          "expect": "暂态错误标记旧快照并自动恢复，拒绝后清理受保护数据；重试复用原接单 ID。",
+          "command": "pnpm --filter @workloom/web exec vitest run src/extensions/ai-pm/PmDelivery.test.tsx",
+          "exec": {
+            "file": "pnpm",
+            "args": [
+              "--filter",
+              "@workloom/web",
+              "exec",
+              "vitest",
+              "run",
+              "src/extensions/ai-pm/PmDelivery.test.tsx"
+            ]
+          },
+          "last_result": "not-run"
+        }
+      ],
+      "regression": {
+        "command": "pnpm --filter @workloom/web exec vitest run src/extensions/ai-pm/PmDelivery.test.tsx"
+      }
+    }
+  ],
+  "gates": [],
+  "issue": {
+    "slug": "geniusdapeng-collab/WorkLoom-PMtest",
+    "number": 2
+  },
+  "notes": "冻结候选后，机器运行记录绑定候选 SHA 并独立保存；当前文件保留本 PR 的断言定义与审计基线。"
+}

@@ -3,7 +3,7 @@ import { z, ZodError } from "zod";
 import { createHash } from "node:crypto";
 import { hasCapability, type Identity } from "@workloom/base/tenancy";
 import { createContext, type TrpcContext } from "../../trpc/context.js";
-import { AccessAuthorityError, currentMemberAuthority, memberAccessGrants } from "../../service/access-authority.js";
+import { AccessAuthorityError, resolveAuthoritativeClientAccess } from "../../service/access-authority.js";
 import { CreatePmRunSchema, safeArtifactPath } from "./contract.js";
 import { PmEventId, PmThreadEventSchema } from "./event-contract.js";
 import { PmTeamService, type PmTeamServiceOptions } from "./service.js";
@@ -12,12 +12,12 @@ import { PmError, type PmScope } from "./types.js";
 const RunId = z.string().min(1).max(100).regex(/^[A-Za-z0-9_-]+$/);
 const EmptyMutation = z.object({}).strict();
 const MAX_BODY_BYTES = 256 * 1024;
-interface Authorized { identity: Identity; scope: PmScope }
+const DEVELOPMENT_PERMISSION = "ai-pm.development.read";
+interface Authorized { memberNo: string; scope: PmScope; canDispatch: boolean }
 
 export interface PmAuthDeps {
   context: (request: Request) => Promise<TrpcContext>;
-  authority: typeof currentMemberAuthority;
-  grants: typeof memberAccessGrants;
+  access: (identity: Identity) => ReturnType<typeof resolveAuthoritativeClientAccess>;
 }
 export interface PmRouterOptions {
   service?: PmTeamService;
@@ -63,25 +63,31 @@ export function createPmTeamRouter(options: PmRouterOptions = {}) {
   // database-backed worker only after a request has passed the member middleware.
   let service = options.service;
   const getService = () => service ??= new PmTeamService(options.serviceOptions);
-  const auth: PmAuthDeps = { context: createContext, authority: currentMemberAuthority, grants: memberAccessGrants, ...options.auth };
+  const auth: PmAuthDeps = { context: createContext, access: resolveAuthoritativeClientAccess, ...options.auth };
   const app = new Hono<{ Variables: { pm: Authorized } }>();
   app.use("*", async (context, next) => {
     context.header("cache-control", "no-store");
     const session = await auth.context(context.req.raw);
     if (!session.session) throw new PmError("UNAUTHENTICATED", "请先以有效成员会话登录", 401);
     if (session.partnerIdentity || !session.identity) throw new PmError("MEMBER_REQUIRED", "AI产品经理交付只允许当前工作区成员操作", 403);
-    const current = await auth.authority(session.identity);
-    const identity = current.identity;
-    if (identity.memberNo === "GUEST" || !["owner", "manager", "staff"].includes(identity.role)) {
+    const access = await auth.access(session.identity);
+    const { subject, scope, bundle, navigationPermissions, actionPermissions, plan } = access;
+    if (subject.kind !== "member" || !["owner", "manager", "staff"].includes(subject.role)) {
       throw new PmError("MEMBER_WRITE_ROLE_REQUIRED", "游客、伙伴和只读角色不能访问AI产品经理交付任务", 403);
     }
-    const grants = auth.grants({ role: identity.role, plan: identity.plan, guest: false, permissions: current.permissions });
-    if (!grants.navigationPermissions.includes("tasks.read")) throw new PmError("TASK_READ_FORBIDDEN", "当前成员没有任务读取权限", 403);
-    if (context.req.method !== "GET" && (!grants.actionPermissions.includes("task.dispatch")
-      || !grants.actionPermissions.includes("workspace.write") || !hasCapability(identity.plan, "quest"))) {
+    const development = bundle.configured && bundle.ui.navigation?.slots.find((slot) =>
+      slot.capabilityId === "ai-pm.development" && slot.route === "/development" && slot.clients.includes("pc"));
+    if (!development || !development.permissions.includes(DEVELOPMENT_PERMISSION)
+      || !development.permissions.every((permission) => navigationPermissions.includes(permission))) {
+      throw new PmError("PM_DEVELOPMENT_FORBIDDEN", "当前工作区未开放产品交付，或当前成员没有开发场域权限", 403);
+    }
+    if (!navigationPermissions.includes("tasks.read")) throw new PmError("TASK_READ_FORBIDDEN", "当前成员没有任务读取权限", 403);
+    const canDispatch = actionPermissions.includes("task.dispatch")
+      && actionPermissions.includes("workspace.write") && hasCapability(plan, "quest");
+    if (context.req.method !== "GET" && !canDispatch) {
       throw new PmError("TASK_DISPATCH_FORBIDDEN", "当前成员没有任务派发、工作区写入权限或套餐能力", 403);
     }
-    context.set("pm", { identity, scope: { tenantId: identity.tenantId, workspaceId: identity.workspaceId } });
+    context.set("pm", { memberNo: subject.memberNo, scope, canDispatch });
     await next();
   });
   app.onError((error, context) => {
@@ -95,7 +101,8 @@ export function createPmTeamRouter(options: PmRouterOptions = {}) {
 
   app.get("/status", async (context) => {
     allowedQuery(context.req.raw, []);
-    return context.json(await getService().status(context.get("pm").scope));
+    const { scope, canDispatch } = context.get("pm");
+    return context.json({ ...await getService().status(scope), canDispatch });
   });
   app.get("/runs", async (context) => {
     const query = allowedQuery(context.req.raw, ["limit"]);
@@ -105,20 +112,21 @@ export function createPmTeamRouter(options: PmRouterOptions = {}) {
   app.post("/runs", async (context) => {
     allowedQuery(context.req.raw, []);
     const actor = context.get("pm");
-    const result = await getService().create(actor.scope, CreatePmRunSchema.parse(await readJson(context.req.raw)), actor.identity.memberNo);
+    const result = await getService().create(actor.scope, CreatePmRunSchema.parse(await readJson(context.req.raw)), actor.memberNo);
     return context.json(result.detail, result.created ? 201 : 200);
   });
   app.post("/events", async (context) => {
     allowedQuery(context.req.raw, []);
     const actor = context.get("pm");
     const event = PmThreadEventSchema.parse(await readJson(context.req.raw));
-    const receipt = await getService().receiveEvent(actor.scope, event, actor.identity.memberNo);
+    const receipt = await getService().receiveEvent(actor.scope, event, actor.memberNo);
     return context.json(receipt, receipt.replayed ? 200 : event.kind === "request" ? 202 : 201);
   });
   app.get("/threads/:id/events", async (context) => {
-    const query = allowedQuery(context.req.raw, ["limit"]);
+    const query = allowedQuery(context.req.raw, ["limit", "runId"]);
     const limit = z.coerce.number().int().min(1).max(50).parse(query.get("limit") ?? 20);
-    const events = await getService().listThreadEvents(context.get("pm").scope, PmEventId.parse(context.req.param("id")), limit);
+    const runId = RunId.optional().parse(query.get("runId") ?? undefined);
+    const events = await getService().listThreadEvents(context.get("pm").scope, PmEventId.parse(context.req.param("id")), limit, runId);
     return context.json({ events });
   });
   app.get("/threads/:id/events/:eventId", async (context) => {
@@ -129,7 +137,10 @@ export function createPmTeamRouter(options: PmRouterOptions = {}) {
   });
   app.get("/runs/:id", async (context) => {
     allowedQuery(context.req.raw, []);
-    return context.json(await getService().detail(context.get("pm").scope, RunId.parse(context.req.param("id"))));
+    const service = getService();
+    const { scope } = context.get("pm");
+    const detail = await service.detail(scope, RunId.parse(context.req.param("id")));
+    return context.json({ ...detail, resumeBlock: await service.resumeBlock(scope, detail) });
   });
   app.get("/runs/:id/search-evidence", async (context) => {
     allowedQuery(context.req.raw, []);
@@ -146,7 +157,7 @@ export function createPmTeamRouter(options: PmRouterOptions = {}) {
       EmptyMutation.parse(await readJson(context.req.raw, true));
       const actor = context.get("pm");
       const id = RunId.parse(context.req.param("id"));
-      const result = action === "cancel" ? await getService().cancel(actor.scope, id, actor.identity.memberNo)
+      const result = action === "cancel" ? await getService().cancel(actor.scope, id, actor.memberNo)
         : await getService().start(actor.scope, id, action === "resume");
       return context.json(result, action === "cancel" ? 200 : 202);
     });
