@@ -67,10 +67,15 @@ export function SimBanner() {
   const simData = st.dataMode === "simulated";
   const mockLlm = !st.llm.real;
   if (!simData && !mockLlm) return null;
+  const localDesktop = typeof window !== "undefined" && Boolean(window.workloomDesktopSetup);
   return (
     <div className="relative z-30 flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-amber-500/50 bg-amber-100/80 px-4 py-2 text-body text-amber-800 backdrop-blur">
       <Icon name="warning" size={16} />
       <span className="min-w-0 flex-1 break-words">
+        {localDesktop ? <>
+          {simData && <>工作区尚未完成正式经营配置。</>}
+          {mockLlm && <>模型连接尚未通过正式验证。</>}
+        </> : <>
         {st.persistedDataMode === "real" && (!st.formalActivationRecorded || (st.activationGate && !st.activationGate.canActivate)) && (
           <>原“正式”标记缺少当前服务端门禁凭据或已不满足门禁，已按<b>模拟运行态</b>展示。</>
         )}
@@ -84,12 +89,13 @@ export function SimBanner() {
           <>大模型仍为<b>内置确定性应答</b>（数据已切真实模式）。</>
         )}
         {" "}请开始接入真实数据使用——点击右侧按钮进入「落地向导」，全程自动完成。
+        </>}
       </span>
       <a
         href="/onboarding"
         className="shrink-0 rounded border border-amber-500/60 bg-amber-200/60 px-3 py-1 font-bold text-amber-900 no-underline transition-colors hover:bg-amber-300/60"
       >
-        接入真实数据 →
+        {localDesktop ? "打开配置引导 →" : "接入真实数据 →"}
       </a>
     </div>
   );

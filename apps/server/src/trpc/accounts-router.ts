@@ -232,6 +232,9 @@ export const accountsRouter = router({
     guestEnter: publicProcedure
       .input(z.object({ device, ip, productId: z.string().max(80).optional(), appId: z.string().max(120).optional() }))
       .mutation(async ({ input }) => {
+        if (process.env.NODE_ENV === "production" && /^[a-f0-9]{64}$/.test(process.env.WORKLOOM_PM_DESKTOP_SETUP_TOKEN ?? "")) {
+          throw new TRPCError({ code: "FORBIDDEN", message: "桌面生产工作区需要正式登录" });
+        }
         const product = productIdentity();
         if ((input.productId && input.productId !== product.productId) || (input.appId && input.appId !== product.appId)) {
           throw new TRPCError({ code: "BAD_REQUEST", message: "当前客户端与服务端产品不匹配，请更新客户端后重试" });

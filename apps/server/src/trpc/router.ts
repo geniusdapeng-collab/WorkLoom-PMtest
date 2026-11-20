@@ -34,6 +34,7 @@ import {
 import { applyKbPublishAfterApproval, searchKB } from "../service/kb.js";
 import { acquisitionQuestPlanner } from "../industry/hotel/acquisition-planner.js";
 import { createPmTeamRouter } from "../industry/ai-pm/router.js";
+import { createPmDesktopSetupRouter } from "../industry/ai-pm/desktop-setup-router.js";
 import { createAssistantRouter } from "../assistant/router.js";
 import {
   actionProcedure,
@@ -3744,6 +3745,7 @@ export type AppRouter = typeof appRouter;
 /** 产品 HTTP 接线仅由行业组合根声明，公共启动入口只消费通用路由集合。 */
 export const productHttpRoutes: Array<{ path: string; router: Hono<any> }> = [
   { path: "/api/pm", router: createPmTeamRouter() },
+  { path: "/api/pm-desktop", router: createPmDesktopSetupRouter() },
   { path: "/api/assistant", router: createAssistantRouter() },
 ];
 /** 上下文类型经 router 入口再导出（前端 AppRouter 类型可移植性，TS2742） */

@@ -196,25 +196,20 @@ test("安装后目标校验拒绝宿主架构原生包并生成稳定 inventory 
   }
 });
 
-test("正式与应急装配线统一使用每产品 lock、目标 OS/CPU 和身份闭包", () => {
-  const electron = readFileSync(join(REPOSITORY_ROOT, "scripts/pack-electron-payload.sh"), "utf8");
-  const windows = readFileSync(join(REPOSITORY_ROOT, "scripts/pack-windows.sh"), "utf8");
-  const macos = readFileSync(join(REPOSITORY_ROOT, "scripts/pack-macos.sh"), "utf8");
-  for (const source of [electron, windows, macos]) {
-    assert.match(source, /runtime-deps-lock\.mjs stage/u);
-    assert.match(source, /product-runtime\.mjs --manifest-path/u);
-    assert.match(source, /PRODUCT_MANIFEST_PATH/u);
-    assert.match(source, /product\.manifest\.json/u);
-    assert.match(source, /scripts\/product-runtime\.mjs/u);
-    assert.match(source, /scripts\/vite-product\.mjs/u);
-    assert.match(source, /payload-policy\.mjs assert-runtime/u);
-    assert.doesNotMatch(source, /\bnpm install --no-audit --no-fund --legacy-peer-deps/u);
-  }
-  assert.match(electron, /--os "\$TARGET_OS" --cpu "\$TARGET_CPU"/u);
-  assert.match(windows, /--os win32 --cpu x64/u);
-  assert.match(macos, /--os darwin --cpu "\$NODE_ARCH"/u);
-  assert.match(macos, /x86_64\|x64\) NATS_ARCH="amd64"/u);
-  assert.doesNotMatch(windows, /\bcopy_nm\b/u);
+test("Electron 装配使用每产品 lock、目标 OS/CPU 和身份闭包", () => {
+  const source = readFileSync(join(REPOSITORY_ROOT, "scripts/pack-electron-payload.sh"), "utf8");
+  assert.match(source, /runtime-deps-lock\.mjs stage.*--os "\$TARGET_OS" --cpu "\$TARGET_CPU"/u);
+  assert.match(source, /product-runtime\.mjs --manifest-path/u);
+  assert.match(source, /PRODUCT_MANIFEST_PATH/u);
+  assert.match(source, /product\.manifest\.json/u);
+  assert.match(source, /scripts\/product-runtime\.mjs/u);
+  assert.match(source, /scripts\/vite-product\.mjs/u);
+  assert.match(source, /payload-policy\.mjs assert-runtime/u);
+  assert.doesNotMatch(source, /\bnpm install --no-audit --no-fund --legacy-peer-deps|\bcopy_nm\b/u);
+  assert.match(source, /mac-arm64\)\s+TARGET_OS="darwin";\s+TARGET_CPU="arm64"/u);
+  assert.match(source, /mac-x64\)\s+TARGET_OS="darwin";\s+TARGET_CPU="x64"/u);
+  assert.match(source, /win-x64\)\s+TARGET_OS="win32";\s+TARGET_CPU="x64"/u);
+  assert.match(source, /mac-x64\)\s+NATS_DIST="nats-server-\$\{NATS_VER\}-darwin-amd64\.tar\.gz"/u);
   const product = loadProductRuntime(REPOSITORY_ROOT);
   if (product.repository === "workloom-ai/workloom-im") {
     const workflow = readFileSync(join(REPOSITORY_ROOT, ".github/workflows/desktop-production-release.yml"), "utf8");

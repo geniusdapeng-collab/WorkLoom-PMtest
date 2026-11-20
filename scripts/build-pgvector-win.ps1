@@ -1,5 +1,5 @@
 # ============================================================
-# build-pgvector-win.ps1 —— Windows 上从源码编译 pgvector（供 pack-windows.sh 合入）
+# build-pgvector-win.ps1 —— Windows 上从源码编译 Electron 载荷使用的 pgvector
 # 背景与两次踩坑记录：
 #   ① zonky embedded PG 是纯运行时（无 include/ 无 pg_config.exe），不能当编译底座；
 #   ② pgvector 官方 Makefile.win 需要 PGROOT 环境变量（非 PATH 里的 pg_config）。

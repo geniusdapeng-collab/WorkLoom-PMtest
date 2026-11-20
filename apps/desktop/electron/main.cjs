@@ -3,7 +3,7 @@
  *
  * 产品定义：客户端即产品本身（对标 WorkBuddy/微信桌面端），不是浏览器套壳——
  *   ① 完全自包含：应用资源内携带 Node 24 + PostgreSQL 17(+pgvector) + nats + 产品载荷，
- *      首启由 bootstrap.cjs 自动完成装配→initdb→迁移→种子（AI 产品经理示例包）→起服务，
+ *      首启由 bootstrap.cjs 自动完成装配→initdb→迁移→起服务，
  *      用户侧零依赖、零命令行、零外部浏览器；
  *   ② 响应式工作区：默认 1440×900，允许用户自由缩放、分屏与全屏；
  *      布局由共享 Web 壳按真实可用宽度重排，不再用整页 zoomFactor 模拟响应式；
@@ -25,7 +25,7 @@
  *   WORKLOOM_PORT_OFFSET 产品端口偏移（行业包/构建配置提供，默认 0）
  *   WORKLOOM_START_PATH  产品首屏本地路由（构建配置提供，默认 /）
  */
-const { app, BrowserWindow, Tray, Menu, Notification, nativeImage, shell, dialog } = require("electron");
+const { app, BrowserWindow, Tray, Menu, Notification, nativeImage, shell, dialog, ipcMain } = require("electron");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -92,7 +92,7 @@ const MIN_H = 640;
 let win = null;
 let splash = null;
 let tray = null;
-let handle = null; // bootstrap 返回的 { stop, webUrl }
+let handle = null;
 let quitting = false;
 let supportDirResolved = null;
 let bootstrapRunning = false;
@@ -100,6 +100,22 @@ let bootstrapStartedAt = 0;
 let retryBootstrap = null;
 let lastBootstrapError = null;
 let lastBootstrapReference = null;
+
+async function desktopSetupRequest(event, method, input) {
+  if (!handle?.requestSetup || !win || event.sender !== win.webContents
+    || !event.senderFrame || event.senderFrame !== win.webContents.mainFrame) return { error: "NOT_FOUND" };
+  const sender = new URL(event.senderFrame.url);
+  if (sender.origin !== new URL(handle.webUrl).origin || sender.pathname !== "/login") return { error: "NOT_FOUND" };
+  try {
+    const response = await handle.requestSetup(method, input);
+    return await response.json();
+  } catch {
+    return { error: "SETUP_FAILED" };
+  }
+}
+
+ipcMain.handle("pm-desktop:setup-status", (event) => desktopSetupRequest(event, "GET"));
+ipcMain.handle("pm-desktop:setup-create", (event, input) => desktopSetupRequest(event, "POST", input));
 
 /* ---------- 单实例锁：重复启动唤出已有窗口 ---------- */
 const gotLock = app.requestSingleInstanceLock();
@@ -266,7 +282,11 @@ function createWindow() {
     autoHideMenuBar: true,
     backgroundColor: "#F8FAFC",
     show: false,
-    webPreferences: { contextIsolation: true, nodeIntegration: false },
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      ...(handle?.requestSetup ? { preload: path.join(__dirname, "preload.cjs") } : {}),
+    },
   });
 
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -326,9 +346,15 @@ function createWindow() {
   });
   win.on("closed", () => { win = null; });
 
-  const productUrl = handle?.webUrl ?? WEB_URL;
-  const renderUrl = SAFE_RENDERING ? `${productUrl}?render=vector2d` : productUrl;
-  void win.loadURL(renderUrl);
+  const productUrl = new URL(handle?.webUrl ?? WEB_URL);
+  if (handle?.requestSetup) {
+    const destination = productUrl.pathname;
+    productUrl.pathname = "/login";
+    productUrl.searchParams.set("next", destination);
+    productUrl.searchParams.set("desktop", "1");
+  }
+  if (SAFE_RENDERING) productUrl.searchParams.set("render", "vector2d");
+  void win.loadURL(productUrl.href);
 }
 
 function pixelHealth(image) {

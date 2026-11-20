@@ -2,7 +2,7 @@
 # 用法：先 bash scripts/pack-electron-payload.sh 装配 dist-payload/，再 pnpm app:dist
 # 说明（v2.1.0 起）：客户端完全自包含——extraResources 打入 Node 24 + PostgreSQL 17
 #       (+pgvector) + nats-server + 产品载荷，用户机零依赖；首启由
-#       apps/desktop/electron/bootstrap.cjs 自动完成装配→initdb→迁移→种子→起服务，
+#       apps/desktop/electron/bootstrap.cjs 自动完成装配→initdb→迁移→起服务，
 #       客户端窗口即产品（不再打开外部浏览器）。
 appId: com.workloom.pmtest
 productName: WorkLoom PMtest
@@ -12,6 +12,7 @@ directories:
   buildResources: apps/desktop/electron/assets
 files:
   - apps/desktop/electron/**/*
+  - "!apps/desktop/electron/**/*.test.cjs"
   - package.json
 # 关键纪律（v2.2.0 漏包实证）：electron-builder 的 extraResources 默认跳过
 # **/node_modules/**——载荷的扁平化运行依赖（tsx/hono/pg）会被静默丢弃，

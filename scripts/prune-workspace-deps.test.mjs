@@ -60,15 +60,15 @@ test("a copied workspace node_modules symlink is unlinked without changing its t
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("all three packaging paths preserve npm nested boundaries and verify production preview", () => {
+test("Electron packaging preserves npm nested boundaries and verifies production preview", () => {
   const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  for (const script of ["pack-electron-payload.sh", "pack-macos.sh", "pack-windows.sh"]) {
-    const source = readFileSync(join(root, "scripts", script), "utf8");
-    assert.match(source, /node scripts\/prune-workspace-deps\.mjs "\$R\/node_modules" "\$pname"/u, script);
-    assert.doesNotMatch(source, /find "\$R\/node_modules"[^\n]*-name node_modules[^\n]*rm -rf/u, script);
-    assert.match(source, /node scripts\/verify-runtime-preview\.mjs "\$R" "\$NM_STAGE\/node_modules"/u, script);
-    assert.match(source, /node scripts\/verify-runtime-deepseek\.mjs "\$R" "\$R\/node_modules"/u, script);
-  }
+  const source = readFileSync(join(root, "scripts/pack-electron-payload.sh"), "utf8");
+  assert.match(source, /tar --exclude=node_modules -chf - -C "\$source" \. \| tar -xf - -C "\$destination"/u);
+  assert.match(source, /copy_workspace_source "\$pdir" "\$R\/node_modules\/\$pname"/u);
+  assert.match(source, /node scripts\/prune-workspace-deps\.mjs "\$R\/node_modules" "\$pname"/u);
+  assert.doesNotMatch(source, /find "\$R\/node_modules"[^\n]*-name node_modules[^\n]*rm -rf/u);
+  assert.match(source, /node scripts\/verify-runtime-preview\.mjs "\$R" "\$NM_STAGE\/node_modules"/u);
+  assert.match(source, /node scripts\/verify-runtime-deepseek\.mjs "\$R" "\$R\/node_modules"/u);
 });
 
 function tokenizerPayload(t) {

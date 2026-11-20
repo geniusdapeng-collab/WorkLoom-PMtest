@@ -2,7 +2,7 @@
 # ============================================================
 # WorkLoom Electron 自包含载荷装配（desktop-production-release 流水线专用）
 # 产出：dist-payload/{runtime,node,pg,nats}——由 electron-builder extraResources 打入安装包
-#   runtime/  产品载荷（源码+迁移+种子+扁平 node_modules+web dist+VERSION）
+#   runtime/  产品载荷（源码+迁移+正式行业包+扁平 node_modules+web dist+VERSION）
 #   node/     Node 24 官方二进制（按平台/架构）
 #   pg/       PostgreSQL 17 + pgvector（bin/lib/share 两平台同构）
 #   nats/     nats-server（JetStream 事件总线）
@@ -52,6 +52,16 @@ copy() {
   if cp --version 2>/dev/null | grep -q GNU; then cp -aL "$@"; else cp -pRL "$@"; fi
 }
 
+copy_workspace_source() {
+  local source="$1" destination="$2"
+  if [ -d "$source" ]; then
+    mkdir -p "$destination"
+    tar --exclude=node_modules -chf - -C "$source" . | tar -xf - -C "$destination"
+  else
+    copy "$source" "$destination"
+  fi
+}
+
 echo "== 装配 Electron 自包含载荷（${VERSION} · ${PLATFORM}-${ARCH}）=="
 rm -rf "$OUT"
 mkdir -p "$OUT"
@@ -65,7 +75,7 @@ case "$PLATFORM_OPS_MODE" in
   *) echo "❌ 无效的载荷边界策略：$PLATFORM_OPS_MODE"; exit 1 ;;
 esac
 
-# ---------- 1. 产品载荷 runtime/（与 pack-macos/pack-windows 同白名单口径） ----------
+# ---------- 1. 产品载荷 runtime/（macOS 和 Windows 共用白名单） ----------
 echo "→ 装配产品载荷…"
 R="$OUT/runtime"
 mkdir -p "$R/apps" "$R/scripts"
@@ -77,19 +87,20 @@ cp "$PRODUCT_MANIFEST_PATH" "$R/product.manifest.json"
 [ -f "$R/.env.defaults" ] || cp .env.example "$R/.env.defaults"
 RUNTIME_SOURCE_DIRS=(
   apps/server apps/web/src apps/web/index.html apps/web/public apps/web/package.json
-  apps/web/vite.config.ts apps/web/tsconfig.json packages bundles
+  apps/web/vite.config.ts apps/web/tsconfig.json packages
 )
 [ "$PLATFORM_OPS_MODE" = "include" ] && RUNTIME_SOURCE_DIRS+=(platform-ops)
 for d in "${RUNTIME_SOURCE_DIRS[@]}"; do
   [ -e "$d" ] || continue
   mkdir -p "$R/$(dirname "$d")"
-  copy "$d" "$R/$(dirname "$d")/"
+  copy_workspace_source "$d" "$R/$d"
 done
+DESKTOP_BUNDLES="build/desktop-bundles"
+[ -d "$DESKTOP_BUNDLES" ] || { echo "❌ 缺少正式桌面行业包，请先以构建签名密钥执行 pnpm bundle:release --desktop"; exit 1; }
+BUNDLES_ROOT="$DESKTOP_BUNDLES" pnpm bundle:governance
+copy "$DESKTOP_BUNDLES" "$R/bundles"
 cp scripts/migrate.ts scripts/desktop-bootstrap-db.mjs scripts/product-runtime.mjs scripts/vite-product.mjs scripts/dsh-runtime.cjs "$R/scripts/"
-cp scripts/seed*.ts "$R/scripts/"  # 全部行业种子随包（seed/seed-aipm/seed-geo/seed-video/seed-consulting/seed-boost/seed-platform…按仓配置选用）
 printf '%s\n' "$VERSION" > "$R/VERSION"
-# 源码不携带 node_modules：运行期统一由下方 npm 扁平化安装的根 node_modules 提供（v2.0.8 实证）
-find "$R/apps" "$R/packages" -type d -name node_modules -prune -exec rm -rf {} + 2>/dev/null || true
 
 # ---------- 2. web 构建产物 + 运行期依赖（npm 扁平化，无 symlink，electron-builder 友好） ----------
 if [ ! -f apps/web/dist/index.html ]; then
@@ -113,7 +124,7 @@ for pkgjson in "${INTERNAL_PACKAGE_MANIFESTS[@]}"; do
   [ -n "$pname" ] || continue
   pdir="$(dirname "$pkgjson")"
   mkdir -p "$R/node_modules/$(dirname "$pname")"
-  copy "$pdir" "$R/node_modules/$pname"
+  copy_workspace_source "$pdir" "$R/node_modules/$pname"
   # 只移除刚复制的 workspace 包自带依赖；npm ci 的第三方嵌套树是版本边界，
   # 删除它会让 dsh 等运行时在客户机上出现 MODULE_NOT_FOUND / 错版加载。
   node scripts/prune-workspace-deps.mjs "$R/node_modules" "$pname"
@@ -226,8 +237,6 @@ if node -e 'process.exit(require("./apps/server/package.json").dependencies?.["@
     [ -f "$OUT/$f" ] || { echo "❌ PM Harness 载荷不完整：$f 缺失"; exit 1; }
   done
 fi
-# 种子脚本按仓各异（seed-aipm/seed-trading/seed-video…），存在其一即可
-compgen -G "$OUT/runtime/scripts/seed*.ts" > /dev/null || { echo "❌ 载荷自检失败：runtime/scripts/seed*.ts 缺失"; exit 1; }
 if [ "$PLATFORM" = "win" ]; then
   [ -f "$OUT/nats/nats-server.exe" ] || { echo "❌ 载荷自检失败：nats/nats-server.exe 缺失"; exit 1; }
   [ -f "$OUT/node/node.exe" ] || { echo "❌ 载荷自检失败：node/node.exe 缺失"; exit 1; }

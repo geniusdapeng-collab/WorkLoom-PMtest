@@ -212,6 +212,41 @@ test("身份闭包目录与归档完整且产品身份一致时通过", () => {
   }
 });
 
+test("正式桌面目录和归档拒绝示例数据脚本或首启种子配置", () => {
+  const manifest = product();
+  const root = fixture(manifest, { git: false });
+  const runtime = join(root, "runtime");
+  writeRuntimeIdentityPayload(runtime, manifest);
+  const seed = join(runtime, "scripts", "seed-aipm.ts");
+  try {
+    const policy = loadPayloadPolicy(root);
+    writeFileSync(seed, "// offline fixture\n");
+    assert.throws(() => assertRuntimePayloadBoundary(runtime, policy), /不得包含示例数据脚本/u);
+    assert.throws(() => assertArchivePayloadBoundary([
+      ...requiredArchiveEntries(),
+      ".\\runtime\\scripts\\SEED-AIPM.ts",
+    ], policy), /不得包含示例数据脚本/u);
+
+    rmSync(seed);
+    writeFileSync(join(runtime, ".env.defaults"), "DESKTOP_SEED_SCRIPT=scripts/seed-aipm.ts\n");
+    assert.throws(() => assertRuntimePayloadBoundary(runtime, policy), /配置了示例数据脚本/u);
+    rmSync(join(runtime, ".env.defaults"));
+
+    const bundle = join(runtime, "bundles", "ai-pm");
+    mkdirSync(join(bundle, "seeds"), { recursive: true });
+    assert.throws(() => assertRuntimePayloadBoundary(runtime, policy), /不得包含行业包示例数据目录/u);
+    assert.throws(() => assertArchivePayloadBoundary([
+      ...requiredArchiveEntries(),
+      ".\\runtime\\bundles\\ai-pm\\SEEDS\\fixture.json",
+    ], policy), /不得包含示例数据脚本/u);
+    rmSync(join(bundle, "seeds"), { recursive: true });
+    writeFileSync(join(bundle, "bundle.json"), '{ "workloom": { "provides": { "seeds": ["example.json"] } } }\n');
+    assert.throws(() => assertRuntimePayloadBoundary(runtime, policy), /仍声明示例数据/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("归档中的身份闭包必须是精确文件路径，目录或大小写伪装不能通过", () => {
   const policy = payloadPolicyFor(product());
   const entries = requiredArchiveEntries();

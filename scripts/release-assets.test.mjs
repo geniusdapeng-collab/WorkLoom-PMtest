@@ -27,7 +27,6 @@ test("release asset manifest pins every desktop runtime artifact", () => {
     "nats-server-v2.11.4-darwin-arm64.tar.gz",
     "nats-server-v2.11.4-linux-amd64.tar.gz",
     "nats-server-v2.11.4-windows-amd64.zip",
-    "embedded-postgres-binaries-windows-amd64-17.2.0.jar",
     "postgresql17.17.11.0.nupkg",
   ];
   assert.deepEqual(Object.keys(manifest.assets).sort(), required.sort());
@@ -91,17 +90,12 @@ test("every packaging download is wired through the verified fetch boundary", as
   const desktopWorkflowPath = resolveDesktopWorkflowPath(repositoryRoot, product).absolute;
   const files = {
     electron: await readFile(new URL("./pack-electron-payload.sh", import.meta.url), "utf8"),
-    mac: await readFile(new URL("./pack-macos.sh", import.meta.url), "utf8"),
-    win: await readFile(new URL("./pack-windows.sh", import.meta.url), "utf8"),
     nats: await readFile(new URL("./embedded-nats.mjs", import.meta.url), "utf8"),
     pgvectorWin: await readFile(new URL("./build-pgvector-win.ps1", import.meta.url), "utf8"),
     desktopWorkflow: await readFile(desktopWorkflowPath, "utf8"),
-    legacyWorkflow: await readFile(new URL("../.github/workflows/pack-self-contained.yml", import.meta.url), "utf8"),
   };
-  for (const name of ["electron", "mac", "win"]) {
-    assert.match(files[name], /source scripts\/release-assets\.sh/);
-    assert.match(files[name], /workloom_fetch_verified/);
-  }
+  assert.match(files.electron, /source scripts\/release-assets\.sh/);
+  assert.match(files.electron, /workloom_fetch_verified/);
   const helper = await readFile(new URL("./release-assets.sh", import.meta.url), "utf8");
   assert.match(helper, /\.part\.\$\$/);
   assert.match(helper, /verify \"\$partial\"/);
@@ -118,11 +112,9 @@ test("every packaging download is wired through the verified fetch boundary", as
   assert.match(files.pgvectorWin, /\$ActualPgvectorCommit -ne \$PgvectorCommit/);
   assert.doesNotMatch(files.pgvectorWin, /foreach \(\$pkg|git clone --depth 1 --branch/);
   assert.match(files.electron, /verify-windows-pg-provenance vendor\/pg-win\/WORKLOOM-PROVENANCE\.txt/);
-  assert.match(files.win, /verify-windows-pg-provenance vendor\/pg-win\/WORKLOOM-PROVENANCE\.txt/);
-  for (const name of ["desktopWorkflow", "legacyWorkflow"]) {
-    assert.match(files[name], /runs-on: windows-2022/);
-    assert.doesNotMatch(files[name], /runs-on: windows-latest/);
-  }
+  assert.match(files.electron, /verify-windows-pg-provenance "\$PV\/WORKLOOM-PROVENANCE\.txt"/);
+  assert.match(files.desktopWorkflow, /runs-on: windows-2022/);
+  assert.doesNotMatch(files.desktopWorkflow, /runs-on: windows-latest/);
   for (const [name, source] of Object.entries(files)) {
     assert.doesNotMatch(source, /curl[^\n]+-o[^\n]+(?:node-|Postgres-|nats-server|nats\.(?:zip|tgz)|pg\.dmg)/, `${name} bypasses verified fetch`);
   }

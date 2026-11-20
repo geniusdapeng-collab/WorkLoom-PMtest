@@ -609,9 +609,7 @@ test("v20 scope 明确保护产品身份、仓级发布器、桌面发布封口�
     "scripts/release-publisher-policy.test.mjs",
   ]) assert.ok(scope.exclude.includes(industryCoupled), `${industryCoupled} 必须保留在基座仓`);
   assert.ok(!scope.exclude.includes("scripts/desktop-workflow-path.mjs"), "仓级 workflow 兼容解析器必须随 base-sync 下发");
-  for (const packer of ["scripts/pack-electron-payload.sh", "scripts/pack-windows.sh", "scripts/pack-macos.sh"]) {
-    assert.ok(!scope.exclude.includes(packer), `${packer} 必须作为同一公共装配能力下发`);
-  }
+  assert.ok(!scope.exclude.includes("scripts/pack-electron-payload.sh"), "Electron 载荷装配器必须作为公共能力下发");
   assert.ok(!scope.exclude.includes("scripts/release-assets.test.mjs"), "共享发行来源门禁必须随 base-sync 下发");
   assert.ok(!scope.exclude.includes("scripts/verify-product-content.mjs"), "共享产品门禁必须随 base-sync 下发");
   assert.ok(!scope.exclude.includes("scripts/generate-client-projections.mts"), "客户端投影生成器必须随 base-sync 下发");

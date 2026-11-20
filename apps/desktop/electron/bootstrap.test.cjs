@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { spawnSync } = require("node:child_process");
 const { describe, it } = require("node:test");
 const {
   bootstrap,
@@ -24,7 +25,6 @@ const {
   renderStrictPgHba,
   enforceStrictPgHba,
   validateDatabaseHelper,
-  openExternalUrl,
   acquireBootstrapLock,
   tarExtractionPlan,
 } = require("./bootstrap.cjs");
@@ -152,6 +152,33 @@ describe("桌面载荷原子装配", () => {
         /载荷版本标记缺失/u,
       );
       assert.equal(fs.existsSync(path.join(supportDir, "runtime")), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("旧缓存提前写入版本号后中断解压，重启重新提取并暂存完整载荷", async () => {
+    const { root, sourceRoot, supportDir } = fixture("2.0.0", false);
+    const archiveFile = path.join(root, "payload.tar.gz");
+    const cacheDir = path.join(supportDir, ".payload-cache");
+    try {
+      fs.writeFileSync(path.join(root, "PAYLOAD_VERSION"), "2.0.0\n");
+      fs.writeFileSync(path.join(sourceRoot, "PAYLOAD_VERSION"), "2.0.0\n");
+      const archived = spawnSync("tar", ["-czf", archiveFile, "-C", sourceRoot, "."], { encoding: "utf8" });
+      assert.equal(archived.status, 0, archived.stderr || archived.error?.message);
+      fs.mkdirSync(path.join(cacheDir, "runtime"), { recursive: true });
+      fs.writeFileSync(path.join(cacheDir, "PAYLOAD_VERSION"), "2.0.0\n");
+      fs.writeFileSync(path.join(cacheDir, "runtime", "VERSION"), "2.0.0\n");
+      fs.writeFileSync(path.join(supportDir, "VERSION"), "2.0.0\n");
+      await assert.rejects(bootstrap({ resourcesDir: root, supportDir, smoke: true, failAt: "after-stage" }), /安装故障注入：after-stage/u);
+      assert.equal(fs.readFileSync(path.join(cacheDir, "runtime", "payload.txt"), "utf8"), "runtime-2.0.0");
+      assert.equal(fs.readFileSync(path.join(cacheDir, ".extraction-complete"), "utf8"), "2.0.0\n");
+      assert.equal(fs.existsSync(path.join(supportDir, "runtime")), false);
+      assert.equal(fs.existsSync(path.join(supportDir, ".bootstrap-lock")), false);
+      fs.unlinkSync(path.join(cacheDir, "runtime", "payload.txt"));
+      fs.writeFileSync(path.join(cacheDir, "runtime", "cache-still-reused.txt"), "complete");
+      await assert.rejects(bootstrap({ resourcesDir: root, supportDir, smoke: true, failAt: "after-stage" }), /安装故障注入：after-stage/u);
+      assert.equal(fs.readFileSync(path.join(cacheDir, "runtime", "cache-still-reused.txt"), "utf8"), "complete");
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -535,7 +562,7 @@ describe("桌面 PostgreSQL 凭据状态与 SCRAM 围栏", () => {
   });
 });
 
-describe("应急浏览器壳与正式 Electron 共用安全引导", () => {
+describe("Electron 安全引导与独立验收入口", () => {
   it("原子单实例锁拒绝活进程，并可接管死进程遗留锁", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "workloom-bootstrap-lock-"));
     let byte = 1;
@@ -564,49 +591,25 @@ describe("应急浏览器壳与正式 Electron 共用安全引导", () => {
     }
   });
 
-  it("两端旧启动器只委托 bootstrap，不再维护 trust/helper 分支", () => {
-    const macLauncher = fs.readFileSync(
-      path.join(__dirname, "../WorkLoom.app/Contents/MacOS/WorkLoom"),
-      "utf8",
-    );
-    const windowsLauncher = fs.readFileSync(
-      path.join(__dirname, "../windows/WorkLoom.bat"),
-      "utf8",
-    );
-    for (const source of [macLauncher, windowsLauncher]) {
-      assert.match(source, /bootstrap\.cjs/u);
-      assert.doesNotMatch(source, /--auth(?:=|\s+)trust|desktop-bootstrap-db\.mjs/iu);
+  it("独立启动缺少 --smoke 时在创建支持目录之前退出", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "workloom-bootstrap-cli-"));
+    const support = path.join(root, "must-not-create");
+    try {
+      const result = spawnSync(process.execPath, [path.join(__dirname, "bootstrap.cjs"), "--support", support],
+        { encoding: "utf8", timeout: 5_000 });
+      assert.ifError(result.error);
+      assert.equal(result.status, 2);
+      assert.match(result.stderr, /--smoke/u);
+      assert.equal(fs.existsSync(support), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
     }
-    assert.match(windowsLauncher, /set "RESOURCES=%~dp0\."/u);
-    assert.doesNotMatch(windowsLauncher, /set "RESOURCES=%~dp0"/u);
-
-    const macPack = fs.readFileSync(path.join(__dirname, "../../../scripts/pack-macos.sh"), "utf8");
-    const windowsPack = fs.readFileSync(path.join(__dirname, "../../../scripts/pack-windows.sh"), "utf8");
-    assert.match(macPack, /electron\/bootstrap\.cjs[^\n]+Resources\/bootstrap\.cjs/u);
-    assert.match(windowsPack, /electron\/bootstrap\.cjs[^\n]+PKG\/bootstrap\.cjs/u);
-    assert.match(macPack, /Resources\/pg\/bin/u);
-    assert.doesNotMatch(macPack, /Resources\/pg\/Postgres\.app/u);
-  });
-
-  it("浏览器壳按平台使用无 shell 拼接的固定打开命令", () => {
-    const calls = [];
-    const spawnCommand = (command, args, options) => {
-      calls.push({ command, args, options });
-      return { on() {}, unref() {} };
-    };
-    openExternalUrl("http://127.0.0.1:5173", { platform: "darwin", spawnCommand });
-    openExternalUrl("http://127.0.0.1:5173", { platform: "win32", spawnCommand });
-    assert.deepEqual(calls[0].command, "open");
-    assert.deepEqual(calls[0].args, ["http://127.0.0.1:5173"]);
-    assert.deepEqual(calls[1].command, "cmd.exe");
-    assert.deepEqual(calls[1].args, ["/d", "/s", "/c", "start", "", "http://127.0.0.1:5173"]);
-    assert.equal(calls.every(({ options }) => options.detached && options.stdio === "ignore"), true);
   });
 
   it("CLI 在启动前注册 INT/TERM/HUP，并用 AbortSignal 驱动初始化清理", () => {
     const source = fs.readFileSync(path.join(__dirname, "bootstrap.cjs"), "utf8");
     const signalRegistration = source.indexOf('for (const signalName of ["SIGINT", "SIGTERM", "SIGHUP"])');
-    const invocation = source.indexOf("bootstrap({ resourcesDir, supportDir, smoke, signal: abortController.signal })");
+    const invocation = source.indexOf("bootstrap({ resourcesDir, supportDir, smoke: true, signal: abortController.signal })");
     assert.ok(signalRegistration > 0 && signalRegistration < invocation);
     assert.match(source, /if \(abortSignal\?\.aborted\) throw new Error/u);
   });
