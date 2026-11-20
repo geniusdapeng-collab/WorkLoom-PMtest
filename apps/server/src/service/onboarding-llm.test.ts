@@ -12,8 +12,15 @@ const connection = {
   provider: "deepseek",
   baseUrl: "https://api.deepseek.com",
   model: "deepseek-flash",
-  apiKey: "test-provider-key",
+  apiKey: "mock-provider-key",
 };
+
+function fixtureEndpointWithUserInfo(baseUrl: string): string {
+  const endpoint = new URL(baseUrl);
+  endpoint.username = "fixture-user";
+  endpoint.password = "mock-test-only";
+  return endpoint.href;
+}
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -21,7 +28,7 @@ describe("当前模型的公开连接状态", () => {
   it("使用 PM DeepSeek 的默认端点、模型与凭据优先级", () => {
     const env = { LLM_PROVIDER: "deepseek", LLM_API_KEY: "", DEEPSEEK_API_KEY: connection.apiKey };
     expect(currentLlmConnection(env)).toEqual(connection);
-    expect(currentLlmConnection({ ...env, LLM_API_KEY: "explicit-test-key" }).apiKey).toBe("explicit-test-key");
+    expect(currentLlmConnection({ ...env, LLM_API_KEY: "mock-explicit-key" }).apiKey).toBe("mock-explicit-key");
     expect(currentLlmConnection({ ...env, LLM_PROVIDER: "custom" }).apiKey).toBe("");
     expect(llmConnectionStatus(connection)).toEqual({
       provider: "deepseek", baseUrl: connection.baseUrl, model: "deepseek-flash",
@@ -37,7 +44,7 @@ describe("当前模型的公开连接状态", () => {
     "https://api.deepseek.com.example.test",
     "https://api.deepseek.com:8443",
     "https://api.deepseek.com/v1/other",
-    "https://fixture-user:fixture-password@api.deepseek.com",
+    fixtureEndpointWithUserInfo("https://api.deepseek.com"),
     "https://api.deepseek.com?token=fixture",
     "https://api.deepseek.com#fixture",
   ])("禁止把已存密钥用于非受支持的服务地址 %s", (baseUrl) => {
@@ -46,7 +53,7 @@ describe("当前模型的公开连接状态", () => {
 
   it("只公开无凭据的地址，并保留自定义无密钥网关的配置状态", () => {
     const fixtures = {
-      ...connection, baseUrl: "https://user:password@gateway.example.test",
+      ...connection, baseUrl: fixtureEndpointWithUserInfo("https://gateway.example.test"),
     };
     expect(llmConnectionStatus(fixtures)).toMatchObject({ baseUrl: "", configured: false });
     expect(canVerifySavedDeepSeek({ ...connection, baseUrl: "https://api.deepseek.com/v1/" })).toBe(true);
@@ -57,9 +64,9 @@ describe("当前模型的公开连接状态", () => {
   it("模型、地址、提供方或凭据变化使在途验证过期", () => {
     expect(sameLlmConnection(connection, { ...connection })).toBe(true);
     for (const change of [
-      { provider: "custom" }, { baseUrl: `${connection.baseUrl}/v1` }, { model: "legacy-model" }, { apiKey: "rotated-key" },
+      { provider: "custom" }, { baseUrl: `${connection.baseUrl}/v1` }, { model: "legacy-model" }, { apiKey: "mock-rotated-key" },
     ]) expect(sameLlmConnection(connection, { ...connection, ...change })).toBe(false);
-    expect(llmCredentialFingerprint("rotated-key")).not.toBe(llmCredentialFingerprint(connection.apiKey));
+    expect(llmCredentialFingerprint("mock-rotated-key")).not.toBe(llmCredentialFingerprint(connection.apiKey));
   });
 });
 
