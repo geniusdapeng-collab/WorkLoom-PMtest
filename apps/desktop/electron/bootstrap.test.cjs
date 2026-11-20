@@ -251,14 +251,6 @@ describe("桌面载荷原子装配", () => {
     }
     assert.doesNotMatch(mainSource, /textContent\?\.includes\(['"](?:跳过仪式|进入系统)/u);
   });
-
-  it("默认 DSH 渲染冒烟与 legacy 回滚入口各有独立可观察标记", () => {
-    const mainSource = fs.readFileSync(path.join(__dirname, "main.cjs"), "utf8");
-    assert.match(mainSource, /runDshRenderSmoke/u);
-    assert.match(mainSource, /data-workloom-pm/);
-    assert.match(mainSource, /CLIENT_MODE === "legacy" \? "\/development"/u);
-    assert.match(mainSource, /title === "WorkLoom PM"/u);
-  });
 });
 
 describe("桌面 PostgreSQL 实例归属与端口契约", () => {

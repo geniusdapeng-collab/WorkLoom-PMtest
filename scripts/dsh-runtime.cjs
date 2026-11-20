@@ -1,226 +1,32 @@
-/**
- * Shared desktop integration for the official DeepSeek Harness client.
- *
- * This module is dependency-free because both the source launcher and the
- * packaged Electron bootstrap use it before the product server starts.
- */
+/** Boot an isolated, application-owned profile with the official DSH Desktop context. */
 "use strict";
 
-const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { createRequire } = require("node:module");
+const { pathToFileURL } = require("node:url");
 
-const CLIENT_MODES = new Set(["dsh", "legacy"]);
-const DSH_ENV_KEYS = new Set([
-  "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE",
-  "TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "WINDIR", "COMSPEC",
-  "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
-  "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
-  "DEEPSEEK_API_KEY", "WORKLOOM_DSH_MODEL",
-]);
-
-function resolveClientMode(environment = process.env) {
-  const mode = environment.WORKLOOM_CLIENT?.trim() || "dsh";
-  if (!CLIENT_MODES.has(mode)) {
-    throw new Error("WORKLOOM_CLIENT 只允许 dsh 或 legacy");
-  }
-  return mode;
-}
-
-function readProductIdentity(root) {
-  const manifestFile = path.join(root, "product.manifest.json");
-  let manifest;
-  try {
-    manifest = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
-  } catch {
-    throw new Error("product.manifest.json 无法读取或解析");
-  }
-  for (const [key, value] of [
-    ["productId", manifest.productId],
-    ["displayName", manifest.displayName],
-    ["defaultBundle", manifest.defaultBundle],
-    ["demoWorkspaceSlug", manifest.demoWorkspaceSlug],
-    ["demoMemberNo", manifest.demoMemberNo],
-  ]) {
-    if (typeof value !== "string" || !value.trim()) throw new Error(`product.manifest.json 缺少 ${key}`);
-  }
-  return {
-    productId: manifest.productId,
-    displayName: manifest.displayName,
-    defaultBundle: manifest.defaultBundle,
-    workspaceSlug: manifest.demoWorkspaceSlug,
-    memberNo: manifest.demoMemberNo,
-  };
-}
-
-function createBridgeToken(randomBytes = crypto.randomBytes) {
-  const token = randomBytes(32).toString("base64url");
-  if (!/^[A-Za-z0-9_-]{32,200}$/u.test(token)) throw new Error("无法生成有效的 PM 桌面桥接能力");
-  return token;
-}
-
-function resolvePackageRoot(root, packageName) {
-  const requireFromServer = createRequire(path.join(root, "apps", "server", "package.json"));
-  try {
-    return path.dirname(requireFromServer.resolve(`${packageName}/package.json`));
-  } catch (error) {
-    throw new Error(`缺少 ${packageName}，请先完成 pnpm install（${error instanceof Error ? error.message : String(error)}）`);
-  }
-}
-
-function resolveDshCli(root) {
-  const packageRoot = resolvePackageRoot(root, "@deepseek-ai/dsh");
-  let packageJson;
-  try {
-    packageJson = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
-  } catch {
-    throw new Error("DeepSeek Harness package.json 无法读取");
-  }
-  if (packageJson.version !== "0.2.1-rc.2") {
-    throw new Error(`DeepSeek Harness 版本必须锁定为 0.2.1-rc.2，实际为 ${packageJson.version ?? "未知"}`);
-  }
-  const cli = path.join(packageRoot, "lib", "bin.js");
-  if (!fs.existsSync(cli)) throw new Error("DeepSeek Harness CLI 入口缺失");
-  return { packageRoot, cli, version: packageJson.version };
-}
-
-function resolvePluginEntry(root) {
-  const packageRoot = path.join(root, "packages", "pm-dsh-client");
-  const packageJsonFile = path.join(packageRoot, "package.json");
-  const entry = path.join(packageRoot, "lib", "index.js");
-  const client = path.join(packageRoot, "lib", "client.js");
-  if (!fs.existsSync(packageJsonFile) || !fs.existsSync(entry) || !fs.existsSync(client)) {
-    throw new Error("WorkLoom PM DSH 插件载荷不完整");
-  }
-  let manifest;
-  try {
-    manifest = JSON.parse(fs.readFileSync(packageJsonFile, "utf8"));
-  } catch {
-    throw new Error("WorkLoom PM DSH 插件 package.json 无法解析");
-  }
-  if (manifest.name !== "@workloom/dsh-pm-client" || manifest.dsh?.client?.platform !== "web") {
-    throw new Error("WorkLoom PM DSH 插件清单不符合 browser roster 合同");
-  }
-  return { packageRoot, entry, manifest };
-}
-
-function patchText(pluginEntry) {
-  return [
-    "# Generated for this launch only. It contains no credentials.",
-    "- id: ui-brand-official",
-    "  disabled: true",
-    "",
-    // PM dispatch owns execution. The conversation host only needs the PM tools.
-    ...["preset-cordis", "preset-minimal", "preset-ptc", "terminal-controller",
-      "ui-sidebar-terminal", "ui-agent-preset"].flatMap((id) => [
-      `- id: ${id}`, "  disabled: true", "",
-    ]),
-    "- id: preset-standard",
-    "  config:",
-    "    id: standard",
-    "    order: 1",
-    "    plugins:",
-    "      - id: persona",
-    "        name: '@deepseek-ai/dsh-persona'",
-    "        config:",
-    "          prefix: 你是 WorkLoom PM 的产品研发入口。",
-    "          includeRuntimeContext: false",
-    "      - id: tool-ask-user",
-    "        name: '@deepseek-ai/dsh-tool-ask-user'",
-    "",
-    "- id: agent-default-model",
-    "  config:",
-    "    provider: deepseek-official",
-    "    model: !!js process.env.WORKLOOM_DSH_MODEL || 'deepseek-flash'",
-    "",
-    "- id: web-runtime",
-    "  config:",
-    "    openBrowser: false",
-    "    printUrl: false",
-    "    surfaceContext: false",
-    "",
-    "- insert:",
-    "    - id: workloom-pm-client",
-    `      name: ${JSON.stringify(pluginEntry)}`,
-    "",
-  ].join("\n");
-}
-
-function atomicWrite(file, content, mode) {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temporary = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
-  try {
-    fs.writeFileSync(temporary, content, { mode });
-    fs.renameSync(temporary, file);
-  } finally {
-    fs.rmSync(temporary, { force: true });
-  }
-}
-
-function prepareDshRuntime({ root, supportDir }) {
-  const product = readProductIdentity(root);
-  const dsh = resolveDshCli(root);
-  const plugin = resolvePluginEntry(root);
-  const stateDir = path.join(supportDir, ".workloom-dsh");
-  const dshHome = path.join(stateDir, "home");
-  const workspaceDir = path.join(stateDir, "workspace");
-  const patchFile = path.join(stateDir, "pmtest.patch.yml");
-  fs.mkdirSync(dshHome, { recursive: true, mode: 0o700 });
-  fs.mkdirSync(workspaceDir, { recursive: true, mode: 0o700 });
-  atomicWrite(patchFile, patchText(plugin.entry), 0o600);
-  return {
-    product,
-    dshCli: dsh.cli,
-    dshVersion: dsh.version,
-    pluginEntry: plugin.entry,
-    dshHome,
-    workspaceDir,
-    patchFile,
-    stateDir,
-  };
-}
-
-function dshEnvironment(baseEnvironment, {
-  serverPort,
-  token,
-  dshHome,
-}) {
-  if (!Number.isInteger(serverPort) || serverPort < 1 || serverPort > 65535) throw new Error("PM serverPort 无效");
-  if (!/^[A-Za-z0-9_-]{32,200}$/u.test(token)) throw new Error("PM DSH bridge token 无效");
-  const environment = Object.fromEntries(Object.entries(baseEnvironment)
-    .filter(([key]) => DSH_ENV_KEYS.has(key.toUpperCase())));
-  if (!environment.DEEPSEEK_API_KEY?.trim() && baseEnvironment.LLM_API_KEY?.trim()
-    && (!baseEnvironment.LLM_PROVIDER || baseEnvironment.LLM_PROVIDER === "deepseek")) {
-    environment.DEEPSEEK_API_KEY = baseEnvironment.LLM_API_KEY;
-  }
-  return {
-    ...environment,
-    NODE_ENV: "production",
-    DSH_HOME: dshHome,
-    DSH_TELEMETRY_DISABLED: "1",
-    WORKLOOM_PM_API_URL: `http://127.0.0.1:${serverPort}`,
-    PM_DSH_BRIDGE_TOKEN: token,
-  };
-}
-
-function dshArgs({ cli, port, patchFile, open = false }) {
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("DSH web port 无效");
-  return [
-    cli,
-    "--patch", patchFile,
-    "--profile", "web",
-    "--host", "127.0.0.1",
-    "--port", String(port),
-    ...(open ? [] : ["--no-open"]),
-  ];
-}
+const READY_EVENT = "workloom:dsh-ready";
+const PROFILE = "desktop";
+const PRIVATE_TRANSPORT_PATCH = `- id: web-runtime
+  config:
+    openBrowser: false
+    printUrl: false
+    surfaceContext: false
+- id: desktop-product-telemetry
+  disabled: true
+- id: product-analytics
+  disabled: true
+`;
 
 function dshReadyUrl(message, port) {
-  if (message?.type !== "workloom:dsh-ready" || typeof message.url !== "string") return null;
+  if (message?.type !== READY_EVENT || message.profile !== PROFILE || typeof message.url !== "string") return null;
   try {
     const url = new URL(message.url);
-    if (url.origin !== `http://127.0.0.1:${port}` || url.pathname !== "/" || url.username
+    const expectedOrigin = port === 0
+      ? url.protocol === "http:" && url.hostname === "127.0.0.1" && Number(url.port) > 0
+      : url.origin === `http://127.0.0.1:${port}`;
+    if (!expectedOrigin || url.pathname !== "/" || url.username
       || url.password || url.hash || !/^\?token=[A-Za-z0-9_-]{32,200}$/u.test(url.search)) return null;
     return url.href;
   } catch {
@@ -258,16 +64,71 @@ function waitForDshUrl(child, port, timeoutMs, signal) {
   });
 }
 
-module.exports = {
-  resolveClientMode,
-  readProductIdentity,
-  createBridgeToken,
-  resolveDshCli,
-  resolvePluginEntry,
-  prepareDshRuntime,
-  dshEnvironment,
-  dshArgs,
-  dshReadyUrl,
-  waitForDshUrl,
-  patchText,
-};
+async function runDesktopHost() {
+  if (typeof process.send !== "function") throw new Error("DSH Desktop 宿主需要桌面启动器的 IPC 通道");
+  const [cli, projectDir, portText, patchFile] = process.argv.slice(2);
+  const port = Number(portText);
+  if (![cli, projectDir, patchFile].every((file) => typeof file === "string" && path.isAbsolute(file))
+    || !Number.isInteger(port) || port < 0 || port > 65535
+    || projectDir !== path.join(process.env.DSH_HOME ?? "", "profiles", PROFILE)) {
+    throw new Error("DSH Desktop 宿主未收到有效的本地配置");
+  }
+
+  // Upstream Electron initializes a private directory with the Web bundle pair,
+  // then passes the reserved Desktop context to the official profile runner.
+  const installAnchor = path.join(path.dirname(cli), "..", "package.json");
+  const resolve = createRequire(installAnchor);
+  const { PROFILE_TEMPLATES, initProfile, loadProfileDirectory } = await import(
+    pathToFileURL(resolve.resolve("@deepseek-ai/dsh-app-boot")).href
+  );
+  const { createLaunchEnvironmentSnapshot } = await import(
+    pathToFileURL(resolve.resolve("@deepseek-ai/dsh-launch-environment")).href
+  );
+  const { runProfile } = await import(pathToFileURL(resolve.resolve("@deepseek-ai/dsh/profile-boot")).href);
+  const bundles = PROFILE_TEMPLATES.web.bundles;
+  initProfile(projectDir, bundles);
+  const profile = loadProfileDirectory("WorkLoom PM", projectDir, installAnchor, { userLayer: false });
+  if (profile.skippedBundles.length || profile.layers.map((layer) => layer.packageName).join(",") !== bundles.join(",")) {
+    throw new Error("DSH Desktop 宿主的官方组件未完整装配");
+  }
+  const transportPatch = path.join(projectDir, "workloom-private-transport.patch.yml");
+  fs.writeFileSync(transportPatch, PRIVATE_TRANSPORT_PATCH, { mode: 0o600 });
+  const running = runProfile({
+    environment: createLaunchEnvironmentSnapshot([{ source: "process", values: process.env }]),
+    profile: PROFILE,
+    resolvedProfile: { profile, installAnchor },
+    patchFiles: [patchFile, transportPatch],
+    args: ["--no-open", "--host", "127.0.0.1", "--port", String(port)],
+  });
+  const stop = () => {
+    void running.then(({ shutdown }) => shutdown.shutdown(0)).catch(() => { process.exitCode = 1; });
+  };
+  process.once("disconnect", stop);
+  const { ctx } = await running;
+  const contextName = ctx.get("profileContext")?.name;
+  const boundPort = ctx.webServer.port;
+  if (contextName !== PROFILE || !Number.isInteger(boundPort) || boundPort < 1 || (port !== 0 && boundPort !== port)) {
+    stop();
+    throw new Error("DSH 宿主就绪状态与已声明的 Desktop 配置不符");
+  }
+  if (process.connected) {
+    const url = ctx.connection.authenticatedUrl(`http://127.0.0.1:${boundPort}`);
+    process.send({ type: READY_EVENT, profile: contextName, url }, (error) => {
+      if (error) stop();
+    });
+  }
+}
+
+if (require.main === module) {
+  void runDesktopHost().catch((error) => {
+    let message = error instanceof Error ? error.message : "未知错误";
+    const proxyKey = process.env.WORKLOOM_DSH_PROXY_KEY;
+    if (proxyKey) message = message.replaceAll(proxyKey, "[REDACTED]");
+    message = message.replace(/([?&]token=)[^\s&]+/gu, "$1[REDACTED]");
+    console.error(`DSH Desktop 宿主启动失败：${message.slice(0, 2048)}`);
+    process.exitCode = 1;
+    if (process.connected) process.disconnect();
+  });
+}
+
+module.exports = { dshReadyUrl, waitForDshUrl };

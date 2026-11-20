@@ -44,9 +44,7 @@ AI-PM 工作区另有一套受行业约束的语义路由：需求、竞品、�
 
 ## 新增的 PM 团队层
 
-默认 DSH 桌面入口通过回环 `/api/pm-dsh` 提交完整目标；legacy PC `/development` 的团队页面继续使用 `/api/pm`。两个入口消费同一个 `PmTeamService`。指定 employee 时跳过收费规划，形成该员工的单节点；未指定时由 `chief-pm` 生成岗位 DAG。它是独立入口，不会默默把旧 IM 的所有聊天任务改为多员工自治。[A]
-
-DSH 适配包 `packages/pm-dsh-client/` 注册创建、读取、等待、取消、恢复与产物读取工具。启动器每次启动生成 32 字节随机能力，只注入 PM server 和 DSH 宿主进程；HTTP 头 `x-workloom-pm-bridge` 使用定时安全比较，桥仅允许在本机回环地址绑定。能力值不进入模型提示、工具参数、工具结果、会话事件或仓库文件。桥仍实时解析成员、套餐、活动 Bundle 与动作授权，未因“本机”而绕过 PM 开发场域权限。[A]
+PC `/development` 的团队页面通过 `/api/pm` 提交完整目标。指定 employee 时跳过收费规划，形成该员工的单节点；未指定时由 `chief-pm` 生成岗位 DAG。它是独立入口，不会默默把旧 IM 的所有聊天任务改为多员工自治。[A]
 
 ```mermaid
 flowchart TD

@@ -50,6 +50,7 @@ function runRow(row: Row): PmRun {
   };
 }
 function taskRow(row: Row): PmTask {
+  const adapter = (row.adapter_receipt as Record<string, unknown> | null)?.adapter;
   return {
     id: String(row.id), runId: String(row.run_id), presetKey: String(row.preset_key), goal: String(row.goal),
     dependsOn: row.depends_on as string[], acceptance: row.acceptance as string[], outputRefs: row.output_refs as string[],
@@ -58,7 +59,7 @@ function taskRow(row: Row): PmTask {
     modelId: nullableString(row.model_id), responseId: nullableString(row.response_id), fenceImpacts: row.fence_impacts as RuleImpact[],
     adapterReceipt: row.adapter_receipt as PmTask["adapterReceipt"],
     attemptReceipts: row.attempt_receipts as PmTask["attemptReceipts"],
-    executionBackend: row.adapter_receipt && (row.adapter_receipt as Record<string, unknown>).adapter === "deepseek-harness-headless"
+    executionBackend: adapter === "deepseek-harness-headless" || adapter === "deepseek-harness-desktop"
       ? "deepseek-harness" : row.model_id ? "deepseek-completion" : null,
     startedAt: optionalStamp(row.started_at), finishedAt: optionalStamp(row.finished_at),
   };

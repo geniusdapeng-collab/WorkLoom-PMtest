@@ -1,24 +1,10 @@
 # Changelog
 
-## [0.2.0] - 2026-11-19 · DeepSeek Harness 桌面工作台
+## 0.2.0
 
-### 新增
-
-- 默认桌面入口切换为 DeepSeek Harness 同源会话工作台，移除用户进入 PM 团队前必须理解多页经营导航的负担。
-- 新增 `@workloom/dsh-pm-client`：在 DSH 中注册 PM 创建、查询、等待、取消、恢复和产物读取工具，并提供 WorkLoom PM 品牌与起始提示。
-- 新增 `/api/pm-dsh` 回环桥。能力值每次启动随机生成，只通过短生命周期进程环境传递，不进入模型提示、工具参数、会话日志或仓库文件。
-- 新增 DSH 预置打包、启动补丁生成、legacy 回滚开关和 packaged DSH 渲染冒烟。
-
-### 变更
-
-- 产品首屏从 `/development` 改为 DSH `/`；原 WorkLoom 多页工作台保留为 `WORKLOOM_CLIENT=legacy`。
-- 官方 DSH 上游开发源码核对到 `dsh-v0.2.2-rc.5`；本版运行依赖仍锁定已过 PM 门禁的 `0.2.1-rc.2`，并在同一提交中新增 UI 适配和回归证据。
-
-### 验证
-
-- DSH 插件工具、品牌和回滚模式单元测试。
-- `/api/pm-dsh` 能力鉴权、派发权限和产物路径边界测试。
-- 本机真实 DSH 页面加载、WorkLoom PM 品牌替换、文档标题与工作区首屏截图。
+- 桌面客户端继续使用 WorkLoom 开发场域、导航、DevFabric、任务与产物交互。
+- 桌面研发任务使用 DeepSeek Harness 官方 Desktop profile。既有 PM 研发围栏、逐请求预算、文件核验及产物回执贯穿新执行链。
+- 桌面执行回执记录 profile、会话 ID、模型用量及会话日志摘要。原有 headless 回执继续可以读取。
 
 ## 2026-10-30
 

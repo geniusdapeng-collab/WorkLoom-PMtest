@@ -2,7 +2,7 @@
   "name": "workloom-pmtest",
   "productName": "WorkLoom PMtest",
   "workloomPortOffset": 231,
-  "workloomStartPath": "/",
+  "workloomStartPath": "/development",
   "version": "0.2.0",
   "private": true,
   "type": "module",

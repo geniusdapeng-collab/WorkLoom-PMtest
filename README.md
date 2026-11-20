@@ -6,18 +6,15 @@
 
 你提出目标和边界，产品经理组织需求、研发、质量与交付；系统不只回答“做了什么”，还保留谁做了什么、用了什么材料、产出什么文件、跑过哪些检查，以及哪些事情仍然没有验证。
 
-[English](README_EN.md) · [核心能力](#核心能力从一句话到可验收交付) · [DSH 客户端迁移](docs/DSH-CLIENT-MIGRATION.md) · [云端工作台](docs/ASSISTANT-WORKBENCH.md) · [交付架构](docs/PM-DELIVERY.md) · [218 项真实评测](docs/DEEPSEEK-218-EVALUATION.md) · [Apache-2.0](LICENSE)
+[English](README_EN.md) · [核心能力](#核心能力从一句话到可验收交付) · [云端工作台](docs/ASSISTANT-WORKBENCH.md) · [交付架构](docs/PM-DELIVERY.md) · [218 项真实评测](docs/DEEPSEEK-218-EVALUATION.md) · [Apache-2.0](LICENSE)
 
 </div>
 
 WorkLoom PMtest 面向产品负责人、创业者和小型研发团队。它不是只会写一段文案或代码的单点助手，而是一套把 **目标澄清、岗位协作、受限执行、质量验证和发布门禁** 串成同一条链路的 AI 产品研发系统。
 
-正式桌面入口已改为 **DeepSeek Harness 开源桌面同源的会话工作台**。用户在一个输入框提出目标，DSH 通过本机随机能力桥调用 PM 团队；PM 继续负责岗位 DAG、受限执行、产物哈希、验证与交付回执。原有 PC「开发场域」`/development` 和 DevFabric 页面保留为显式回滚模式，不再占据默认首屏。
+正式工作入口是 PC 工作台的 **「开发场域」`/development`**：PM 团队视图用于目标、任务图、执行与产物；原有 DevFabric 开发场域保留为可切换的工作模式。桌面客户端与浏览器开发入口共享服务端。
 
-```bash
-pnpm app                 # 默认：DeepSeek Harness 桌面工作台
-WORKLOOM_CLIENT=legacy pnpm app   # 回滚：原 WorkLoom 多页客户端
-```
+桌面版沿用 WorkLoom 的页面、导航和操作。研发岗位需要读写任务文件时，桌面启动器选择官方 DeepSeek Harness 的 Desktop profile，会话、工具调用、模型用量和产物仍从原 WorkLoom 工作台回读。 [桌面内核接入与验收](docs/DSH-CLIENT-MIGRATION.md)
 
 本仓的交付证据以 [PM-EVALUATION.md](docs/PM-EVALUATION.md) 中标明的源码、模型、样本与实际结果为准。岗位定义、技能文件、演示种子和历史测试徽章都不能代替一次真实交付；本 README 不把它们换算成成功率，也不宣称已有签名安装包。
 
@@ -87,8 +84,7 @@ flowchart TD
 
 - **意图模式**决定这一句话是问答、单员工任务还是需要持续推进的目标。通用路由位于 [`packages/runtime/src/intent.ts`](packages/runtime/src/intent.ts)。
 - **原 Quest**拆分的是同一个员工执行的步骤；它本身不能作为“已经具备跨员工团队 DAG”的证据。
-- **DSH 产品入口**位于 [`packages/pm-dsh-client/`](packages/pm-dsh-client/)。它向 DSH 注册 `pm_create_mission`、`pm_wait_mission`、`pm_read_artifact` 等工具，并把官方品牌位替换为 WorkLoom PM；工具经由仅回环、随每次启动随机生成的能力访问 PM 服务，不在模型上下文或会话日志中保存能力值。
-- **PM 团队层**位于 [`apps/server/src/industry/ai-pm/`](apps/server/src/industry/ai-pm/)。独立 `/api/pm-dsh` 本机桥接收完整目标；不指定员工时，产品总监生成受约束的岗位任务图；指定员工时，直接形成该员工的单任务。它没有把旧意图分类器再串行调用一次来假装“经理”。
+- **PM 团队层**位于 [`apps/server/src/industry/ai-pm/`](apps/server/src/industry/ai-pm/)。独立 `/api/pm` 入口接收完整目标；不指定员工时，产品总监生成受约束的岗位任务图；指定员工时，直接形成该员工的单任务。它没有把旧意图分类器再串行调用一次来假装“经理”。
 - **岗位装配**给每个任务注入对应员工的岗位提示、技能正文和已完成依赖的产物。技能是 SOP 与边界说明，**不会因为写在 SKILL.md 中就自动获得网络、数据库或 shell 权限**。
 - **模型与 Harness**执行具体工作。普通岗位使用真实 DeepSeek 生成结构化文件内容；开发总指挥的研发节点使用受限 dsh。Harness 负责模型与工具之间的循环，PM 团队层负责岗位、依赖、预算与交付状态。
 - **完成判定**依赖真实文件、哈希、检查和回执。缺少用量、超时、取消、产物漂移或检查失败不能被记成成功。恢复任务时重新检查已有产物，不能只相信旧状态。
@@ -138,7 +134,7 @@ flowchart TD
 
 搜索与抓取通过显式的 `deepseek_search` / `deepseek_fetch` 函数工具接入 DeepSeek 自营 Search/Fetch API。**支持搜索工具不代表所有请求都自动联网**；岗位需要检索时，必须在允许的工具集合中调用并保留来源。Flash 会忽略 Responses API 原生 `web_search`，因此不能仅添加这个字段就宣称已经检索。[Search & Fetch 文档](https://api-docs.deepseek.com/guides/search/) · [Responses 兼容说明](https://api-docs.deepseek.com/guides/responses_api/)
 
-DeepSeek Harness 既是用户现在看到的桌面会话层，也是研发节点的工具执行循环，不是第二个产品经理。产品与研发执行共同锁定 `@deepseek-ai/dsh@0.2.1-rc.2`；研发节点仍在隔离工作目录内只使用明确允许的文件工具。岗位协作、DAG、产物所有权与最终验收由 PM 团队层维护。
+DeepSeek Harness 是工具执行循环与会话机制，不是第二个产品经理。研发节点锁定 `@deepseek-ai/dsh@0.2.1-rc.2`，在隔离工作目录内使用明确允许的文件工具；宿主机任意命令、生产数据和外部发布不因接入模型而开放。岗位协作、DAG、产物所有权与最终验收由 PM 团队层维护。
 
 **客户端内置模型适配与默认配置，不内置共享明文 API Key。** 真实 Key 由启动进程环境或受控本地密钥管理注入，不进入源码、浏览器资源、README、日志或安装包。
 
@@ -176,20 +172,11 @@ LLM_MODEL=deepseek-flash
 pnpm app:dev
 ```
 
-源码启动器读取根 `.env`，由显式进程环境覆盖。DSH 宿主只接收所需的运行与模型配置，数据库凭据由 PM 服务读取。默认端口由产品清单偏移派生。`pnpm app` 先启动 PM server，再启动官方 DSH Web/桌面前端并由 Electron 打开。`pnpm app:dev` 使用源码编排，`pnpm app --smoke` 验证 PM server、DSH 会话和 Electron 主进程。
+源码启动器读取根 `.env`，由显式进程环境覆盖，统一传给 server、Web 与 Electron；默认端口由产品清单偏移派生。浏览器开发使用 `SERVER_PORT=9018 WEB_PORT=5404 pnpm dev`，进入 `http://localhost:5404/development`；自定义端口时同步调整启动进程变量。`pnpm app` 构建 Web 后打开 Electron，`pnpm app:dev` 使用 HMR，`pnpm app --smoke` 只验证源码服务与主进程，不等于安装包渲染或签名验收。
 
-桌面首屏由受控产品清单的 `desktop.startPath` 指向 DSH `/`，源码与安装包使用同一入口。DSH 会话、工作区和缓存存放在产品独立的 `WORKLOOM_SUPPORT_DIR/.workloom-dsh`；PM 数据库仍保存在原独立目录。回滚模式的 `/development`、PC 工作台、移动 B 端和 C 端文件不会被删除。本产品把 `clients.bPc.secretaryAutoScan` 设为 `false`，当前默认 DSH 入口也不会打开旧经营中心的自动扫描。
+桌面首屏由受控产品清单的 `desktop.startPath` 指向 `/development`，源码与安装包使用同一路由；可用 `WORKLOOM_START_PATH` 显式选择安全的本地路径。原经营首页仍可从导航打开。本产品把 `clients.bPc.secretaryAutoScan` 设为 `false`，停用浏览页面时的秘书自动写入扫描；已有收件箱仍每 20 秒刷新，用户主动发起的助手操作保持可用。
 
-### DSH 适配边界
-
-- 不复制或修改官方 DSH 内核；PM 插件使用 DSH 文档化的工具与 Slot 扩展点。
-- 上游源码下载与审查固定到 `deepseek-ai/deepseek-harness` 的 `dsh-v0.2.2-rc.5`；运行时继续使用本仓已通过 218 项门禁的 `0.2.1-rc.2`，避免在 UI 迁移同一提交中无证据跳版本。
-- DSH 的模型 Key 只从启动进程或受控本地配置读取；PM 桥能力是每次启动生成、仅回环、只在服务端和 DSH 宿主进程内存中的随机值。
-- `WORKLOOM_CLIENT=legacy` 是完整回滚开关；旧页面和 `pnpm dev` 浏览器开发链路继续保留。
-
-独立产品身份为 `workloom-pmtest`，桌面 appId 为 `com.workloom.pmtest`，偏移为 `231`。打包默认端口为 server `9018`、web `5404`、PG `5663`、NATS `4453`。源码数据库使用本机配置的连接串，源码支持目录按 `workloom-pmtest` 隔离，`WORKLOOM_SUPPORT_DIR` 可显式覆盖。
-
-从安装包启动时，应用在自己的支持目录装配运行时和数据库。真实任务需要向应用进程注入 `DEEPSEEK_API_KEY`，也可在首启生成的支持目录 `runtime/.env` 中配置同名变量后重启。在 macOS 使用默认目录时，该文件位于 `~/Library/Application Support/WorkLoom PMtest/runtime/.env`。
+独立产品身份为 `workloom-pmtest`，桌面 appId 为 `com.workloom.pmtest`，偏移为 `231`。打包默认端口为 server `9018`、web `5404`、PG `5663`、NATS `4453`；源码数据库仍以你配置的连接串为准。源码客户端默认支持目录按系统应用目录下的 `workloom-pmtest` 隔离；可用 `WORKLOOM_SUPPORT_DIR` 显式覆盖。安装包首次打开会装配本机运行时和数据库，实际模型任务使用启动环境或应用支持目录 `runtime/.env` 中的 `DEEPSEEK_API_KEY`。
 
 `deploy/linux/` 保留上游 Linux 部署资料供查阅，PMtest 的安装、启动、Nginx、备份、恢复检查和数据库初始化入口均已停用。
 
@@ -245,7 +232,7 @@ pnpm runtime:deps:verify
 下方为继承的基座能力目录，由生成器维护；它描述代码入口，不能当作 PM 真实任务通过率。本产品首次源码启动使用上文的 `pnpm app:dev`；自动块内保留的 `preview:all` 首启提示属于上游快照。修改能力面后运行 `pnpm capabilities` / `pnpm capabilities:check`。
 
 <!-- CAPABILITIES:BEGIN -->
-<!-- 本区块由 scripts/generate-capabilities.mjs 自动生成（2026-11-20），请勿手改；重跑 pnpm capabilities 更新 -->
+<!-- 本区块由 scripts/generate-capabilities.mjs 自动生成（2026-10-29），请勿手改；重跑 pnpm capabilities 更新 -->
 
 ## 🧩 系统能力速览（自动生成 · 与代码同步）
 

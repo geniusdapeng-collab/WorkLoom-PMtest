@@ -7,7 +7,7 @@
  *   ③ NATS JetStream：内嵌 nats-server 用户态拉起（缺失降级 memory，不阻断）
  *   ④ 配置：.env.defaults → .env（首启），JWT_SECRET 随机化
  *   ⑤ 引导：migrate + seed-aipm（幂等，.bootstrapped 哨兵）
- *   ⑥ 服务：PM server + DeepSeek Harness Web/Desktop surface（legacy WorkLoom web 可回退）
+ *   ⑥ 服务：server(8787) + web preview(5173)，健康检查 90s
  *
  * 本文件不依赖 electron——CI 冒烟直接以 Node 运行：
  *   node apps/desktop/electron/bootstrap.cjs --smoke --resources <payload目录> --support <可写目录>
@@ -25,7 +25,6 @@ const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
-const { parseEnv } = require("node:util");
 
 const IS_WIN = process.platform === "win32";
 
@@ -103,14 +102,9 @@ function runToLog(cmd, args, logFile) {
 function spawnLogged(cmd, args, opts, logFile) {
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
   const fd = fs.openSync(logFile, "a");
-  const { ipc = false, ...spawnOptions } = opts;
-  try {
-    const child = spawn(cmd, args, { ...spawnOptions, stdio: ipc ? ["ignore", fd, fd, "ipc"] : ["ignore", fd, fd] });
-    child.on("error", () => {});
-    return child;
-  } finally {
-    fs.closeSync(fd);
-  }
+  const child = spawn(cmd, args, { stdio: ["ignore", fd, fd], ...opts });
+  child.on("error", () => {});
+  return child;
 }
 
 function killTree(child) {
@@ -800,11 +794,7 @@ async function httpOk(url) {
  */
 async function bootstrap(opts) {
   const { resourcesDir, supportDir } = opts;
-  const requestedClientMode = (process.env.WORKLOOM_CLIENT?.trim() || "dsh");
-  if (!["dsh", "legacy"].includes(requestedClientMode)) throw new Error("WORKLOOM_CLIENT 只允许 dsh 或 legacy");
-  const startPath = parseDesktopStartPath(opts.startPath === undefined && process.env.WORKLOOM_START_PATH === undefined
-    ? requestedClientMode === "legacy" ? "/development" : "/"
-    : opts.startPath === undefined ? process.env.WORKLOOM_START_PATH : opts.startPath);
+  const startPath = parseDesktopStartPath(opts.startPath === undefined ? process.env.WORKLOOM_START_PATH : opts.startPath);
   const onStatus = opts.onStatus || (() => {});
   const abortSignal = opts.signal;
   const throwIfAborted = () => {
@@ -940,16 +930,12 @@ async function bootstrap(opts) {
   const TSX_CLI = fs.existsSync(path.join(RUNTIME, "node_modules", "tsx", "dist", "cli.mjs"))
     ? path.join(RUNTIME, "node_modules", "tsx", "dist", "cli.mjs")
     : path.join(RUNTIME, "node_modules", ".bin", "tsx");
-  const DSH_RUNTIME_HELPER = path.join(RUNTIME, "scripts", "dsh-runtime.cjs");
   const VITE_JS = path.join(RUNTIME, "node_modules", "vite", "bin", "vite.js");
   const DB_HELPER = path.join(RUNTIME, "scripts", "desktop-bootstrap-db.mjs");
   if (!fs.existsSync(NODE_BIN)) throw new Error(`载荷不完整：Node 运行时缺失（${NODE_BIN}）`);
   if (!fs.existsSync(TSX_CLI)) throw new Error("载荷不完整：tsx 缺失");
-  if (!fs.existsSync(DSH_RUNTIME_HELPER)) throw new Error("载荷不完整：DSH 桌面集成 helper 缺失");
+  if (!fs.existsSync(VITE_JS)) throw new Error("载荷不完整：vite 缺失");
   if (!fs.existsSync(DB_HELPER)) throw new Error("载荷不完整：数据库安全引导 helper 缺失");
-  const dshRuntime = require(DSH_RUNTIME_HELPER);
-  const clientMode = dshRuntime.resolveClientMode(process.env);
-  if (clientMode === "legacy" && !fs.existsSync(VITE_JS)) throw new Error("载荷不完整：legacy vite 缺失");
   for (const executable of ["postgres", "pg_ctl", "initdb"]) {
     if (!fs.existsSync(pgBin(executable))) throw new Error(`载荷不完整：PostgreSQL ${executable} 缺失`);
   }
@@ -1022,30 +1008,7 @@ async function bootstrap(opts) {
     WORKLOOM_WEB_PORT: String(WEB_PORT),
     WORKLOOM_NATS_PORT: String(NATS_PORT),
   };
-  const dshState = clientMode === "dsh"
-    ? dshRuntime.prepareDshRuntime({ root: RUNTIME, supportDir })
-    : null;
-  const bridgeToken = dshState ? dshRuntime.createBridgeToken() : "";
-  const serverEnv = {
-    ...desktopEnv,
-    NODE_ENV: "production",
-    PM_DSH_BRIDGE_TOKEN: bridgeToken,
-    ...(dshState ? {
-      WORKLOOM_PM_WORKSPACE_SLUG: dshState.product.workspaceSlug,
-      WORKLOOM_PM_MEMBER_NO: dshState.product.memberNo,
-    } : {}),
-    WORKLOOM_PRODUCT_MANIFEST: path.join(RUNTIME, "product.manifest.json"),
-  };
-  const dshEnv = dshState
-    ? dshRuntime.dshEnvironment({ ...parseEnv(desktopConfig.text), ...desktopEnv }, {
-      serverPort: SERVER_PORT,
-      token: bridgeToken,
-      dshHome: dshState.dshHome,
-    })
-    : serverEnv;
-  say(clientMode === "dsh"
-    ? `客户端：DeepSeek Harness ${dshState.dshVersion}（PM 原生工具与 WorkLoom 品牌适配）`
-    : "客户端：legacy WorkLoom 多页工作台（显式回退）");
+  const serverEnv = { ...desktopEnv, NODE_ENV: "production", WORKLOOM_PM_DSH_PROFILE: "desktop" };
   const runDatabaseHelper = (mode, legacyPasswords = []) => run(NODE_BIN, [DB_HELPER], {
     env: {
       ...desktopEnv,
@@ -1215,29 +1178,21 @@ async function bootstrap(opts) {
     status("示例团队已装配", { phase: "example-ready", percent: 85, etaSeconds: 15 });
   }
 
-  /* ---------- 4. 起服务：PM server + DSH desktop/web surface ---------- */
+  /* ---------- 4. 起服务：server(8787) + web preview(5173) ---------- */
   status("→ 启动 WorkLoom 服务…", { phase: "services-start", percent: 88, etaSeconds: 12 });
   checkpoint("services", "正在启动本机服务并执行健康检查", { targetVersion: payloadVer, percent: 88, etaSeconds: 12 });
   const serverProc = spawnLogged(NODE_BIN, [TSX_CLI, `--env-file=${envFile}`, "src/index.ts"],
     { cwd: path.join(RUNTIME, "apps", "server"), env: serverEnv }, path.join(logDir, "server.log"));
   children.push(serverProc);
-  const webArgs = clientMode === "dsh"
-    ? dshRuntime.dshArgs({ cli: dshState.dshCli, port: WEB_PORT, patchFile: dshState.patchFile, open: false })
-    : [VITE_JS, "preview", "--host", "127.0.0.1", "--port", String(WEB_PORT), "--strictPort"];
-  const webProc = spawnLogged(NODE_BIN, webArgs,
-    { cwd: dshState?.workspaceDir ?? path.join(RUNTIME, "apps", "web"), env: dshEnv,
-      ...(dshState ? { ipc: true } : {}) }, path.join(logDir, "web.log"));
+  const webProc = spawnLogged(NODE_BIN, [VITE_JS, "preview", "--host", "127.0.0.1", "--port", String(WEB_PORT), "--strictPort"],
+    { cwd: path.join(RUNTIME, "apps", "web"), env: serverEnv }, path.join(logDir, "web.log"));
   children.push(webProc);
-  const webUrl = dshState
-    ? await dshRuntime.waitForDshUrl(webProc, WEB_PORT, 90_000, abortSignal)
-    : desktopWebUrl(WEB_PORT, startPath);
 
   status("→ 等待工作台与服务就绪…", { phase: "services-health", percent: 90, etaSeconds: 10 });
   let ok = false;
   for (let i = 0; i < 90 && !ok; i++) {
     throwIfAborted();
-    ok = (await httpOk(`http://127.0.0.1:${SERVER_PORT}/health`))
-      && (dshState ? webProc.exitCode === null : await httpOk(`http://127.0.0.1:${WEB_PORT}/`));
+    ok = (await httpOk(`http://127.0.0.1:${SERVER_PORT}/health`)) && (await httpOk(`http://127.0.0.1:${WEB_PORT}/`));
     if (!ok && i > 0 && i % 5 === 0) {
       const percent = Math.min(99, 90 + Math.floor(i / 10));
       status("→ 正在完成本机服务健康检查…", {
@@ -1251,6 +1206,7 @@ async function bootstrap(opts) {
   status("启动检查已全部通过", { phase: "ready", percent: 100, etaSeconds: 0 });
   writeInstallCheckpoint(supportDir, { status: "complete", phase: "ready", detail: "安装与启动检查已完成", recoverable: true, targetVersion: payloadVer, percent: 100, etaSeconds: 0 });
 
+  const webUrl = desktopWebUrl(WEB_PORT, startPath);
   let stopped = false;
   const stop = async () => {
     if (stopped) return;
@@ -1317,11 +1273,11 @@ if (require.main === module) {
         process.exit(0);
       }
       if (smoke) {
-        console.log(`== SMOKE 通过：${new URL(webUrl).origin} 健康 ==`);
+        console.log(`== SMOKE 通过：${webUrl} 健康 ==`);
         await stop();
         process.exit(0);
       }
-      console.log(`== WorkLoom 已就绪：${new URL(webUrl).origin} ==`);
+      console.log(`== WorkLoom 已就绪：${webUrl} ==`);
       openExternalUrl(webUrl);
       // 旧 zip 浏览器壳只保留为人工应急回退线；保持父进程存活，直到上方信号处理器
       // 走所有权复验后的统一 stop。

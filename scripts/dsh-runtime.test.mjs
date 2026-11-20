@@ -1,107 +1,75 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import {
-  createBridgeToken,
-  dshArgs,
-  dshEnvironment,
-  dshReadyUrl,
-  patchText,
-  prepareDshRuntime,
-  readProductIdentity,
-  resolveClientMode,
-} from "./dsh-runtime.cjs";
+import { fileURLToPath } from "node:url";
+import { dshReadyUrl, waitForDshUrl } from "./dsh-runtime.cjs";
 
-function writeFixture(root) {
-  mkdirSync(join(root, "apps", "server"), { recursive: true });
-  mkdirSync(join(root, "scripts"), { recursive: true });
-  writeFileSync(join(root, "product.manifest.json"), JSON.stringify({
-    productId: "workloom-pmtest",
-    displayName: "WorkLoom PMtest",
-    defaultBundle: "ai-pm",
-    demoWorkspaceSlug: "ai-pm-demo",
-    demoMemberNo: "MEM-001",
-  }));
-  writeFileSync(join(root, "apps", "server", "package.json"), JSON.stringify({ dependencies: { "@deepseek-ai/dsh": "0.2.1-rc.2" } }));
-  const dshRoot = join(root, "node_modules", "@deepseek-ai", "dsh");
-  mkdirSync(join(dshRoot, "lib"), { recursive: true });
-  writeFileSync(join(dshRoot, "package.json"), JSON.stringify({ name: "@deepseek-ai/dsh", version: "0.2.1-rc.2" }));
-  writeFileSync(join(dshRoot, "lib", "bin.js"), "export {};\n");
-  const pluginRoot = join(root, "packages", "pm-dsh-client");
-  mkdirSync(join(pluginRoot, "lib"), { recursive: true });
-  writeFileSync(join(pluginRoot, "package.json"), JSON.stringify({
-    name: "@workloom/dsh-pm-client",
-    type: "module",
-    dsh: { client: { platform: "web" } },
-  }));
-  writeFileSync(join(pluginRoot, "lib", "index.js"), "export function apply() {}\n");
-  writeFileSync(join(pluginRoot, "lib", "client.js"), "window.__ModuleLoader__.load({});\n");
-}
-
-test("client mode defaults to DSH and legacy remains an explicit rollback", () => {
-  assert.equal(resolveClientMode({}), "dsh");
-  assert.equal(resolveClientMode({ WORKLOOM_CLIENT: "legacy" }), "legacy");
-  assert.throws(() => resolveClientMode({ WORKLOOM_CLIENT: "other" }), /只允许 dsh 或 legacy/u);
+test("the worker accepts only the owned Desktop profile and a clean loopback authority", () => {
+  const previewToken = "q".repeat(43);
+  const url = `http://127.0.0.1:5404/?token=${previewToken}`;
+  const ready = { type: "workloom:dsh-ready", profile: "desktop", url };
+  assert.equal(dshReadyUrl(ready, 0), url);
+  assert.equal(dshReadyUrl(ready, 5404), url);
+  assert.equal(dshReadyUrl(ready, 5405), null);
+  assert.equal(dshReadyUrl({ ...ready, profile: "web" }, 5404), null);
+  assert.equal(dshReadyUrl({ ...ready, url: url.replace("127.0.0.1", "example.net") }, 0), null);
+  assert.equal(dshReadyUrl({ ...ready, url: `${url}&redirect=elsewhere` }, 5404), null);
 });
 
-test("bridge capabilities are unguessable and never appear in the generated patch", () => {
-  const token = createBridgeToken((size) => Buffer.alloc(size, 7));
-  assert.match(token, /^[A-Za-z0-9_-]{43}$/u);
-  const patch = patchText("/tmp/workloom pm/client/lib/index.js");
-  assert.match(patch, /workloom-pm-client/u);
-  assert.match(patch, /ui-brand-official/u);
-  assert.doesNotMatch(patch, new RegExp(token, "u"));
-});
-
-test("desktop session handoff accepts only an authenticated URL for the launched loopback port", () => {
-  const token = "q".repeat(43);
-  const url = `http://127.0.0.1:5404/?token=${token}`;
-  assert.equal(dshReadyUrl({ type: "workloom:dsh-ready", url }, 5404), url);
-  assert.equal(dshReadyUrl({ type: "workloom:dsh-ready", url }, 5405), null);
-  assert.equal(dshReadyUrl({ type: "workloom:dsh-ready", url: url.replace("127.0.0.1", "example.net") }, 5404), null);
-  assert.equal(dshReadyUrl({ type: "workloom:dsh-ready", url: `${url}&redirect=elsewhere` }, 5404), null);
-});
-
-test("prepares an isolated DSH home and launch patch from the product identity", () => {
-  const root = mkdtempSync(join(tmpdir(), "workloom-dsh-runtime-"));
+test("the installed official Desktop profile opens and closes an authenticated loopback session", { timeout: 55_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "workloom-desktop-profile-"));
+  const dshHome = join(root, "home");
+  const patch = join(root, "worker.patch.yml");
+  const fromServer = createRequire(new URL("../apps/server/package.json", import.meta.url));
+  const entry = fileURLToPath(new URL("./dsh-runtime.cjs", import.meta.url));
+  writeFileSync(patch, "[]\n", { mode: 0o600 });
+  const child = spawn(process.execPath, [
+    entry, fromServer.resolve("@deepseek-ai/dsh/lib/bin.js"), join(dshHome, "profiles", "desktop"), "0", patch,
+  ], {
+    cwd: root,
+    env: {
+      PATH: process.env.PATH,
+      HOME: root,
+      USERPROFILE: root,
+      SystemRoot: process.env.SystemRoot,
+      DSH_HOME: dshHome,
+      DSH_TELEMETRY_DISABLED: "1",
+    },
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stderr.on("data", (chunk) => { output += chunk; });
+  const exit = once(child, "exit");
   try {
-    writeFixture(root);
-    const support = join(root, "support");
-    const prepared = prepareDshRuntime({ root, supportDir: support });
-    assert.equal(prepared.product.workspaceSlug, "ai-pm-demo");
-    assert.equal(prepared.dshVersion, "0.2.1-rc.2");
-    assert.equal(readProductIdentity(root).memberNo, "MEM-001");
-    assert.match(readFileSync(prepared.patchFile, "utf8"), /deepseek-official/u);
-    const env = dshEnvironment({
-      LLM_API_KEY: "fixture-model-key",
-      DATABASE_URL: "dummy-database",
-      JWT_SECRET: "fixture-jwt",
-      GH_TOKEN: "fixture-github",
-      NODE_OPTIONS: "fixture-options",
-      PATH: "/bin",
-    }, {
-      serverPort: 9018,
-      token: "t".repeat(43),
-      dshHome: prepared.dshHome,
-    });
-    assert.equal(prepared.workspaceDir, join(support, ".workloom-dsh", "workspace"));
-    assert.equal(env.WORKLOOM_PM_API_URL, "http://127.0.0.1:9018");
-    assert.equal(env.DSH_TELEMETRY_DISABLED, "1");
-    assert.equal(env.NODE_ENV, "production");
-    assert.equal(env.DEEPSEEK_API_KEY, "fixture-model-key");
-    assert.equal(env.PATH, "/bin");
-    for (const key of ["DATABASE_URL", "JWT_SECRET", "GH_TOKEN", "NODE_OPTIONS", "LLM_API_KEY"]) {
-      assert.equal(env[key], undefined, key);
-    }
-    assert.deepEqual(dshArgs({
-      cli: prepared.dshCli, port: 5404, patchFile: prepared.patchFile,
-    }), [
-      prepared.dshCli, "--patch", prepared.patchFile, "--profile", "web",
-      "--host", "127.0.0.1", "--port", "5404", "--no-open",
-    ]);
+    const url = await waitForDshUrl(child, 0, 42_000);
+    const origin = new URL(url).origin;
+    const anonymous = await fetch(origin, { signal: AbortSignal.timeout(5000) });
+    assert.equal(anonymous.status, 401);
+    await anonymous.body?.cancel();
+    const exchange = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(5000) });
+    assert.equal(exchange.status, 303);
+    const cookie = exchange.headers.get("set-cookie")?.split(";", 1)[0];
+    assert.ok(cookie);
+    await exchange.body?.cancel();
+    const ready = await fetch(origin, { headers: { cookie }, signal: AbortSignal.timeout(5000) });
+    assert.equal(ready.status, 200);
+    assert.ok((await ready.text()).includes("__DSH_BOOT__"));
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    if (child.connected) child.disconnect();
+    const watchdog = setTimeout(() => child.kill("SIGKILL"), 5000);
+    try {
+      const [exitCode] = await exit;
+      assert.equal(exitCode, 0);
+      assert.equal(/[?&]token=[A-Za-z0-9_-]{32,}/u.test(output), false);
+    } finally {
+      clearTimeout(watchdog);
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });

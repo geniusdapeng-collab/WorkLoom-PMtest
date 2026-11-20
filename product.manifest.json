@@ -17,7 +17,7 @@
   },
   "desktop": {
     "portOffset": 231,
-    "startPath": "/"
+    "startPath": "/development"
   },
   "clients": {
     "bPc": { "enabled": true, "entry": "apps/web", "secretaryAutoScan": false },

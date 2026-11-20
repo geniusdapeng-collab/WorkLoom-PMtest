@@ -218,9 +218,9 @@ done
 # PM 的真实 Harness 由 server 直接依赖锁定；缺运行时不得继续出安装包。
 if node -e 'process.exit(require("./apps/server/package.json").dependencies?.["@deepseek-ai/dsh"] ? 0 : 1)'; then
   for f in runtime/node_modules/@deepseek-ai/dsh/package.json runtime/node_modules/@deepseek-ai/dsh/lib/bin.js \
-           runtime/node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html \
-           runtime/packages/pm-dsh-client/package.json runtime/packages/pm-dsh-client/lib/index.js runtime/packages/pm-dsh-client/lib/client.js \
+           runtime/node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html runtime/node_modules/@deepseek-ai/dsh/LICENSE \
            runtime/apps/server/src/industry/ai-pm/dsh-adapter.ts runtime/apps/server/src/industry/ai-pm/dsh-workspace.plugin.mjs \
+           runtime/apps/server/src/industry/ai-pm/dsh-desktop-turn.mjs \
            runtime/apps/server/src/industry/ai-pm/code-verifier.ts runtime/apps/server/src/industry/ai-pm/code-test-runner.mjs \
            runtime/apps/server/src/industry/ai-pm/code-test-preload.mjs; do
     [ -f "$OUT/$f" ] || { echo "❌ PM Harness 载荷不完整：$f 缺失"; exit 1; }

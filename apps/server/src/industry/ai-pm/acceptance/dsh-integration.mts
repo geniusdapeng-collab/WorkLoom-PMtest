@@ -77,7 +77,9 @@ test("real DSH performs read -> write -> final, with durable session and measure
     assert.equal(delivered.receipt?.exitCode, 0);
     assert.equal(delivered.receipt?.usageComplete, true);
     assert.ok(Array.isArray(delivered.receipt?.sessionEvidence) && delivered.receipt!.sessionEvidence.length > 0);
-    assert.equal(delivered.receipt?.adapter, "deepseek-harness-headless");
+    const profile = process.env.WORKLOOM_PM_DSH_PROFILE ?? "headless";
+    assert.equal(delivered.receipt?.dshProfile, profile);
+    assert.equal(delivered.receipt?.adapter, `deepseek-harness-${profile}`);
   } finally { await cleanup(directory); }
 });
 
@@ -151,7 +153,8 @@ test("real DSH keeps large complete inputs and prior tool turns in the second ph
     assert.equal(calls, 2); assert.equal(delivered.files[0]?.content, output);
     assert.equal(delivered.receipt?.usageComplete, true);
     const [home] = await readdir(directory);
-    const patch = YAML.parse(await readFile(join(directory, home!, "profiles/pm-employee/cordis.patch.yml"), "utf8")) as Array<{
+    const patchPath = delivered.receipt?.dshProfile === "desktop" ? "pm-worker.patch.yml" : "profiles/pm-employee/cordis.patch.yml";
+    const patch = YAML.parse(await readFile(join(directory, home!, patchPath), "utf8")) as Array<{
       id?: string; disabled?: boolean; config?: { providers?: Record<string, { models: Array<{ contextWindow: number; maxTokens: number }> }> };
     }>;
     for (const id of ["compaction-basic", "tool-result-pruner", "spill-policy", "image-offload"]) {

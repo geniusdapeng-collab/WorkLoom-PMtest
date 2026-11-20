@@ -54,11 +54,11 @@
       "scope": [
         "vendor/dsh（审计基线）",
         "packages/runtime/dsh-gate（锁定运行时）",
-        "PMTest 桌面会话（官方 dsh-web-frontend 与 WorkLoom PM 宿主插件）"
+        "PMTest 桌面研发任务（官方 Desktop profile、隔离工作区与受控模型代理）"
       ],
       "cadence": "weekly",
       "gate": "runtime-gate",
-      "notes": "PM 与桌面会话使用同一锁定发行家族。升级单独评测，执行 PM DSH 子进程、E6 与 H-5 重放、桌面会话及载荷测试，并核对官方 npm integrity 与随包 MIT 许可。0.2.1-rc.2 对应 DeepSeek-V4.1-Flash-1017。源码审阅 pin 与运行 pin 见 docs/DSH-CLIENT-MIGRATION.md，历史运行时回归见 vendor/dsh/VENDOR.md。",
+      "notes": "PM 桌面研发岗位使用同一锁定发行家族的官方 Desktop profile。升级执行 PM 子进程、E6 与 H-5 重放、桌面会话及载荷测试，并核对 npm integrity 与随包 MIT 许可。0.2.1-rc.2 对应 DeepSeek-V4.1-Flash-1017。源码审阅 pin 与运行 pin 见 docs/DSH-CLIENT-MIGRATION.md。",
       "latest": "0.2.1-rc.2",
       "latest_checked_at": "2026-10-29T00:00:00.000Z"
     },

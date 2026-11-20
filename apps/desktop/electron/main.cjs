@@ -16,7 +16,7 @@
  *   WORKLOOM_SOURCE_MODE 仅由 pnpm app 源码编排器设为 1；复用外部源码 server/web
  *   WORKLOOM_SUPPORT_DIR 支持目录（默认当前应用独立 userData）
  *   WORKLOOM_APP_SMOKE   设为 1 时执行后端首启冒烟后退出
- *   WORKLOOM_RENDER_SMOKE 设为 1 时创建真实窗口并验证产品页面后退出
+ *   WORKLOOM_RENDER_SMOKE 设为 1 时创建真实窗口并验证页面/数字人/像素后退出
  *   WORKLOOM_SAFE_RENDERING 设为 1 时禁用硬件加速并使用动态矢量渲染后端
  *   WORKLOOM_WEB_PORT    Web 端口（默认 5173）
  *   WORKLOOM_SERVER_PORT 后端端口（默认 8787）
@@ -61,13 +61,10 @@ const TITLE = process.env.WORKLOOM_APP_TITLE ?? app.getName();
 const APP_SMOKE = process.env.WORKLOOM_APP_SMOKE === "1";
 const RENDER_SMOKE = process.env.WORKLOOM_RENDER_SMOKE === "1";
 const SOURCE_MODE = process.env.WORKLOOM_SOURCE_MODE === "1";
-const CLIENT_MODE = process.env.WORKLOOM_CLIENT?.trim() || "dsh";
-const sourceDshReadyUrl = process.env.WORKLOOM_SOURCE_DSH_WEB_URL;
-delete process.env.WORKLOOM_SOURCE_DSH_WEB_URL;
 const SAFE_RENDERING = process.env.WORKLOOM_SAFE_RENDERING === "1" || process.argv.includes("--safe-rendering");
 const WEB_PORT = Number(process.env.WORKLOOM_WEB_PORT || 5173);
 const START_PATH = resolveDesktopStartPath({
-  configured: process.env.WORKLOOM_START_PATH ?? (CLIENT_MODE === "legacy" ? "/development" : undefined),
+  configured: process.env.WORKLOOM_START_PATH,
   packageFile: path.join(SOURCE_MODE && process.env.WORKLOOM_SOURCE_ROOT
     ? process.env.WORKLOOM_SOURCE_ROOT : app.getAppPath(), "package.json"),
 });
@@ -89,8 +86,8 @@ if (SAFE_RENDERING) {
 /** 默认窗口尺寸；不是固定逻辑画布，用户可自由调整。 */
 const DEFAULT_W = 1440;
 const DEFAULT_H = 900;
-const MIN_W = CLIENT_MODE === "legacy" ? 960 : 420;
-const MIN_H = CLIENT_MODE === "legacy" ? 640 : 560;
+const MIN_W = 960;
+const MIN_H = 640;
 
 let win = null;
 let splash = null;
@@ -161,7 +158,7 @@ const SPLASH_HTML = ({ message, error = "", reference = "", startedAt = Date.now
   return `data:text/html;charset=utf-8,${encodeURIComponent(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WorkLoom 启动</title></head><body>
   <main aria-live="polite">
     <div class="brand">WorkLoom <span>织元</span></div>
-    <div class="subtitle">AI 产品经理 · DeepSeek Harness · ${failed ? "启动需要处理" : "正在准备工作区"}</div>
+    <div class="subtitle">企业数字员工 IM · ${failed ? "启动需要处理" : "正在准备工作区"}</div>
     ${failed ? `<div class="failure" role="alert"><strong>本次启动未完成</strong><p>${safeError}</p>${reference ? `<p>支持参考：${escapeHtml(reference)}</p>` : ""}</div>` : `<div role="progressbar" aria-label="正在初始化" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}" aria-valuetext="${escapeHtml(`${progressText}，${message}`)}" class="progress"><i style="width:${percent}%"></i></div>`}
     <p class="stage">${safeMessage}</p>
     ${failed ? "" : `<p class="elapsed"><strong>${progressText}</strong><br>已用时 <span id="elapsed">0 秒</span> · 进度按已完成的启动检查点更新</p>`}
@@ -330,7 +327,7 @@ function createWindow() {
   win.on("closed", () => { win = null; });
 
   const productUrl = handle?.webUrl ?? WEB_URL;
-  const renderUrl = CLIENT_MODE === "legacy" && SAFE_RENDERING ? `${productUrl}?render=vector2d` : productUrl;
+  const renderUrl = SAFE_RENDERING ? `${productUrl}?render=vector2d` : productUrl;
   void win.loadURL(renderUrl);
 }
 
@@ -350,7 +347,7 @@ function pixelHealth(image) {
   return { mean: Number(mean.toFixed(2)), variance: Number(variance.toFixed(2)), visibleRatio: Number((visible / Math.max(1, n)).toFixed(4)) };
 }
 
-async function runLegacyRenderSmoke() {
+async function runRenderSmoke() {
   const logDir = path.join(supportDirResolved, "logs");
   fs.mkdirSync(logDir, { recursive: true });
   const deadline = Date.now() + 60000;
@@ -529,68 +526,6 @@ async function runLegacyRenderSmoke() {
   console.log(`WorkLoom 渲染冒烟通过：${JSON.stringify(report)}`);
 }
 
-/**
- * Packaged DSH smoke: prove that the official Harness surface loaded, the
- * WorkLoom browser plugin replaced the official brand, and a real composer is
- * mounted. Model calls remain outside this smoke.
- */
-async function runDshRenderSmoke() {
-  const logDir = path.join(supportDirResolved, "logs");
-  fs.mkdirSync(logDir, { recursive: true });
-  const capture = async (name, expectedWidth, timeout) => {
-    const deadline = Date.now() + timeout;
-    let probe = null;
-    while (Date.now() < deadline && win && !win.isDestroyed()) {
-      probe = await win.webContents.executeJavaScript(`(() => {
-        const brand = document.querySelector('[data-workloom-pm="brand"]');
-        const root = document.querySelector('#root');
-        const composer = [...document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]')]
-          .find((element) => {
-            const bounds = element.getBoundingClientRect();
-            return bounds.width > 0 && bounds.height > 0 && bounds.left >= -1 && bounds.right <= innerWidth + 1;
-          });
-        return {
-          productReady: !!brand && (root?.childElementCount || 0) > 0,
-          brandReady: !!brand,
-          composerReady: !!composer,
-          width: innerWidth,
-          horizontalOverflow: Math.max(0, document.documentElement.scrollWidth - innerWidth),
-          title: document.title,
-          bodyText: document.body.innerText.slice(0, 1800),
-        };
-      })()`, true).catch((error) => ({ error: String(error) }));
-      if (probe?.productReady && probe.composerReady && probe.title === "WorkLoom PM"
-        && probe.horizontalOverflow <= 1 && (expectedWidth === undefined || probe.width === expectedWidth)) break;
-      await new Promise((resolve) => setTimeout(resolve, 400));
-    }
-    if (!win || win.isDestroyed()) throw new Error("DSH 渲染窗口提前退出");
-    const shot = await win.webContents.capturePage();
-    const screenshotPath = path.join(logDir, name);
-    fs.writeFileSync(screenshotPath, shot.toPNG());
-    return { ...probe, pixels: pixelHealth(shot), screenshotPath };
-  };
-  const report = { ...await capture("dsh-render.png", undefined, 60000), client: "dsh", checkedAt: new Date().toISOString() };
-  const narrowWidth = 540;
-  win.setContentSize(narrowWidth, 740);
-  report.narrow = await capture("dsh-render-narrow.png", narrowWidth, 10000);
-  const reportPath = path.join(logDir, "dsh-render.json");
-  fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
-  for (const [label, view] of [["默认", report], ["窄窗口", report.narrow]]) {
-    if (!view.productReady || !view.brandReady) throw new Error(`${label} WorkLoom DSH 品牌插件未就绪：${JSON.stringify(view)}`);
-    if (!view.composerReady) throw new Error(`${label} DSH 会话输入框未就绪或不可见：${JSON.stringify(view)}`);
-    if (view.title !== "WorkLoom PM") throw new Error(`${label} DSH 文档标题不正确：${JSON.stringify(view)}`);
-    if (view.horizontalOverflow > 1) throw new Error(`${label} DSH 页面横向溢出：${JSON.stringify(view)}`);
-    if (view.pixels.variance < 20 || view.pixels.visibleRatio < 0.01) throw new Error(`${label} DSH 画面疑似纯黑/纯色：${JSON.stringify(view)}`);
-  }
-  if (report.narrow.width !== narrowWidth) throw new Error(`DSH 窄窗口未调整到 ${narrowWidth}px：${JSON.stringify(report.narrow)}`);
-  console.log(`WorkLoom DSH 渲染冒烟通过：${JSON.stringify(report)}`);
-}
-
-async function runRenderSmoke() {
-  if (CLIENT_MODE !== "legacy") return runDshRenderSmoke();
-  return runLegacyRenderSmoke();
-}
-
 /* ---------- 系统托盘 ---------- */
 function createTray() {
   const icon = nativeImage.createFromPath(path.join(__dirname, "assets/tray.png"));
@@ -646,13 +581,7 @@ app.whenReady().then(async () => {
         }
         // 源码 server/web 由 desktop-app.mts 编排并在拉起 Electron 前完成健康检查。
         // 这里仍保留 handle 契约，让托盘退出/重试与正式安装包走相同生命周期。
-        let webUrl = WEB_URL;
-        if (CLIENT_MODE === "dsh") {
-          const { dshReadyUrl } = require(path.join(sourceRoot, "scripts", "dsh-runtime.cjs"));
-          webUrl = dshReadyUrl({ type: "workloom:dsh-ready", url: sourceDshReadyUrl }, WEB_PORT);
-          if (!webUrl) throw new Error("源码桌面入口没有收到有效的 DSH 就绪地址");
-        }
-        handle = { stop: async () => {}, webUrl };
+        handle = { stop: async () => {}, webUrl: WEB_URL };
       } else {
         handle = await bootstrap({
           resourcesDir,

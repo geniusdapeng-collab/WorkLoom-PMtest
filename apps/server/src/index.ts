@@ -23,7 +23,6 @@ import { startThreadScheduler } from "./runtime/scheduler.js";
 import { gatewayAppend } from "@workloom/base/workdata";
 import { registerBundleAskFacts } from "./runtime/ask-facts-loader.js";
 import { readVoiceFile, synthesizeVoice, voiceStationConfig } from "./voice/station.js";
-import { createPmDesktopBridgeRouter } from "./industry/ai-pm/desktop-bridge.js";
 
 const app = new Hono();
 const { appRouter } = productComposition;
@@ -145,18 +144,6 @@ const productHttpRoutes = (productComposition as unknown as {
   productHttpRoutes?: Array<{ path: string; router: Hono<any> }>;
 }).productHttpRoutes ?? [];
 for (const extension of productHttpRoutes) app.route(extension.path, extension.router);
-
-/**
- * The DSH desktop profile reaches the PM team through one loopback-only,
- * per-process capability. It is absent in ordinary web/server deployments.
- */
-if (process.env.PM_DSH_BRIDGE_TOKEN) {
-  app.route("/api/pm-dsh", createPmDesktopBridgeRouter({
-    workspaceSlug: process.env.WORKLOOM_PM_WORKSPACE_SLUG,
-    memberNo: process.env.WORKLOOM_PM_MEMBER_NO,
-  }));
-  console.log("桌面 DSH → PM 本机桥接已挂载：/api/pm-dsh");
-}
 
 /** 官方运营台 HTTP 端点（仅 SKILL_OPS_MODE=official 部署挂载）：
  *  GET  /skill-dist/manifest.json —— 客户端拉取通道（分发包逐一官方签名，客户端 staging① 验签）

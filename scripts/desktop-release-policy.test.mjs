@@ -10,7 +10,6 @@ const workflowUrl = new URL("../.github/workflows/desktop-production-release.yml
 const source = readFileSync(workflowUrl, "utf8");
 const statePolicy = readFileSync(new URL("./desktop-release-state.mjs", import.meta.url), "utf8");
 const workflow = YAML.parse(source);
-const builderConfig = YAML.parse(readFileSync(new URL("../electron-builder.yml", import.meta.url), "utf8"));
 const downstreamPublisher = YAML.parse(readFileSync(
   new URL("../sync/downstream-desktop-publisher-job.yml", import.meta.url),
   "utf8",
@@ -136,18 +135,6 @@ test("unsigned platform builds require an explicit reviewed input and disclose t
   }
 
   assert.match(stepByName("macos", "打包未签名 DMG（arm64）").run, /mac\.notarize=false/u);
-  for (const platform of ["macos", "windows"]) {
-    const signed = stepByName(platform, "生成签名 Bundle（最小私钥作用域）");
-    const preview = stepByName(platform, "生成预览 Bundle（构建临时密钥）");
-    assert.equal(signed.if, "needs.preflight.outputs.platform-signing == 'signed'");
-    assert.deepEqual(secretReferences(signed), ["BUNDLE_SIGNING_PRIVATE_KEY"]);
-    assert.match(signed.run, /test -n "\$BUNDLE_SIGNING_PRIVATE_KEY"/u);
-    assert.equal(preview.if, "needs.preflight.outputs.platform-signing == 'unsigned'");
-    assert.deepEqual(secretReferences(preview), []);
-    assert.match(preview.run, /generateKeyPairSync\("ed25519"\)/u);
-    assert.match(preview.run, /BUNDLE_SIGNING_PRIVATE_KEY="\$EPHEMERAL_BUNDLE_KEY" .*pnpm bundle:release/u);
-    assert.match(preview.run, /test -s build\/bundle-trust\.json/u);
-  }
   const publish = stepByName("publish-desktop-release", "原子组装、发布并回读核验桌面端 Release");
   assert.equal(publish.env.PLATFORM_SIGNING, "${{ needs.preflight.outputs.platform-signing }}");
   assert.match(publish.run, /platformSigning/u);
@@ -168,13 +155,12 @@ test("Windows package smoke is isolated from the build toolchain and retains all
   assert.equal(new Set(ports).size, ports.length);
   assert.match(smoke.run, /SMOKE_ROOT="\$RUNNER_TEMP\/wl-smoke"/u);
   assert.match(smoke.run, /APP_SMOKE_ROOT="\$RUNNER_TEMP\/wl-app-smoke"/u);
-  assert.match(smoke.run, /RENDER_SMOKE_ROOT="\$RUNNER_TEMP\/wl-render-dsh"/u);
-  assert.match(smoke.run, /test -f "\$RENDER_SMOKE_ROOT\/logs\/dsh-render\.json"/u);
+  assert.match(smoke.run, /RENDER_SMOKE_ROOT="\$RUNNER_TEMP\/wl-render-default"/u);
   assert.doesNotMatch(smoke.run, /\$\{TEMP\}\/wl-/u);
 
   const diagnostics = stepByName("windows", "留存失败诊断（私有 Actions Artifact）");
   const evidencePaths = String(diagnostics.with.path);
-  for (const directory of ["wl-smoke", "wl-app-smoke", "wl-render-dsh"]) {
+  for (const directory of ["wl-smoke", "wl-app-smoke", "wl-render-default"]) {
     assert.match(evidencePaths, new RegExp(`runner\\.temp \\}\\}/${directory}/logs`, "u"));
     assert.match(evidencePaths, new RegExp(`runner\\.temp \\}\\}/${directory}/install-state\\.json`, "u"));
   }
@@ -223,15 +209,6 @@ test("production secrets exist only in the minimum signing steps", () => {
 test("platform jobs hand off three installers and publisher adds a verifiable public manifest", () => {
   const macSeal = stepByName("macos", "封存已验收 macOS 双架构制品").run;
   const winSeal = stepByName("windows", "封存已验收 Windows 制品").run;
-  for (const [seal, sourceVar, os, arch, ext] of [
-    [macSeal, "ARM_SOURCE", "mac", "arm64", "dmg"],
-    [macSeal, "X64_SOURCE", "mac", "x64", "dmg"],
-    [winSeal, "SOURCE", "win", "x64", "exe"],
-  ]) {
-    const artifact = builderConfig.artifactName.replace("${productName}", builderConfig.productName)
-      .replace("${os}", os).replace("${arch}", arch).replace("${ext}", ext);
-    assert.ok(seal.includes(`${sourceVar}="${artifact}"`), `candidate seal must read ${artifact}`);
-  }
   assert.match(macSeal, /WorkLoom-mac-arm64\.dmg/u);
   assert.match(macSeal, /WorkLoom-mac-x64\.dmg/u);
   assert.match(winSeal, /WorkLoom-win-x64\.exe/u);

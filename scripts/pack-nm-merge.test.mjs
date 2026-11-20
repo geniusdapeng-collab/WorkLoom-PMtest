@@ -92,16 +92,6 @@ test("pnpm 锁文件在 Windows CRLF 检出后保持同一解析语义", () => {
   assert.throws(() => parsePnpmRuntimeLock(lf.replace("\n", "\r")), /孤立 CR/u);
 });
 
-test("pnpm 锁文件接受没有外部依赖的 workspace importer", () => {
-  const parsed = parsePnpmRuntimeLock([
-    "lockfileVersion: '9.0'",
-    "importers:",
-    "  packages/pm-dsh-client: {}",
-    "",
-  ].join("\n"));
-  assert.deepEqual(parsed.importers["packages/pm-dsh-client"], {});
-});
-
 test("基座物理存在 platform-ops 时依赖合成仍排除平台工程", () => {
   const root = fixture();
   try {
