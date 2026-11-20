@@ -34,7 +34,7 @@ extraMetadata:
   productName: WorkLoom PMtest
   # 行业版必须在自己的构建配置中声明唯一偏移；基座主进程禁止维护行业仓名称表。
   workloomPortOffset: 231
-  workloomStartPath: /development
+  workloomStartPath: /
 asar: true
 # 产物名带平台与架构、**不带版本号**——文件名恒定才能支撑
 # https://github.com/<org>/<repo>/releases/latest/download/<文件名> 永久直链

@@ -131,7 +131,9 @@ export function parsePnpmRuntimeLock(source) {
   const importersRange = nestedRange(lines, importersEntry, lines.length, 0);
   const importers = {};
   for (const importer of entriesAt(lines, importersRange.start, importersRange.end, 2)) {
-    if (importer.value || Object.hasOwn(importers, importer.key)) throw new Error(`importer ${importer.key} 必须是唯一映射`);
+    if ((importer.value && importer.value !== "{}") || Object.hasOwn(importers, importer.key)) {
+      throw new Error(`importer ${importer.key} 必须是唯一映射`);
+    }
     const importerRange = nestedRange(lines, importer, importersRange.end, 2);
     const parsedImporter = {};
     for (const field of entriesAt(lines, importerRange.start, importerRange.end, 4)) {

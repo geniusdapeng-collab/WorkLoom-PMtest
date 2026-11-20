@@ -108,12 +108,20 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: 生成签名 Bundle（最小私钥作用域）
+        if: needs.preflight.outputs.platform-signing == 'signed'
         env:
           BUNDLE_SIGNING_PRIVATE_KEY: ${{ secrets.BUNDLE_SIGNING_PRIVATE_KEY }}
           BUNDLE_SIGNING_KEY_ID: ${{ vars.BUNDLE_SIGNING_KEY_ID || 'workloom-release-v1' }}
         run: |
-          test -n "$BUNDLE_SIGNING_PRIVATE_KEY" || { echo "❌ 缺少 BUNDLE_SIGNING_PRIVATE_KEY，拒绝生成生产安装包"; exit 1; }
+          test -n "$BUNDLE_SIGNING_PRIVATE_KEY" || { echo "❌ 正式签名发行缺少 BUNDLE_SIGNING_PRIVATE_KEY"; exit 1; }
           pnpm bundle:release
+          test -s build/bundle-trust.json || { echo "❌ 独立 Bundle 公钥环未生成"; exit 1; }
+
+      - name: 生成预览 Bundle（构建临时密钥）
+        if: needs.preflight.outputs.platform-signing == 'unsigned'
+        run: |
+          EPHEMERAL_BUNDLE_KEY="$(node -e 'const {generateKeyPairSync}=require("node:crypto"); const {privateKey}=generateKeyPairSync("ed25519"); process.stdout.write(privateKey.export({type:"pkcs8",format:"pem"}).toString())')"
+          BUNDLE_SIGNING_PRIVATE_KEY="$EPHEMERAL_BUNDLE_KEY" BUNDLE_SIGNING_KEY_ID="unsigned-preview-${GITHUB_RUN_ID}" pnpm bundle:release
           test -s build/bundle-trust.json || { echo "❌ 独立 Bundle 公钥环未生成"; exit 1; }
 
       - name: 生成投影、验证并构建 web（无发行密钥）
@@ -124,7 +132,12 @@ jobs:
           pnpm projections:generate
           grep -q 'WORKLOOM_SAFE_RENDERING' apps/desktop/electron/main.cjs
           grep -q 'WORKLOOM_RENDER_SMOKE' apps/desktop/electron/main.cjs
+          grep -q 'runDshRenderSmoke' apps/desktop/electron/main.cjs
           grep -q 'previousEnvFile' apps/desktop/electron/bootstrap.cjs
+          grep -q 'prepareDshRuntime' apps/desktop/electron/bootstrap.cjs
+          grep -q 'PM_DSH_BRIDGE_TOKEN' apps/desktop/electron/bootstrap.cjs apps/server/src/index.ts
+          test -f packages/pm-dsh-client/lib/index.js
+          test -f packages/pm-dsh-client/lib/client.js
           grep -q 'validateStoredSession' apps/web/src/lib/trpc.ts
           grep -q 'speakAndWait' apps/web/src/components/MateWelcome.tsx
           grep -q 'data-render-mode="vector2d"' apps/web/src/components/loommate/MateLive2D.tsx
@@ -188,11 +201,13 @@ jobs:
           test -n "$BIN" || { echo "❌ arm64 应用主程序未生成"; exit 1; }
           WORKLOOM_APP_SMOKE=1 WORKLOOM_SUPPORT_DIR=/tmp/wl-app-smoke "$BIN"
           test -f /tmp/wl-app-smoke/.bootstrapped || { echo "❌ 真实应用首启未完成"; exit 1; }
-          WORKLOOM_RENDER_SMOKE=1 WORKLOOM_SUPPORT_DIR=/tmp/wl-render-default "$BIN"
-          test -f /tmp/wl-render-default/logs/render-default.json || { echo "❌ 默认渲染探针缺失"; exit 1; }
-          WORKLOOM_RENDER_SMOKE=1 WORKLOOM_SAFE_RENDERING=1 WORKLOOM_SUPPORT_DIR=/tmp/wl-render-safe "$BIN"
-          test -f /tmp/wl-render-safe/logs/render-safe.json || { echo "❌ 安全渲染探针缺失"; exit 1; }
-          echo "✅ 真实 .app 后端 + Live2D + 动态矢量双渲染冒烟通过"
+          WORKLOOM_RENDER_SMOKE=1 WORKLOOM_SUPPORT_DIR=/tmp/wl-render-dsh "$BIN"
+          test -f /tmp/wl-render-dsh/logs/dsh-render.json || { echo "❌ DSH 渲染探针缺失"; exit 1; }
+          WORKLOOM_CLIENT=legacy WORKLOOM_RENDER_SMOKE=1 WORKLOOM_SUPPORT_DIR=/tmp/wl-render-legacy "$BIN"
+          test -f /tmp/wl-render-legacy/logs/render-default.json || { echo "❌ legacy 默认渲染探针缺失"; exit 1; }
+          WORKLOOM_CLIENT=legacy WORKLOOM_RENDER_SMOKE=1 WORKLOOM_SAFE_RENDERING=1 WORKLOOM_SUPPORT_DIR=/tmp/wl-render-safe "$BIN"
+          test -f /tmp/wl-render-safe/logs/render-safe.json || { echo "❌ legacy 安全渲染探针缺失"; exit 1; }
+          echo "✅ 真实 .app 后端 + DSH 页面 + legacy 双渲染冒烟通过"
         timeout-minutes: 20
 
       - name: 上传渲染验收证据
@@ -205,7 +220,9 @@ jobs:
           name: macos-arm64-render-evidence
           if-no-files-found: warn
           path: |
-            /tmp/wl-render-default/logs/render-default.*
+            /tmp/wl-render-dsh/logs/dsh-render*.png
+            /tmp/wl-render-dsh/logs/dsh-render.json
+            /tmp/wl-render-legacy/logs/render-default.*
             /tmp/wl-render-safe/logs/render-safe.*
       - name: 装配自包含载荷（darwin-x64）
         run: bash scripts/pack-electron-payload.sh --platform mac --arch x64 --version "$VERSION"
@@ -256,7 +273,8 @@ jobs:
           name: desktop-macos-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             /tmp/wl-smoke/logs/*.log
-            /tmp/wl-render-default/logs/*
+            /tmp/wl-render-dsh/logs/*
+            /tmp/wl-render-legacy/logs/*
             /tmp/wl-render-safe/logs/*
           if-no-files-found: warn
           retention-days: 7
@@ -270,8 +288,8 @@ jobs:
           set -euo pipefail
           OUT="$RUNNER_TEMP/desktop-macos"
           mkdir -p "$OUT"
-          ARM_SOURCE="WorkLoom 织元-mac-arm64.dmg"
-          X64_SOURCE="WorkLoom 织元-mac-x64.dmg"
+          ARM_SOURCE="WorkLoom PMtest-mac-arm64.dmg"
+          X64_SOURCE="WorkLoom PMtest-mac-x64.dmg"
           ARM="WorkLoom-mac-arm64.dmg"
           X64="WorkLoom-mac-x64.dmg"
           test "$(find release -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d ' ')" -eq 2
@@ -321,6 +339,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: 生成签名 Bundle（最小私钥作用域）
+        if: needs.preflight.outputs.platform-signing == 'signed'
         shell: bash
         env:
           BUNDLE_SIGNING_PRIVATE_KEY: ${{ secrets.BUNDLE_SIGNING_PRIVATE_KEY }}
@@ -328,6 +347,14 @@ jobs:
         run: |
           test -n "$BUNDLE_SIGNING_PRIVATE_KEY" || { echo "❌ 缺少 BUNDLE_SIGNING_PRIVATE_KEY，拒绝生成生产安装包"; exit 1; }
           pnpm bundle:release
+          test -s build/bundle-trust.json || { echo "❌ 独立 Bundle 公钥环未生成"; exit 1; }
+
+      - name: 生成预览 Bundle（构建临时密钥）
+        if: needs.preflight.outputs.platform-signing == 'unsigned'
+        shell: bash
+        run: |
+          EPHEMERAL_BUNDLE_KEY="$(node -e 'const {generateKeyPairSync}=require("node:crypto"); const {privateKey}=generateKeyPairSync("ed25519"); process.stdout.write(privateKey.export({type:"pkcs8",format:"pem"}).toString())')"
+          BUNDLE_SIGNING_PRIVATE_KEY="$EPHEMERAL_BUNDLE_KEY" BUNDLE_SIGNING_KEY_ID="unsigned-preview-${GITHUB_RUN_ID}" pnpm bundle:release
           test -s build/bundle-trust.json || { echo "❌ 独立 Bundle 公钥环未生成"; exit 1; }
 
       - name: 生成投影、验证并构建 web（无发行密钥）
@@ -383,7 +410,7 @@ jobs:
         run: |
           SMOKE_ROOT="$RUNNER_TEMP/wl-smoke"
           APP_SMOKE_ROOT="$RUNNER_TEMP/wl-app-smoke"
-          RENDER_SMOKE_ROOT="$RUNNER_TEMP/wl-render-default"
+          RENDER_SMOKE_ROOT="$RUNNER_TEMP/wl-render-dsh"
           RES="release/win-unpacked/resources"
           test -f "$RES/payload.tar.gz" || { echo "❌ 拆包验收失败：payload.tar.gz 未进包"; exit 1; }
           test -f "$RES/payload/PAYLOAD_VERSION" || { echo "❌ 拆包验收失败：PAYLOAD_VERSION 未进包（缺失将致每次启动重解压）"; exit 1; }
@@ -403,8 +430,8 @@ jobs:
           node -e 'const {spawnSync}=require("node:child_process"); const r=spawnSync(process.argv[1],[],{stdio:"inherit",env:{...process.env,WORKLOOM_APP_SMOKE:"1",WORKLOOM_SUPPORT_DIR:process.argv[2]}}); process.exit(r.status ?? 1)' "$EXE" "$APP_SMOKE_ROOT"
           test -f "$APP_SMOKE_ROOT/.bootstrapped" || { echo "❌ 真实应用首启未完成"; exit 1; }
           node -e 'const {spawnSync}=require("node:child_process"); const r=spawnSync(process.argv[1],[],{stdio:"inherit",env:{...process.env,WORKLOOM_RENDER_SMOKE:"1",WORKLOOM_SUPPORT_DIR:process.argv[2]}}); process.exit(r.status ?? 1)' "$EXE" "$RENDER_SMOKE_ROOT"
-          test -f "$RENDER_SMOKE_ROOT/logs/render-default.json" || { echo "❌ Windows 渲染探针缺失"; exit 1; }
-          echo "✅ 真实 Windows 应用后端 + 页面渲染冒烟通过"
+          test -f "$RENDER_SMOKE_ROOT/logs/dsh-render.json" || { echo "❌ Windows DSH 渲染探针缺失"; exit 1; }
+          echo "✅ 真实 Windows 应用后端 + DSH 页面渲染冒烟通过"
         timeout-minutes: 20
       - name: 留存失败诊断（私有 Actions Artifact）
         if: failure()
@@ -417,8 +444,8 @@ jobs:
             ${{ runner.temp }}/wl-smoke/install-state.json
             ${{ runner.temp }}/wl-app-smoke/logs/*
             ${{ runner.temp }}/wl-app-smoke/install-state.json
-            ${{ runner.temp }}/wl-render-default/logs/*
-            ${{ runner.temp }}/wl-render-default/install-state.json
+            ${{ runner.temp }}/wl-render-dsh/logs/*
+            ${{ runner.temp }}/wl-render-dsh/install-state.json
           if-no-files-found: warn
           retention-days: 7
 
@@ -431,7 +458,7 @@ jobs:
           set -euo pipefail
           OUT="$RUNNER_TEMP/desktop-windows"
           mkdir -p "$OUT"
-          SOURCE="WorkLoom 织元-win-x64.exe"
+          SOURCE="WorkLoom PMtest-win-x64.exe"
           TARGET="WorkLoom-win-x64.exe"
           test "$(find release -maxdepth 1 -type f -name '*.exe' | wc -l | tr -d ' ')" -eq 1
           test -f "release/$SOURCE"

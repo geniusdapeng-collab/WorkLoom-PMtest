@@ -168,6 +168,7 @@ test("PMtest 源码客户端从正式产品清单派生名称、隔离目录和�
     assert.equal(config.webPort, 5404);
     assert.equal(config.serverPort, 9018);
     assert.equal(config.environment.WORKLOOM_APP_TITLE, "WorkLoom PMtest");
+    assert.equal(config.environment.WORKLOOM_START_PATH, "/");
     assert.equal(basename(config.environment.WORKLOOM_SUPPORT_DIR!), "workloom-pmtest");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -41,6 +41,7 @@ esac
 NODE_VER="24.19.0"
 PGAPP_VER="2.9.6-17"
 NATS_VER="v2.11.4"
+PREBUILT_RUNTIME_DIR="${WORKLOOM_PREBUILT_RUNTIME_DIR:-}"
 OUT="dist-payload"
 STAGE="$(mktemp -d /tmp/workloom-epayload.XXXXXX)"
 trap 'rm -rf "$STAGE"' EXIT
@@ -84,7 +85,7 @@ for d in "${RUNTIME_SOURCE_DIRS[@]}"; do
   mkdir -p "$R/$(dirname "$d")"
   copy "$d" "$R/$(dirname "$d")/"
 done
-cp scripts/migrate.ts scripts/desktop-bootstrap-db.mjs scripts/product-runtime.mjs scripts/vite-product.mjs "$R/scripts/"
+cp scripts/migrate.ts scripts/desktop-bootstrap-db.mjs scripts/product-runtime.mjs scripts/vite-product.mjs scripts/dsh-runtime.cjs "$R/scripts/"
 cp scripts/seed*.ts "$R/scripts/"  # 全部行业种子随包（seed/seed-aipm/seed-geo/seed-video/seed-consulting/seed-boost/seed-platform…按仓配置选用）
 printf '%s\n' "$VERSION" > "$R/VERSION"
 # 源码不携带 node_modules：运行期统一由下方 npm 扁平化安装的根 node_modules 提供（v2.0.8 实证）
@@ -118,44 +119,61 @@ for pkgjson in "${INTERNAL_PACKAGE_MANIFESTS[@]}"; do
   node scripts/prune-workspace-deps.mjs "$R/node_modules" "$pname"
 done
 
-# ---------- 3. Node 官方二进制（按平台/架构） ----------
-echo "→ Node ${NODE_VER} ${PLATFORM}-${ARCH}…"
-case "$PLATFORM-$ARCH" in
-  mac-arm64) NODE_DIST="node-v${NODE_VER}-darwin-arm64.tar.gz" ;;
-  mac-x64)   NODE_DIST="node-v${NODE_VER}-darwin-x64.tar.gz" ;;
-  win-x64)   NODE_DIST="node-v${NODE_VER}-win-x64.zip" ;;
-  *) echo "❌ 不支持的平台组合 $PLATFORM-$ARCH"; exit 1 ;;
-esac
-workloom_fetch_verified "$STAGE/$NODE_DIST" "$NODE_DIST" \
-  "https://nodejs.org/dist/v${NODE_VER}/${NODE_DIST}" \
-  "https://npmmirror.com/mirrors/node/v${NODE_VER}/${NODE_DIST}"
-mkdir -p "$OUT/node" "$STAGE/node"
-if [[ "$NODE_DIST" == *.zip ]]; then
-  unzip -q "$STAGE/$NODE_DIST" -d "$STAGE/node"
-  copy "$STAGE/node/node-v${NODE_VER}-win-x64/"* "$OUT/node/"
-else
-  tar xzf "$STAGE/$NODE_DIST" -C "$STAGE/node"
-  NDIR="$(find "$STAGE/node" -maxdepth 1 -type d -name "node-v*" | head -1)"
-  for sub in bin lib include share; do
-    [ -d "$NDIR/$sub" ] && copy "$NDIR/$sub" "$OUT/node/"
+# ---------- 3/4/5. Node + PostgreSQL + NATS ----------
+if [ -n "$PREBUILT_RUNTIME_DIR" ]; then
+  echo "→ 复用已验证的预构建运行时：$PREBUILT_RUNTIME_DIR"
+  for part in node pg nats; do
+    [ -d "$PREBUILT_RUNTIME_DIR/$part" ] || { echo "❌ 预构建运行时缺 $part"; exit 1; }
+    copy "$PREBUILT_RUNTIME_DIR/$part" "$OUT/$part"
   done
-fi
-
-# ---------- 4. PostgreSQL 17 + pgvector（bin/lib/share 同构摊平） ----------
-echo "→ PostgreSQL + pgvector…"
-mkdir -p "$OUT/pg"
-if [ "$PLATFORM" = "mac" ]; then
-  # Postgres.app 2.9.6-17 为 universal 二进制（arm64+x86_64 通吃）
-  PGAPP_DIST="Postgres-${PGAPP_VER}.dmg"
-  workloom_fetch_verified "$STAGE/pg.dmg" "$PGAPP_DIST" "https://github.com/PostgresApp/PostgresApp/releases/download/v2.9.6/${PGAPP_DIST}"
-  hdiutil attach -nobrowse -mountpoint "$STAGE/mnt" "$STAGE/pg.dmg" >/dev/null
-  copy "$STAGE/mnt/Postgres.app/Contents/Versions/17/bin" "$OUT/pg/bin"
-  copy "$STAGE/mnt/Postgres.app/Contents/Versions/17/lib" "$OUT/pg/lib"
-  copy "$STAGE/mnt/Postgres.app/Contents/Versions/17/share" "$OUT/pg/share"
-  hdiutil detach "$STAGE/mnt" >/dev/null
-  [ -x "$OUT/pg/bin/postgres" ] || { echo "❌ PG 结构异常（postgres 缺失）"; exit 1; }
-  ls "$OUT/pg/lib/postgresql/vector.dylib" >/dev/null || { echo "❌ pgvector 未随包"; exit 1; }
+  NODE_BIN="$OUT/node/bin/node"
+  [ -x "$NODE_BIN" ] || NODE_BIN="$OUT/node/node.exe"
+  [ -x "$NODE_BIN" ] || { echo "❌ 预构建 Node 不可执行"; exit 1; }
+  [ "$("$NODE_BIN" --version)" = "v${NODE_VER}" ] || { echo "❌ 预构建 Node 版本不匹配"; exit 1; }
+  "$OUT/pg/bin/postgres" --version | grep -q " 17\\." || { echo "❌ 预构建 PostgreSQL 不是 17"; exit 1; }
+  [ "$("$OUT/nats/nats-server" --version | awk '{print $2}')" = "$NATS_VER" ] || { echo "❌ 预构建 NATS 版本不匹配"; exit 1; }
+  if [ "$PLATFORM" = "mac" ]; then
+    [ -f "$OUT/pg/lib/postgresql/vector.dylib" ] || { echo "❌ 预构建 pgvector 未随包"; exit 1; }
+  else
+    [ -f "$OUT/pg/lib/vector.dll" ] || { echo "❌ 预构建 pgvector 未随包"; exit 1; }
+  fi
 else
+  echo "→ Node ${NODE_VER} ${PLATFORM}-${ARCH}…"
+  case "$PLATFORM-$ARCH" in
+    mac-arm64) NODE_DIST="node-v${NODE_VER}-darwin-arm64.tar.gz" ;;
+    mac-x64)   NODE_DIST="node-v${NODE_VER}-darwin-x64.tar.gz" ;;
+    win-x64)   NODE_DIST="node-v${NODE_VER}-win-x64.zip" ;;
+    *) echo "❌ 不支持的平台组合 $PLATFORM-$ARCH"; exit 1 ;;
+  esac
+  workloom_fetch_verified "$STAGE/$NODE_DIST" "$NODE_DIST" \
+    "https://nodejs.org/dist/v${NODE_VER}/${NODE_DIST}" \
+    "https://npmmirror.com/mirrors/node/v${NODE_VER}/${NODE_DIST}"
+  mkdir -p "$OUT/node" "$STAGE/node"
+  if [[ "$NODE_DIST" == *.zip ]]; then
+    unzip -q "$STAGE/$NODE_DIST" -d "$STAGE/node"
+    copy "$STAGE/node/node-v${NODE_VER}-win-x64/"* "$OUT/node/"
+  else
+    tar xzf "$STAGE/$NODE_DIST" -C "$STAGE/node"
+    NDIR="$(find "$STAGE/node" -maxdepth 1 -type d -name "node-v*" | head -1)"
+    for sub in bin lib include share; do
+      [ -d "$NDIR/$sub" ] && copy "$NDIR/$sub" "$OUT/node/"
+    done
+  fi
+
+  echo "→ PostgreSQL + pgvector…"
+  mkdir -p "$OUT/pg"
+  if [ "$PLATFORM" = "mac" ]; then
+    # Postgres.app 2.9.6-17 为 universal 二进制（arm64+x86_64 通吃）
+    PGAPP_DIST="Postgres-${PGAPP_VER}.dmg"
+    workloom_fetch_verified "$STAGE/pg.dmg" "$PGAPP_DIST" "https://github.com/PostgresApp/PostgresApp/releases/download/v2.9.6/${PGAPP_DIST}"
+    hdiutil attach -nobrowse -mountpoint "$STAGE/mnt" "$STAGE/pg.dmg" >/dev/null
+    copy "$STAGE/mnt/Postgres.app/Contents/Versions/17/bin" "$OUT/pg/bin"
+    copy "$STAGE/mnt/Postgres.app/Contents/Versions/17/lib" "$OUT/pg/lib"
+    copy "$STAGE/mnt/Postgres.app/Contents/Versions/17/share" "$OUT/pg/share"
+    hdiutil detach "$STAGE/mnt" >/dev/null
+    [ -x "$OUT/pg/bin/postgres" ] || { echo "❌ PG 结构异常（postgres 缺失）"; exit 1; }
+    ls "$OUT/pg/lib/postgresql/vector.dylib" >/dev/null || { echo "❌ pgvector 未随包"; exit 1; }
+  else
   # Windows：vendor/pg-win（与 pgvector 编译底座同源 EDB 全量树，82139ce 口径）+ CI 预编译 pgvector
   [ -f "vendor/pg-win/bin/postgres.exe" ] || { echo "❌ 缺 vendor/pg-win——先跑 scripts/build-pgvector-win.ps1"; exit 1; }
   node scripts/release-assets.mjs verify-windows-pg-provenance vendor/pg-win/WORKLOOM-PROVENANCE.txt
@@ -168,38 +186,40 @@ else
   cp "$PV/lib/vector.dll" "$OUT/pg/lib/"
   cp "$PV"/share/extension/vector.control "$OUT/pg/share/extension/"
   cp "$PV"/share/extension/vector--*.sql "$OUT/pg/share/extension/"
-  echo "✓ pgvector 合入（vector.dll + control + sql）"
-fi
+    echo "✓ pgvector 合入（vector.dll + control + sql）"
+  fi
 
-# ---------- 5. nats-server（JetStream；+20MB 开箱即持久化事件总线） ----------
-echo "→ nats-server ${NATS_VER}…"
-mkdir -p "$OUT/nats"
-case "$PLATFORM-$ARCH" in
-  mac-arm64) NATS_DIST="nats-server-${NATS_VER}-darwin-arm64.tar.gz" ;;
-  mac-x64)   NATS_DIST="nats-server-${NATS_VER}-darwin-amd64.tar.gz" ;;
-  win-x64)   NATS_DIST="nats-server-${NATS_VER}-windows-amd64.zip" ;;
-esac
-workloom_fetch_verified "$STAGE/$NATS_DIST" "$NATS_DIST" "https://github.com/nats-io/nats-server/releases/download/${NATS_VER}/${NATS_DIST}"
-if [[ "$NATS_DIST" == *.zip ]]; then
-  unzip -qo "$STAGE/$NATS_DIST" -d "$STAGE/nats-x"
-  cp "$STAGE/nats-x/nats-server-${NATS_VER}-windows-amd64/nats-server.exe" "$OUT/nats/"
-else
-  mkdir -p "$STAGE/nats-x"
-  tar xzf "$STAGE/$NATS_DIST" -C "$STAGE/nats-x"
-  cp "$STAGE/nats-x/nats-server-${NATS_VER}-"*/nats-server "$OUT/nats/"
-  chmod +x "$OUT/nats/nats-server"
+  echo "→ nats-server ${NATS_VER}…"
+  mkdir -p "$OUT/nats"
+  case "$PLATFORM-$ARCH" in
+    mac-arm64) NATS_DIST="nats-server-${NATS_VER}-darwin-arm64.tar.gz" ;;
+    mac-x64)   NATS_DIST="nats-server-${NATS_VER}-darwin-amd64.tar.gz" ;;
+    win-x64)   NATS_DIST="nats-server-${NATS_VER}-windows-amd64.zip" ;;
+  esac
+  workloom_fetch_verified "$STAGE/$NATS_DIST" "$NATS_DIST" "https://github.com/nats-io/nats-server/releases/download/${NATS_VER}/${NATS_DIST}"
+  if [[ "$NATS_DIST" == *.zip ]]; then
+    unzip -qo "$STAGE/$NATS_DIST" -d "$STAGE/nats-x"
+    cp "$STAGE/nats-x/nats-server-${NATS_VER}-windows-amd64/nats-server.exe" "$OUT/nats/"
+  else
+    mkdir -p "$STAGE/nats-x"
+    tar xzf "$STAGE/$NATS_DIST" -C "$STAGE/nats-x"
+    cp "$STAGE/nats-x/nats-server-${NATS_VER}-"*/nats-server "$OUT/nats/"
+    chmod +x "$OUT/nats/nats-server"
+  fi
 fi
 
 # ---------- 9. 载荷自检（v2.2.1 实证：NATS 段变量粘连致脚本中途异常但步骤未失败，
 #      DMG 带着残缺载荷照出——装配脚本必须自证完整，防"静默半成品"） ----------
 for f in runtime/node_modules/tsx/package.json runtime/node_modules/hono/package.json \
-         runtime/scripts/migrate.ts runtime/scripts/product-runtime.mjs runtime/scripts/vite-product.mjs \
+         runtime/scripts/migrate.ts runtime/scripts/product-runtime.mjs runtime/scripts/vite-product.mjs runtime/scripts/dsh-runtime.cjs \
          runtime/product.manifest.json runtime/apps/web/vite.config.ts; do
   [ -f "$OUT/$f" ] || { echo "❌ 载荷自检失败：$f 缺失"; exit 1; }
 done
 # PM 的真实 Harness 由 server 直接依赖锁定；缺运行时不得继续出安装包。
 if node -e 'process.exit(require("./apps/server/package.json").dependencies?.["@deepseek-ai/dsh"] ? 0 : 1)'; then
   for f in runtime/node_modules/@deepseek-ai/dsh/package.json runtime/node_modules/@deepseek-ai/dsh/lib/bin.js \
+           runtime/node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html \
+           runtime/packages/pm-dsh-client/package.json runtime/packages/pm-dsh-client/lib/index.js runtime/packages/pm-dsh-client/lib/client.js \
            runtime/apps/server/src/industry/ai-pm/dsh-adapter.ts runtime/apps/server/src/industry/ai-pm/dsh-workspace.plugin.mjs \
            runtime/apps/server/src/industry/ai-pm/code-verifier.ts runtime/apps/server/src/industry/ai-pm/code-test-runner.mjs \
            runtime/apps/server/src/industry/ai-pm/code-test-preload.mjs; do

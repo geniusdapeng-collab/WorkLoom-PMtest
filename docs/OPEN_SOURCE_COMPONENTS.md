@@ -1,9 +1,9 @@
-# WorkLoom 开源组件清单 · workloom-pm
+# WorkLoom 开源组件清单 · workloom-pmtest
 
 <!-- 自动生成，请勿手改：node scripts/oss-inventory.mjs --write -->
 
 > 生成器：`scripts/oss-inventory.mjs`（离线事实）＋ `scripts/oss-watch.sh`（上游最新版本）
-> 仓库：geniusdapeng-collab/workloom-pm ｜ 最近一次成功扫描：尚未记录已核实成功（运行 `pnpm oss:watch`） ｜ 最近尝试：未记录
+> 仓库：geniusdapeng-collab/WorkLoom-PMtest ｜ 最近一次成功扫描：尚未记录已核实成功（运行 `pnpm oss:watch`） ｜ 最近尝试：未记录
 > 历史全量扫描/尝试（未核实）：2026-09-19T10:16:38.000Z
 > 每项上游版本按成功时间、查询状态和 TTL 单独判定；历史缓存与失败查询不作本次最新版本结论。
 > 统计：登记组件 99 个 ｜ npm 直接依赖 183 个 ｜ Python 依赖 5 个 ｜ 容器镜像 2 个
@@ -24,7 +24,7 @@
 | # | 组件 | 开源地址 / 许可 | 当前使用版本 | 上游最新 | 状态 | 使用位置 | 注意事项 |
 |---|---|---|---|---|---|---|---|
 | 1 | Hugging Face Tokenizers.js | [github.com/huggingface/tokenizers.js](https://github.com/huggingface/tokenizers.js) · Apache-2.0 | 0.2.0 | 0.2.0（历史记录；未核实或已过期） | 运行时 | packages/base/model-router（DeepSeek V4.1 实际请求计量）、桌面生产载荷（纯 JavaScript，离线运行） | 只作 BPE 编码引擎，DeepSeek 官方模板、词表与许可在 model-router/assets/deepseek-v41 固定；升级须对照官方 recipe 完整 token ID 并通过三目标运行时载荷校验。 |
-| 2 | DeepSeek Harness（dsh） | [github.com/deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) · MIT | 0.2.1-rc.2 | 0.2.1-rc.2（历史记录；未核实或已过期） | 运行时 | vendor/dsh（审计基线）、packages/runtime/dsh-gate（锁定运行时） | Agent 运行时地基：锁版 + 内部 fork 镜像，任何新版本（含 rc 预发布）即触发升级；每次单独一批，必过 PM DSH 真实子进程回归、E6 回归与 H-5 kill -9 重放，并核对 vendor tarball integrity。0.2.1-rc.2 的官方发布说明明确适配 DeepSeek-V4.1-Flash-1017 与 Search/Fetch API；root workspace 和 dsh-gate 均锁同一家族版本，@opentelemetry/api 固定 1.9.0。E6/H-5 的 Mock 端口可用 DSH_GATE_MOCK_PORT 覆盖（默认 8799）。历史升级与回归见 vendor/dsh/VENDOR.md。 |
+| 2 | DeepSeek Harness（dsh） | [github.com/deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) · MIT | 0.2.1-rc.2 | 0.2.1-rc.2（历史记录；未核实或已过期） | 运行时 | vendor/dsh（审计基线）、packages/runtime/dsh-gate（锁定运行时）、PMTest 桌面会话（官方 dsh-web-frontend 与 WorkLoom PM 宿主插件） | PM 与桌面会话使用同一锁定发行家族。升级单独评测，执行 PM DSH 子进程、E6 与 H-5 重放、桌面会话及载荷测试，并核对官方 npm integrity 与随包 MIT 许可。0.2.1-rc.2 对应 DeepSeek-V4.1-Flash-1017。源码审阅 pin 与运行 pin 见 docs/DSH-CLIENT-MIGRATION.md，历史运行时回归见 vendor/dsh/VENDOR.md。 |
 | 3 | Cordis（插件元框架） | [github.com/cordiverse/cordis](https://github.com/cordiverse/cordis) · MIT | 4.0.5 | 4.0.2（历史记录；未核实或已过期） | 运行时 | 随 dsh 分发（插件元框架）、packages/runtime/plugins | 插件可撤销效果是技能绑定围栏、插件卸载即撤销的运行时保证；实际版本以 dsh 锁定树为准（上游独立仓为 4.0.0-rc 线，跟随 dsh 升级） |
 | 4 | Schemastery | [github.com/deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) · MIT | 3.18.5 | 3.18.2（历史记录；未核实或已过期） | 运行时 | 随 dsh 分发（配置 schema 引擎） | 配置文件校验引擎；随 dsh 锁定树升级，不单独升级 |
 | 5 | node-addon-require-builtin | [github.com/deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) · MIT | 0.1.9 | 0.1.6（历史记录；未核实或已过期） | 运行时 | 随 dsh 分发（原生插件加载） | dsh 原生插件加载依赖；随 dsh 锁定树升级 |

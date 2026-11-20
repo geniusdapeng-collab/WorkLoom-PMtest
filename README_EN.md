@@ -6,13 +6,18 @@
 
 You supply the goal and boundaries. The product manager coordinates requirements, implementation, quality, and delivery. The system reports not only what it did, but also who did it, which material was consumed, which files were produced, which checks ran, and what remains unverified.
 
-[简体中文](README.md) · [Core capabilities](#core-capabilities-from-a-goal-to-verifiable-delivery) · [Cloud workbench](docs/ASSISTANT-WORKBENCH.md) · [Delivery architecture](docs/PM-DELIVERY.md) · [218-task evaluation](docs/DEEPSEEK-218-EVALUATION.md) · [Apache-2.0](LICENSE)
+[简体中文](README.md) · [Core capabilities](#core-capabilities-from-a-goal-to-verifiable-delivery) · [DSH client migration](docs/DSH-CLIENT-MIGRATION.md) · [Cloud workbench](docs/ASSISTANT-WORKBENCH.md) · [Delivery architecture](docs/PM-DELIVERY.md) · [218-task evaluation](docs/DEEPSEEK-218-EVALUATION.md) · [Apache-2.0](LICENSE)
 
 </div>
 
 WorkLoom PM is for product owners, founders, and small development teams. It is not a single-purpose writing or coding assistant. It connects **goal clarification, role coordination, restricted execution, quality verification, and release gates** into one AI product-development workflow.
 
-The PC workspace entry is **Development, `/development`**. The PM team view presents goals, task dependencies, execution, and artifacts. The original DevFabric development workspace remains available as another view. Desktop and browser development clients use the same server.
+The default desktop entry is now a **DeepSeek Harness-based conversation workspace**. A user states a goal in one composer; DSH calls the PM team through a per-launch loopback capability. PM retains ownership of the role DAG, restricted execution, artifact hashes, verification, and delivery receipts. The original WorkLoom Development view at `/development` remains available as an explicit rollback mode.
+
+```bash
+pnpm app                         # default: DeepSeek Harness workspace
+WORKLOOM_CLIENT=legacy pnpm app  # rollback: original WorkLoom multi-page client
+```
 
 For actual delivery results, use the source revision, model, samples, and evidence recorded in [PM-EVALUATION.md](docs/PM-EVALUATION.md). Employee definitions, skill files, seeded examples, and historical test badges do not establish a live success rate. This README does not advertise a signed WorkLoom PM installer.
 
@@ -134,7 +139,7 @@ The default real model is **`deepseek-flash`**. DeepSeek's documentation observe
 
 The explicit `deepseek_search` and `deepseek_fetch` function tools call DeepSeek's own Search/Fetch API. **Having search tools does not mean every request automatically searches the web.** A permitted role must invoke retrieval and retain sources. Flash ignores the Responses API's native `web_search` tool; adding that field alone does not prove that retrieval happened. [Search & Fetch](https://api-docs.deepseek.com/guides/search/) · [Responses compatibility](https://api-docs.deepseek.com/guides/responses_api/)
 
-DeepSeek Harness provides a model/tool execution loop and sessions. It is not another product manager. Development nodes pin `@deepseek-ai/dsh@0.2.1-rc.2` and operate within an isolated working directory and an explicit file-tool scope. Connecting a model does not open arbitrary host commands, production data, or external publishing. The PM team layer manages the role DAG, artifact ownership, and acceptance.
+DeepSeek Harness is both the visible desktop conversation layer and the development-node execution loop. It is not another product manager. The `@workloom/dsh-pm-client` plugin registers PM mission tools and replaces the default brand through documented DSH extension points. The runtime pins `@deepseek-ai/dsh@0.2.1-rc.2`; development nodes remain restricted to an isolated working directory and an explicit file-tool scope. The PM team layer owns the role DAG, artifact ownership, and acceptance.
 
 **The client includes a model adapter and defaults, not a shared plaintext API key.** Inject the real key through the launch environment or controlled local secret management. It must not enter source code, browser assets, documentation, logs, or installer files.
 
@@ -172,11 +177,20 @@ Inject `DEEPSEEK_API_KEY` into the launch process through your controlled mechan
 pnpm app:dev
 ```
 
-The source launcher reads the root `.env`, applies explicit process overrides, and passes the resolved configuration to the server, Web client, and Electron. Default ports derive from the product manifest offset. For browser development, run `SERVER_PORT=8987 WEB_PORT=5373 pnpm dev` and open `http://localhost:5373/development`; update both process variables when using custom ports. `pnpm app` builds the Web client and opens Electron; `pnpm app:dev` uses HMR. `pnpm app --smoke` checks source services and the Electron main process; it does not replace packaged rendering, signing, or notarization acceptance.
+The source launcher reads the root `.env` and applies explicit process overrides. The PM server receives its database configuration, and the DSH host receives the runtime and model configuration it needs. Default ports derive from the product manifest offset. `pnpm app` starts the PM server, DSH, and Electron. `pnpm app --smoke` checks the source services, DSH session handshake, and Electron main process.
 
-The controlled product manifest sets `desktop.startPath` to `/development` for both source and packaged desktop launches. `WORKLOOM_START_PATH` can explicitly select another safe local route. The original operating home remains accessible from navigation. This product sets `clients.bPc.secretaryAutoScan` to `false`, disabling automatic secretary writes while browsing. Existing inbox items still refresh every 20 seconds, and user-initiated assistant actions remain available.
+The controlled product manifest sets `desktop.startPath` to DSH `/`. DSH sessions and workspace state live under the product-specific `WORKLOOM_SUPPORT_DIR/.workloom-dsh`; the PM database remains in its existing isolated directory. Rollback mode and all original PC, mobile-B, and mobile-C files remain present.
 
-Product identity is `workloom-pm`, desktop appId is `com.workloom.pm`, and port offset is `200`. Packaged defaults are server `8987`, Web `5373`, PostgreSQL `5632`, and NATS `4422`. Source databases use the configured connection strings. Source-client support data defaults to `workloom-pm` under the operating system application-data directory; `WORKLOOM_SUPPORT_DIR` provides an explicit override. The Electron name and shortcuts use the independent product identity.
+### DSH adaptation boundary
+
+- The official DSH core is not copied or patched; the PM plugin uses documented tool and slot extension points.
+- Upstream source was downloaded and reviewed at `deepseek-ai/deepseek-harness#dsh-v0.2.2-rc.5`; the runtime remains on the repository's already-gated `0.2.1-rc.2` so the UI migration does not silently change the harness being evaluated.
+- The model key remains process-supplied. The PM bridge capability is random per launch, loopback-only, and lives only in the server and DSH host process memory.
+- `WORKLOOM_CLIENT=legacy` is the complete client rollback switch.
+
+Product identity is `workloom-pmtest`, desktop appId is `com.workloom.pmtest`, and port offset is `231`. Packaged defaults are server `9018`, Web `5404`, PostgreSQL `5663`, and NATS `4453`. Source databases use the configured connection strings. Source-client support data defaults to `workloom-pmtest` under the operating system application-data directory. Set `WORKLOOM_SUPPORT_DIR` to override it.
+
+On first launch the installed app initializes its embedded runtime and database in the app support directory. Set `DEEPSEEK_API_KEY` in the app environment or in the generated `runtime/.env`, then restart before submitting real tasks. The default macOS file is `~/Library/Application Support/WorkLoom PMtest/runtime/.env`.
 
 Inherited `setup`, `preview:all`, and other industry demonstrations are retained. `preview:all` is an inherited demonstration path; its readiness banner cannot establish real PM delivery. Check its current ports and database configuration before using it alongside an existing IM development instance.
 

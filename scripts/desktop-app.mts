@@ -13,8 +13,10 @@
  * 前置：未初始化环境时自动提示先跑 pnpm setup（幂等，已装好直接跳过）。
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:net";
+import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,6 +24,7 @@ import { parseEnv } from "node:util";
 import { loadProductRuntime, validateProductStartPath } from "./product-runtime.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const dshRuntime = createRequire(import.meta.url)("./dsh-runtime.cjs") as typeof import("./dsh-runtime.cjs");
 const DEV = process.argv.includes("--dev");
 const SMOKE = process.argv.includes("--smoke");
 
@@ -48,13 +51,13 @@ function stopAll(code = 0) {
 process.on("SIGINT", () => stopAll(0));
 process.on("SIGTERM", () => stopAll(0));
 
-function run(cmd: string, args: string[], name: string, env: NodeJS.ProcessEnv = {}): ChildProcess {
+function run(cmd: string, args: string[], name: string, env: NodeJS.ProcessEnv, cwd = ROOT, ipc = false): ChildProcess {
   const p = spawn(cmd, args, {
-    cwd: ROOT,
-    env: { ...process.env, ...env },
-    stdio: ["ignore", "pipe", "pipe"],
+    cwd,
+    env,
+    stdio: ipc ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
     // Windows 兼容：pnpm 等命令是 .cmd 脚本，无 shell 无法执行（ENOENT）
-    shell: process.platform === "win32",
+    shell: process.platform === "win32" && cmd === "pnpm",
   });
   p.stdout?.on("data", (d: Buffer) => process.stdout.write(`${C.cyn}[${name}]${C.rst} ${d}`));
   p.stderr?.on("data", (d: Buffer) => process.stderr.write(`${C.yel}[${name}]${C.rst} ${d}`));
@@ -263,6 +266,7 @@ export function buildElectronEnvironment({
   delete result.WORKLOOM_RESOURCES;
   delete result.WORKLOOM_WEB_URL;
   delete result.WORKLOOM_SERVER_URL;
+  delete result.WORKLOOM_SOURCE_DSH_WEB_URL;
   result.WORKLOOM_SUPPORT_DIR = supportDir ?? sourceSupportDirectory(sourceRoot, environment);
   return result;
 }
@@ -342,6 +346,29 @@ async function main() {
     process.exit(1);
   }
 
+  const clientMode = dshRuntime.resolveClientMode(runtimeEnvironment);
+  const bridgeToken = clientMode === "dsh" ? dshRuntime.createBridgeToken(randomBytes) : undefined;
+  const dsh = clientMode === "dsh"
+    ? dshRuntime.prepareDshRuntime({ root: sourceRoot, supportDir: runtimeEnvironment.WORKLOOM_SUPPORT_DIR! })
+    : null;
+  const serverEnvironment: NodeJS.ProcessEnv = {
+    ...runtimeEnvironment,
+    PM_DSH_BRIDGE_TOKEN: bridgeToken ?? "",
+    ...(dsh ? {
+      WORKLOOM_PM_WORKSPACE_SLUG: dsh.product.workspaceSlug,
+      WORKLOOM_PM_MEMBER_NO: dsh.product.memberNo,
+    } : {}),
+  };
+  const electronEnvironment: NodeJS.ProcessEnv = {
+    ...runtimeEnvironment,
+    WORKLOOM_CLIENT: clientMode,
+    WORKLOOM_START_PATH: clientMode === "legacy" && !process.env.WORKLOOM_START_PATH
+      ? "/development" : runtimeEnvironment.WORKLOOM_START_PATH,
+  };
+  say(clientMode === "dsh"
+    ? `客户端：DeepSeek Harness ${dsh!.dshVersion}（PM 原生工具与 WorkLoom 品牌适配）`
+    : "客户端：legacy WorkLoom 多页工作台（显式回退）");
+
   // ③ 端口冲突预检
   for (const port of [SERVER_PORT, WEB_PORT]) {
     if (await portBusy(port)) {
@@ -352,27 +379,42 @@ async function main() {
 
   // ④ 源码 server 由编排器启动；正式安装包仍由 Electron bootstrap 管理内嵌运行时。
   say(`启动源码 server（:${SERVER_PORT}）…`);
-  run("pnpm", ["-C", "apps/server", DEV ? "dev" : "start"], "server", runtimeEnvironment);
+  run("pnpm", ["-C", "apps/server", DEV ? "dev" : "start"], "server", serverEnvironment);
   if (!(await waitHealth(`http://localhost:${SERVER_PORT}/health`, 60))) {
     warn(`server ${SERVER_PORT} 未就绪`); stopAll(1); return;
   }
   say("server 就绪 ✓");
 
-  // ⑤ 起 web（生产=构建+preview；开发=vite dev）
-  if (!DEV) {
-    say("构建 web 生产包（首次约 1-2 分钟）…");
+  // ⑤ 默认启动官方 DSH Web/Desktop 前端；legacy 仅作显式回滚。
+  let dshWebUrl: string | undefined;
+  if (dsh && bridgeToken) {
+    say(`启动 DeepSeek Harness（:${WEB_PORT}）…`);
+    const args = dshRuntime.dshArgs({
+      cli: dsh.dshCli,
+      port: WEB_PORT,
+      patchFile: dsh.patchFile,
+      open: false,
+    });
+    const child = run(process.execPath, args, "dsh", dshRuntime.dshEnvironment(runtimeEnvironment, {
+      serverPort: SERVER_PORT,
+      token: bridgeToken,
+      dshHome: dsh.dshHome,
+    }), dsh.workspaceDir, true);
+    dshWebUrl = await dshRuntime.waitForDshUrl(child, WEB_PORT, 60_000);
+  } else if (!DEV) {
+    say("构建 legacy WorkLoom web 生产包（首次约 1-2 分钟）…");
     const build = spawnSync("pnpm", ["-C", "apps/web", "build"], { cwd: ROOT, stdio: "inherit", env: runtimeEnvironment, shell: process.platform === "win32" });
     if (build.status !== 0) { warn("web 构建失败"); stopAll(1); return; }
-    say(`启动 web 预览（:${WEB_PORT}）…`);
+    say(`启动 legacy web 预览（:${WEB_PORT}）…`);
     run("pnpm", ["-C", "apps/web", "preview"], "web", runtimeEnvironment);
   } else {
-    say(`启动 web dev server（:${WEB_PORT}，HMR）…`);
+    say(`启动 legacy web dev server（:${WEB_PORT}，HMR）…`);
     run("pnpm", ["-C", "apps/web", "dev"], "web", runtimeEnvironment);
   }
-  if (!(await waitHealth(`http://localhost:${WEB_PORT}/`, 30))) {
-    warn(`web ${WEB_PORT} 未就绪`); stopAll(1); return;
+  if (!dshWebUrl && !(await waitHealth(`http://127.0.0.1:${WEB_PORT}/`, 30))) {
+    warn(`${clientMode === "dsh" ? "DSH" : "legacy web"} ${WEB_PORT} 未就绪`); stopAll(1); return;
   }
-  say("web 就绪 ✓");
+  say(`${clientMode === "dsh" ? "DSH" : "legacy web"} 就绪 ✓`);
 
   if (SMOKE) {
     // 源码冒烟验证外部源码服务与 Electron 主进程，可在 CI/无头环境执行。
@@ -382,15 +424,15 @@ async function main() {
     const needNoSandbox = process.platform === "linux" && typeof process.getuid === "function" && process.getuid() === 0;
     const e = spawn(electronBin, [...(needNoSandbox ? ["--no-sandbox"] : []), join(ROOT, "apps/desktop/electron/main.cjs")], {
       cwd: ROOT,
-      env: buildElectronEnvironment({
-        environment: runtimeEnvironment,
+      env: { ...buildElectronEnvironment({
+        environment: electronEnvironment,
         webPort: WEB_PORT,
         serverPort: SERVER_PORT,
         sourceRoot,
         sourceNode: process.execPath,
         supportDir: smokeSupport.supportDir,
         smoke: true,
-      }),
+      }), WORKLOOM_SOURCE_DSH_WEB_URL: dshWebUrl },
       stdio: "ignore",
     });
     children.push(e);
@@ -411,20 +453,20 @@ async function main() {
   }
 
   // ⑥ 拉起 Electron 原生窗口（窗口关闭 → 主进程退出 → 收掉全部子进程）
-  say(`打开桌面窗口 → http://localhost:${WEB_PORT}${runtimeEnvironment.WORKLOOM_START_PATH}`);
+  say(`打开桌面窗口 → http://127.0.0.1:${WEB_PORT}${electronEnvironment.WORKLOOM_START_PATH}`);
   // Linux root（容器/服务器）需 --no-sandbox；普通桌面用户不受影响
   const needNoSandbox = process.platform === "linux" && typeof process.getuid === "function" && process.getuid() === 0;
   const electronArgs = [...(needNoSandbox ? ["--no-sandbox"] : []), join(ROOT, "apps/desktop/electron/main.cjs")];
   const e = spawn(electronBin, electronArgs, {
     cwd: ROOT,
-    env: buildElectronEnvironment({
-      environment: runtimeEnvironment,
+    env: { ...buildElectronEnvironment({
+      environment: electronEnvironment,
       webPort: WEB_PORT,
       serverPort: SERVER_PORT,
       sourceRoot,
       sourceNode: process.execPath,
       smoke: false,
-    }),
+    }), WORKLOOM_SOURCE_DSH_WEB_URL: dshWebUrl },
     stdio: "inherit",
   });
   children.push(e);
