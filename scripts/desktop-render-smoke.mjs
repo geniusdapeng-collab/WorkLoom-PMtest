@@ -100,7 +100,12 @@ async function exerciseOwnerSetup(page, tokenKey, productPath) {
     await page.getByLabel(name, { exact: true }).or(page.getByPlaceholder(name, { exact: true })).first().fill(value, { timeout: 8_000 });
   }
   await page.getByRole("button", { name: "创建工作区", exact: true }).click({ timeout: 8_000 });
-  await page.waitForURL((url) => url.origin === web && url.pathname === productPath, { timeout: 16_000 });
+  try {
+    await page.waitForURL((url) => url.origin === web && url.pathname === productPath, { timeout: 16_000 });
+  } catch (error) {
+    const message = await page.getByRole("alert").first().textContent({ timeout: 1000 }).catch(() => null);
+    throw new Error(`创建工作区后未进入 ${productPath}${message ? `：${message.trim()}` : ""}`, { cause: error });
+  }
   const access = await page.evaluate(async (key) => {
     const token = localStorage.getItem(key);
     if (!token) return { status: 0 };
@@ -224,14 +229,18 @@ try {
   console.log(JSON.stringify(receipt));
 } finally {
   if (browser?.isConnected()) {
-    if (!outcome) {
-      const cdp = await browser.newBrowserCDPSession().catch(() => null);
-      await cdp?.send("Browser.close").catch(() => {});
-    }
-    await browser.close();
+    const closeBrowser = async () => {
+      if (!outcome) {
+        const cdp = await browser.newBrowserCDPSession();
+        await cdp.send("Browser.close");
+      }
+      await browser.close();
+    };
+    // Chromium can close before acknowledging Browser.close. Keep the original failure visible.
+    await Promise.race([closeBrowser().catch(() => {}), exited, pause(3000)]);
   }
   if (!outcome) {
-    await Promise.race([exited, pause(5000, null, { ref: false })]);
+    await Promise.race([exited, pause(5000)]);
     if (!outcome) child.kill("SIGTERM");
   }
 }

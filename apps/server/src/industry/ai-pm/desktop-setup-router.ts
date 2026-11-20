@@ -50,8 +50,9 @@ export function createPmDesktopSetupRouter({
     }
   });
 
-  app.onError((_error, context) => {
-    console.error("[pm-desktop] 本机工作区开通失败");
+  app.onError((error, context) => {
+    const frame = error.stack?.split("\n").find((line) => /^\s+at /u.test(line));
+    console.error("[pm-desktop] 本机工作区开通失败", { type: error.name, frame });
     return context.json({ error: "SETUP_FAILED" }, 500);
   });
   return app;
