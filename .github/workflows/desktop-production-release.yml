@@ -399,12 +399,17 @@ jobs:
           test -n "$EXE" || { echo "❌ Windows 应用主程序未生成"; exit 1; }
           INSTALLER="$(find release -maxdepth 1 -type f -name '*.exe' -print -quit)"
           test -n "$INSTALLER" || { echo "❌ Windows 安装包未生成"; exit 1; }
-          if [ "$PLATFORM_SIGNING" = "signed" ]; then
-            powershell -NoProfile -Command '$s = Get-AuthenticodeSignature -FilePath $args[0]; if ($s.Status -ne "Valid") { Write-Error "应用签名无效：$($s.Status)"; exit 1 }' "$EXE"
-            powershell -NoProfile -Command '$s = Get-AuthenticodeSignature -FilePath $args[0]; if ($s.Status -ne "Valid") { Write-Error "安装包签名无效：$($s.Status)"; exit 1 }' "$INSTALLER"
-          else
-            powershell -NoProfile -Command '$s = Get-AuthenticodeSignature -FilePath $args[0]; if ($s.Status -eq "Valid") { Write-Error "未签名模式不得混入未知正式证书"; exit 1 }; Write-Host "未签名状态：$($s.Status)"' "$INSTALLER"
-          fi
+          WORKLOOM_WINDOWS_APP="$EXE" WORKLOOM_WINDOWS_INSTALLER="$INSTALLER" \
+            powershell -NoProfile -NonInteractive -Command '
+              $ErrorActionPreference = "Stop"
+              $expected = if ($env:PLATFORM_SIGNING -eq "signed") { "Valid" } else { "NotSigned" }
+              foreach ($file in @($env:WORKLOOM_WINDOWS_APP, $env:WORKLOOM_WINDOWS_INSTALLER)) {
+                $signature = Get-AuthenticodeSignature -LiteralPath $file
+                if ($signature.Status -ne $expected) {
+                  throw "Authenticode $file`: expected $expected, received $($signature.Status)"
+                }
+                Write-Host "Authenticode $file`: $($signature.Status)"
+              }'
           node -e 'const {spawnSync}=require("node:child_process"); const r=spawnSync(process.argv[1],[],{stdio:"inherit",env:{...process.env,WORKLOOM_APP_SMOKE:"1",WORKLOOM_SUPPORT_DIR:process.argv[2]}}); process.exit(r.status ?? 1)' "$EXE" "$APP_SMOKE_ROOT"
           test -f "$APP_SMOKE_ROOT/.bootstrapped" || { echo "❌ 真实应用首启未完成"; exit 1; }
           node scripts/desktop-render-smoke.mjs "$EXE" "$RENDER_SMOKE_ROOT" default

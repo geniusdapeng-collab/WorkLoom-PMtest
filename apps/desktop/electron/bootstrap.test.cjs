@@ -159,12 +159,11 @@ describe("桌面载荷原子装配", () => {
 
   it("旧缓存提前写入版本号后中断解压，重启重新提取并暂存完整载荷", async () => {
     const { root, sourceRoot, supportDir } = fixture("2.0.0", false);
-    const archiveFile = path.join(root, "payload.tar.gz");
     const cacheDir = path.join(supportDir, ".payload-cache");
     try {
       fs.writeFileSync(path.join(root, "PAYLOAD_VERSION"), "2.0.0\n");
       fs.writeFileSync(path.join(sourceRoot, "PAYLOAD_VERSION"), "2.0.0\n");
-      const archived = spawnSync("tar", ["-czf", archiveFile, "-C", sourceRoot, "."], { encoding: "utf8" });
+      const archived = spawnSync("tar", ["-czf", "../payload.tar.gz", "."], { cwd: sourceRoot, encoding: "utf8" });
       assert.equal(archived.status, 0, archived.stderr || archived.error?.message);
       fs.mkdirSync(path.join(cacheDir, "runtime"), { recursive: true });
       fs.writeFileSync(path.join(cacheDir, "PAYLOAD_VERSION"), "2.0.0\n");

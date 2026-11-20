@@ -1,0 +1,5 @@
+# Keep checked-out text bytes stable for signed assets and Git Bash on Windows.
+* text=auto eol=lf
+
+# Preserve the exact bytes of the upstream Live2D bundle.
+apps/web/public/live2d/live2d.min.js -text

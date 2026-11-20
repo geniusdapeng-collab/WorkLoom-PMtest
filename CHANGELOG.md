@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- 固定跨平台检出的文本字节，确保 Windows 安装包按相同的行业包资产摘要验签。
+- 修正 Windows 发行流程的 Authenticode 路径传递，使安装包验收读取确切文件。
+
 ## 0.2.0
 
 - 桌面客户端继续使用 WorkLoom 开发场域、导航、DevFabric、任务与产物交互。
