@@ -57,8 +57,17 @@ import {
 } from "@workloom/base/review-console";
 import { routeIntent, runAsk } from "@workloom/runtime";
 import { LlmIntentClassifier, type IntentClassifier } from "@workloom/runtime";
-import { providerFromEnv, OpenAiCompatibleProvider } from "@workloom/base/model-router";
+import { providerFromEnv } from "@workloom/base/model-router";
 import { routedLlmCall, resetLlmAssembly } from "../service/llm.js";
+import {
+  canVerifySavedDeepSeek,
+  currentLlmConnection,
+  llmConnectionStatus,
+  llmCredentialFingerprint,
+  probeLlm,
+  sameLlmConnection,
+  type LlmConnection,
+} from "../service/onboarding-llm.js";
 import {
   evaluateRealModeReadiness,
   type ActivationGateResult,
@@ -218,11 +227,10 @@ const systemRouter = router({
 });
 
 /* ================= 落地向导（D24：模拟运行态 → 真实经营 切换面） =================
- * 契约：首次安装开箱即为「全模拟运行态」（种子数据 + mock 模型），P0/工作台横幅常显提示；
- * 向导四步（自检 → 真实大模型 → 经营主体 → 启用真实模式）尽量自动化：
- *  - saveLlmConfig 真实试调通过才落盘（.env 四变量 + process.env + 清缓存，全链即时真实化）
+ * 向导分别核验当前模型连接、经营主体和装配。桌面空库开通与正式经营激活是独立步骤。
+ *  - saveLlmConfig 试调通过才更新模型配置；verifyConfiguredLlm 试调已配置连接，无需重填密钥
  *  - activateRealMode 在服务端重新核验模型、主体、装配资产与考试绑定，通过才写入正式激活凭据
- * 全程五元事件留痕；API Key 只记掩码后 4 位（L6.2 同纪律）。
+ * 五元事件只记录连接状态。凭据指纹用于校验配置是否变更，不返回客户端。
  */
 
 /** 仓库根 .env 定位（cwd 可能是 apps/server 或仓库根；向上找 pnpm-workspace.yaml） */
@@ -259,38 +267,67 @@ function persistLlmEnv(cfg: { provider: string; baseUrl: string; apiKey: string;
   resetLlmAssembly(); // v3.0：模型池与行业策略缓存同步复位（写盘即全链生效免重启）
 }
 
-/** LLM 装配状态（真实=非 mock 且 baseUrl 齐备；apiKey 可空=免 key 网关） */
-function llmAssembly(): { provider: string; model: string; baseUrl: string; real: boolean } {
-  const provider = process.env.LLM_PROVIDER ?? "mock";
-  const baseUrl = process.env.LLM_BASE_URL ?? "";
-  return {
-    provider,
-    model: process.env.LLM_MODEL ?? "",
-    baseUrl,
-    real: provider !== "mock" && baseUrl.length > 0,
+async function recordLlmVerification(
+  scope: ReturnType<typeof scopeOf>,
+  memberNo: string,
+  input: LlmConnection,
+  source: "updated" | "existing",
+): Promise<void> {
+  const { provider, baseUrl, model, apiKey } = input;
+  const assertCurrent = () => {
+    if (source === "existing" && !sameLlmConnection(input, currentLlmConnection())) {
+      throw new TRPCError({ code: "CONFLICT", message: "模型配置在测试期间变更，请刷新后重新验证" });
+    }
   };
-}
-
-/** 仅用于判断当前凭据是否仍是已实测版本；不回传、不进事件明文。 */
-function llmCredentialFingerprint(apiKey: string): string {
-  return createHash("sha256").update(`workloom-llm-credential/v1:${apiKey}`, "utf8").digest("hex");
-}
-
-/** 真实试调探针（落地向导「测试连接」：真实 round-trip 通过才允许保存） */
-async function probeLlm(cfg: { baseUrl: string; apiKey?: string; model: string }): Promise<{ reply: string; latencyMs: number }> {
-  const provider = new OpenAiCompatibleProvider(cfg.model, { baseUrl: cfg.baseUrl, apiKey: cfg.apiKey || undefined });
-  const t0 = Date.now();
-  const res = await Promise.race([
-    provider.chat([{ role: "user", content: "你是企业经营系统的数字员工。请用一句中文回答：你已在线，可以开始工作。" }]),
-    new Promise<never>((_, rej) => setTimeout(() => rej(new Error("模型响应超时（25s）")), 25_000)),
-  ]);
-  if (!res.text.trim()) throw new Error("模型返回为空");
-  return { reply: res.text.trim().slice(0, 200), latencyMs: Date.now() - t0 };
+  assertCurrent();
+  const client = await getAppPool().connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT set_config('app.workspace_id', $1, true)", [scope.workspaceId]);
+    await client.query("SELECT set_config('app.tenant_id', $1, true)", [scope.tenantId]);
+    assertCurrent();
+    const verified = provider !== "mock";
+    const saved = await client.query(
+      `UPDATE profiles
+       SET archive=jsonb_set(archive, '{llmVerification}', $2::jsonb, true), updated_at=now()
+       WHERE workspace_id=$1`,
+      [scope.workspaceId, JSON.stringify({
+        provider, baseUrl, model, credentialFingerprint: llmCredentialFingerprint(apiKey), verified,
+        verifiedAt: verified ? new Date().toISOString() : null,
+        verifiedBy: verified ? memberNo : null,
+      })],
+    );
+    if (source === "existing" && saved.rowCount !== 1) {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "当前工作区缺少配置档案，无法记录模型验证" });
+    }
+    await gatewayAppendOnClient(client, {
+      ...scope, actor: { id: memberNo, type: "human" }, sessionId: `onboarding-${scope.workspaceId}`,
+    }, {
+      who: { type: "human", id: memberNo, role: "human" },
+      context: { tenant_id: scope.tenantId, workspace_id: scope.workspaceId, time: new Date().toISOString() },
+      object: { type: "workspace", id: scope.workspaceId },
+      decision: {
+        action: "onboarding.llm_configured",
+        params: { provider, base_url: llmConnectionStatus(input).baseUrl, model, configuration_source: source },
+        after: { real: verified },
+        basis: [source === "existing" ? "落地向导：现有模型连接实测通过" : "落地向导：更新模型服务配置"],
+      },
+      rule_impact: [],
+      model_trace: { model_id: "human-operator", tier: "standard" },
+    });
+    assertCurrent();
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 interface OnboardingGateSnapshot {
   persistedDataMode: "simulated" | "real";
-  llmVerified: boolean;
+  llm: ReturnType<typeof llmConnectionStatus> & { real: boolean };
   formalActivationRecorded: boolean;
   business: { name: string; industry: string; note: string; configuredAt: string; source: string } | null;
   workspace: { name: string; bundleId: string | null; isExample: boolean };
@@ -320,19 +357,6 @@ async function loadOnboardingGate(
   const business = rawBusiness && typeof rawBusiness === "object"
     ? rawBusiness as { name?: string; industry?: string; note?: string; configured_at?: string; source?: string }
     : null;
-  const currentLlm = llmAssembly();
-  const rawLlmVerification = archive.llmVerification;
-  const llmVerification = rawLlmVerification && typeof rawLlmVerification === "object"
-    ? rawLlmVerification as { provider?: string; baseUrl?: string; model?: string; credentialFingerprint?: string; verified?: boolean }
-    : null;
-  const llmVerified = Boolean(
-    currentLlm.real
-    && llmVerification?.verified
-    && llmVerification.provider === currentLlm.provider
-    && llmVerification.baseUrl === currentLlm.baseUrl
-    && llmVerification.model === currentLlm.model
-    && llmVerification.credentialFingerprint === llmCredentialFingerprint(process.env.LLM_API_KEY ?? ""),
-  );
   const rawFormalActivation = archive.realModeActivation;
   const formalActivationRecorded = Boolean(
     rawFormalActivation
@@ -458,6 +482,20 @@ async function loadOnboardingGate(
     };
   }
 
+  const currentLlm = currentLlmConnection();
+  const llmStatus = llmConnectionStatus(currentLlm);
+  const rawLlmVerification = archive.llmVerification;
+  const llmVerification = rawLlmVerification && typeof rawLlmVerification === "object"
+    ? rawLlmVerification as { provider?: string; baseUrl?: string; model?: string; credentialFingerprint?: string; verified?: boolean }
+    : null;
+  const llmVerified = Boolean(
+    llmStatus.configured
+    && llmVerification?.verified
+    && llmVerification.provider === currentLlm.provider
+    && llmVerification.baseUrl === currentLlm.baseUrl
+    && llmVerification.model === currentLlm.model
+    && llmVerification.credentialFingerprint === llmCredentialFingerprint(currentLlm.apiKey),
+  );
   const readinessFacts = {
     llmReal: llmVerified,
     workspaceIsExample: Boolean(workspace?.is_example),
@@ -481,7 +519,7 @@ async function loadOnboardingGate(
   };
   return {
     persistedDataMode: archive.dataMode === "real" ? "real" : "simulated",
-    llmVerified,
+    llm: { ...llmStatus, real: llmVerified },
     formalActivationRecorded,
     business: business ? {
       name: business.name ?? "",
@@ -604,7 +642,7 @@ const onboardingRouter = router({
         formalActivationRecorded: gateSnapshot.formalActivationRecorded,
         activationGate: gateSnapshot.gate,
         business: gateSnapshot.business,
-        llm: { ...llmAssembly(), real: gateSnapshot.llmVerified },
+        llm: gateSnapshot.llm,
         workspace: { name: gateSnapshot.workspace.name, events, members, agents, memories },
         workspaceId: scope.workspaceId,
         // V4 §2 示例明示：示例包装配标记（SimBanner 银带语义事实源）
@@ -627,14 +665,30 @@ const onboardingRouter = router({
     }))
     .mutation(async ({ input }) => {
       try {
-        const r = await probeLlm(input);
+        const r = await probeLlm(input, canVerifySavedDeepSeek({ ...input, provider: "deepseek" }));
         return { ok: true as const, ...r };
       } catch (err) {
         return { ok: false as const, error: err instanceof Error ? err.message : String(err) };
       }
     }),
 
-  /** 第①步保存：真实试调通过 → 写 .env 四变量 + 即时生效 + 事件留痕（key 只记掩码；provider=mock 为还原操作，免实测） */
+  /** 使用服务器已经配置的 DeepSeek 连接，只记录当前工作区的验证。 */
+  verifyConfiguredLlm: actionProcedure("workspace.configure").input(z.void()).mutation(async ({ ctx }) => {
+    const connection = currentLlmConnection();
+    if (!canVerifySavedDeepSeek(connection)) {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "服务器尚未配置可直接验证的 DeepSeek 官方连接" });
+    }
+    let latencyMs: number;
+    try {
+      ({ latencyMs } = await probeLlm(connection, true));
+    } catch {
+      throw new TRPCError({ code: "BAD_REQUEST", message: "DeepSeek 连接验证未通过，请检查当前模型配置和账户状态" });
+    }
+    await recordLlmVerification(scopeOf(ctx.identity), ctx.identity.memberNo, connection, "existing");
+    return { ok: true as const, real: true as const, latencyMs };
+  }),
+
+  /** 配置变更须经过真实试调，mock 为显式还原操作。 */
   saveLlmConfig: actionProcedure("workspace.configure")
     .input(z.object({
       provider: z.string().min(1).max(40),
@@ -649,57 +703,13 @@ const onboardingRouter = router({
           throw new TRPCError({ code: "BAD_REQUEST", message: "真实模型装配需要合法的 baseUrl 与 model" });
         }
         try {
-          await probeLlm({ baseUrl: input.baseUrl, apiKey: input.apiKey, model: input.model }); // 真实试调不过 → 拒绝保存（不落半残配置）
+          await probeLlm(input, canVerifySavedDeepSeek(input));
         } catch (err) {
           throw new TRPCError({ code: "BAD_REQUEST", message: `模型实测未通过，未保存：${err instanceof Error ? err.message : err}` });
         }
       }
       persistLlmEnv(input);
-      // D16（#1/A）：事件写入并入显式事务（.env 落盘不可回滚，故事件写在其成功后同一 COMMIT 提交）
-      const llmClient = await getAppPool().connect();
-      try {
-        await llmClient.query("BEGIN");
-        await llmClient.query("SELECT set_config('app.workspace_id', $1, true)", [scope.workspaceId]);
-        await llmClient.query("SELECT set_config('app.tenant_id', $1, true)", [scope.tenantId]);
-        await llmClient.query(
-          `UPDATE profiles
-           SET archive=jsonb_set(archive, '{llmVerification}', $2::jsonb, true), updated_at=now()
-           WHERE workspace_id=$1`,
-          [scope.workspaceId, JSON.stringify({
-            provider: input.provider,
-            baseUrl: input.baseUrl,
-            model: input.model,
-            credentialFingerprint: llmCredentialFingerprint(input.apiKey),
-            verified: input.provider !== "mock",
-            verifiedAt: input.provider !== "mock" ? new Date().toISOString() : null,
-            verifiedBy: input.provider !== "mock" ? ctx.identity.memberNo : null,
-          })],
-        );
-        await gatewayAppendOnClient(llmClient, {
-          ...scope, actor: { id: ctx.identity.memberNo, type: "human" }, sessionId: `onboarding-${scope.workspaceId}`,
-        }, {
-          who: { type: "human", id: ctx.identity.memberNo },
-          context: { tenant_id: scope.tenantId, workspace_id: scope.workspaceId, time: new Date().toISOString() },
-          object: { type: "workspace", id: scope.workspaceId },
-          decision: {
-            action: "onboarding.llm_configured",
-            params: {
-              provider: input.provider, base_url: input.baseUrl, model: input.model,
-              key_mask: input.apiKey ? `***${input.apiKey.slice(-4)}` : "(免 key 网关)",
-            },
-            after: { real: input.provider !== "mock" },
-            basis: ["落地向导：真实大模型装配（实测通过后写回 .env 四变量，全链即时生效）"],
-          },
-          rule_impact: [],
-          model_trace: { model_id: "human-operator", tier: "standard" },
-        });
-        await llmClient.query("COMMIT");
-      } catch (err) {
-        await llmClient.query("ROLLBACK").catch(() => undefined);
-        throw err;
-      } finally {
-        llmClient.release();
-      }
+      await recordLlmVerification(scope, ctx.identity.memberNo, input, "updated");
       return { ok: true, real: input.provider !== "mock" };
     }),
 

@@ -385,6 +385,7 @@ export default function PmDelivery() {
   const resumeBlock = detail?.resumeBlock;
   const dispatchDenied = status?.canDispatch === false;
   const taskBusy = busy || dispatchDenied || Boolean(detailError);
+  const needsModel = !loading && status?.configured === false;
 
   if (view === "machines") return <><div className="pm-legacy-return"><Button onClick={() => setView("delivery")}><Icon name="chevron" className="pm-back-icon" />返回产品交付团队</Button></div><P25 /></>;
 
@@ -400,11 +401,15 @@ export default function PmDelivery() {
       <div><strong>{loading ? "待加载" : clientValueText(status?.employees.length ?? 0)}</strong><span>已就绪员工</span><small>按岗位与技能分别装配</small></div>
       <div><strong>{loading ? "待加载" : active}</strong><span>正在交付</span><small>来自最近 20 条任务</small></div>
       <div><strong>{loading ? "待加载" : completed}</strong><span>产物已交齐</span><small>来自最近 20 条任务</small></div>
-      <div className="pm-model-stat"><span>内置驱动模型</span><strong>{modelName(status?.modelId)}</strong><small>{status?.configured ? "真实模型已配置 · 用量逐任务记录" : "等待服务端模型配置"}</small></div>
+      <div className="pm-model-stat">
+        <span>驱动模型</span>
+        <strong>{loading ? "正在读取" : modelName(status?.modelId)}</strong>
+        <small>{loading ? "正在查询配置" : status?.configured ? "API 连接已配置 · 用量逐任务记录" : needsModel ? "尚未配置模型连接" : "模型状态暂不可用"}</small>
+        {status && <Link to="/onboarding?step=model">配置模型服务</Link>}
+      </div>
     </Card>
 
     {error && <BannerAlert level="alert" className="pm-message" action={<><Button variant="quiet" disabled={busy} onClick={reloadWorkspace}>重新加载</Button><Link to="/login">前往登录</Link></>}>{error}</BannerAlert>}
-    {!loading && status && !status.configured && <BannerAlert level="info" className="pm-message" action={<Link to="/onboarding">配置模型</Link>}>配置真实模型后即可开始交付。密钥由本机服务安全读取。</BannerAlert>}
     {dispatchDenied && <BannerAlert level="info" className="pm-message">当前权限或套餐只允许查看交付记录。提交目标、补充和执行操作需要任务派发权限。</BannerAlert>}
     {notice && <BannerAlert level="info" className="pm-message">{notice}</BannerAlert>}
 
@@ -427,7 +432,9 @@ export default function PmDelivery() {
               description="只填写可公开的关键词。系统会将该检索词发送给外部搜索服务，请勿填写客户信息、内部资料或密钥。"
               placeholder="例如：站点公开文档的产品名称和功能关键词" disabled={busy} /></details>
           {formError && <BannerAlert level="alert" className="pm-message">{formError}</BannerAlert>}
-          <Button type="submit" variant="primary" className="pm-submit" disabled={busy || loading || dispatchDenied || !status?.configured} busy={busy} busyLabel="正在提交目标…">交给团队执行<Icon name="send" /></Button>
+          <Button type="submit" variant="primary" className="pm-submit" disabled={busy || loading || dispatchDenied || !status?.configured}
+            aria-describedby={needsModel ? "pm-dispatch-requirement" : undefined} busy={busy} busyLabel="正在提交目标…">交给团队执行<Icon name="send" /></Button>
+          {needsModel && <p id="pm-dispatch-requirement" className="pm-boundary">配置模型连接后即可提交目标。</p>}
           <p className="pm-boundary">本轮产物保存在隔离目录。外部发布和生产变更使用独立审批流程。</p>
         </form>
         <div className="pm-example-list"><p className="pm-small-label">从一个具体场景开始</p>{EXAMPLES.map((example) => <Button variant="quiet" disabled={busy} key={example.tag} onClick={() => { setGoal(example.goal); setEmployee(""); setFileChecks(""); setSearchQuery(""); setFormError(""); inputRef.current?.focus(); }}>

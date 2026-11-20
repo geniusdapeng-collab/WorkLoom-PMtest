@@ -154,7 +154,7 @@ export default function Observability({ view }: { view: "events" | "models" }) {
             </p>
           </div>
           {view === "models" && (
-            <button type="button" onClick={() => navigate("/onboarding")}
+            <button type="button" onClick={() => navigate("/onboarding?step=model&from=models")}
               className="rounded-lg border border-gline px-3 py-2 text-body font-semibold text-gold hover:bg-card">
               配置模型服务
             </button>
@@ -176,7 +176,7 @@ export default function Observability({ view }: { view: "events" | "models" }) {
             title={view === "events" ? "暂无可见事件" : "暂无模型调用记录"}
             hint={view === "events" ? "运行一条任务后，执行证据会出现在这里。" : "先配置模型并执行任务，路由证据会写入事件账本。"}
             actionLabel={view === "models" ? "去配置模型" : "前往任务工作台"}
-            onAction={() => navigate(view === "models" ? "/onboarding" : "/tasks")}
+            onAction={() => navigate(view === "models" ? "/onboarding?step=model&from=models" : "/tasks")}
           />
         ) : (
           <div className="space-y-2.5">

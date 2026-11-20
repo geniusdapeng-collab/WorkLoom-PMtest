@@ -25,6 +25,7 @@ const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { parseEnv } = require("node:util");
 
 const IS_WIN = process.platform === "win32";
 
@@ -359,6 +360,26 @@ function existingUrlPassword(text, key) {
   } catch { return null; }
 }
 
+const LEGACY_PM_SANDBOX = ["runtime", "apps", "server", "data", "pm-sandbox"];
+
+function desktopPmSandboxOverride(text, supportDir) {
+  // The app starts the server with --env-file; inherited variables take precedence there.
+  const configuredRoot = process.env.PM_SANDBOX_ROOT ?? parseEnv(text).PM_SANDBOX_ROOT;
+  if (configuredRoot === undefined) return undefined;
+  const runtime = path.resolve(supportDir, "runtime");
+  const configured = path.resolve(runtime, "apps", "server", configuredRoot);
+  const legacy = path.resolve(supportDir, ...LEGACY_PM_SANDBOX);
+  if (path.relative(legacy, configured) === ""
+      || path.relative(normalizeDataDirectory(legacy), normalizeDataDirectory(configured)) === "") {
+    return path.resolve(supportDir, "pm-sandbox");
+  }
+  const relative = path.relative(normalizeDataDirectory(runtime), normalizeDataDirectory(configured));
+  if (!relative || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))) {
+    throw new Error("自定义 PM_SANDBOX_ROOT 位于将被替换的运行时内，保留原数据并停止启动，请将它移至持久目录");
+  }
+  return undefined;
+}
+
 function buildDesktopEnvironment(text, {
   pgPort,
   serverPort,
@@ -366,6 +387,7 @@ function buildDesktopEnvironment(text, {
   adminPassword,
   appPassword,
   gatewayPassword,
+  supportDir,
   /**
    * 载荷运行时目录（绝对路径）。GR-15 的执行器注册表要从载荷内桥源码派生，
    * 因此必须由调用方传入——原先直接引用外层函数的 `RUNTIME` 常量，
@@ -392,6 +414,13 @@ function buildDesktopEnvironment(text, {
   if (toolExecutorModules) values.WORKLOOM_TOOL_EXECUTOR_MODULES = toolExecutorModules;
   let next = text;
   for (const [key, value] of Object.entries(values)) next = upsertEnvValue(next, key, value);
+  // Use Electron's actual userData path for packaged subprocesses, including Finder launches.
+  // This is launcher-owned and must follow the selected profile without rewriting the user's .env.
+  if (supportDir !== undefined) {
+    values.WORKLOOM_SUPPORT_DIR = path.resolve(supportDir);
+    const sandboxOverride = desktopPmSandboxOverride(text, supportDir);
+    if (sandboxOverride !== undefined) values.PM_SANDBOX_ROOT = sandboxOverride;
+  }
   return { text: next, values };
 }
 
@@ -662,6 +691,42 @@ function writeInstallCheckpoint(supportDir, state) {
   }, null, 2)}\n`, 0o600);
 }
 
+function existingPmSandboxDirectory(directory) {
+  let entry;
+  try { entry = fs.lstatSync(directory); } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  if (!entry.isDirectory() || entry.isSymbolicLink()) {
+    throw new Error("PM 产物目录或其上级不是普通目录，保留原数据并停止升级");
+  }
+  return true;
+}
+
+/** Called with the bootstrap lock held, before the runtime swap or its backup cleanup. */
+function migrateLegacyPmSandbox(supportDir) {
+  let legacy = supportDir;
+  for (const segment of LEGACY_PM_SANDBOX) {
+    legacy = path.join(legacy, segment);
+    if (!existingPmSandboxDirectory(legacy)) return null;
+  }
+  if (fs.readdirSync(legacy).length === 0) return null;
+
+  const persistent = path.join(supportDir, "pm-sandbox");
+  let placeholderMode = null;
+  if (existingPmSandboxDirectory(persistent)) {
+    if (fs.readdirSync(persistent).length > 0) {
+      throw new Error("旧版与持久 PM 产物目录均有内容，保留两份数据并停止升级");
+    }
+    // Windows does not reliably replace an existing directory with rename; remove only an empty placeholder.
+    placeholderMode = fs.statSync(persistent).mode & 0o777;
+    fs.rmdirSync(persistent);
+  }
+  // A retry observes either the complete old tree or the complete persistent tree. No copy or merge.
+  fs.renameSync(legacy, persistent);
+  return { legacy, persistent, placeholderMode };
+}
+
 /**
  * 在 supportDir 同一文件系统内完成“先装配、后换入”。任何换入阶段异常都会恢复
  * 原目录、VERSION 与首航哨兵。调用方必须在修改持久数据库认证前 commit：凭据轮换
@@ -682,6 +747,7 @@ function installPayloadAtomically({ sourceRoot, supportDir, payloadVer, previous
   const movedNew = [];
   const movedOld = [];
   let closed = false;
+  let pmSandboxMigration = null;
   const fault = (point) => {
     if (failAt === point) throw new Error(`安装故障注入：${point}`);
   };
@@ -698,6 +764,15 @@ function installPayloadAtomically({ sourceRoot, supportDir, payloadVer, previous
     else atomicWrite(versionFile, oldVersion);
     if (oldBootFlag === null) fs.rmSync(bootFlag, { force: true });
     else atomicWrite(bootFlag, oldBootFlag);
+    if (pmSandboxMigration) {
+      const { legacy, persistent, placeholderMode } = pmSandboxMigration;
+      if (existingPmSandboxDirectory(legacy) || !existingPmSandboxDirectory(persistent)) {
+        throw new Error("PM 产物目录状态变化，保留当前原件并停止回滚");
+      }
+      fs.renameSync(persistent, legacy);
+      pmSandboxMigration = null;
+      if (placeholderMode !== null) fs.mkdirSync(persistent, { mode: placeholderMode });
+    }
     fs.rmSync(stagingRoot, { recursive: true, force: true });
     fs.rmSync(backupRoot, { recursive: true, force: true });
     closed = true;
@@ -716,6 +791,7 @@ function installPayloadAtomically({ sourceRoot, supportDir, payloadVer, previous
     if (assembledVer !== payloadVer) throw new Error(`暂存载荷版本不一致：期望 ${payloadVer}，实际 ${assembledVer || "缺失"}`);
     fault("after-stage");
 
+    pmSandboxMigration = migrateLegacyPmSandbox(supportDir);
     fs.mkdirSync(backupRoot, { recursive: true });
     onPhase("swapping");
     for (const [index, part] of parts.entries()) {
@@ -738,6 +814,7 @@ function installPayloadAtomically({ sourceRoot, supportDir, payloadVer, previous
   }
 
   return {
+    migratedPmSandbox: pmSandboxMigration !== null,
     rollback: restore,
     commit() {
       if (closed) return;
@@ -885,7 +962,10 @@ async function bootstrap(opts) {
     // runtime 会在升级时整体替换；先保留用户配置，避免 JWT/API Key/模型设置被新版覆盖。
     const previousEnvFile = path.join(supportDir, "runtime", ".env");
     let previousEnv = null;
-    try { previousEnv = fs.readFileSync(previousEnvFile); } catch { /* 首装没有旧配置 */ }
+    try { previousEnv = fs.readFileSync(previousEnvFile); } catch (error) {
+      if (error?.code !== "ENOENT") throw new Error("无法保留本机配置，已停止替换运行时", { cause: error });
+    }
+    desktopPmSandboxOverride(previousEnv?.toString("utf8") ?? "", supportDir);
     payloadTransaction = installPayloadAtomically({
       sourceRoot: effResources,
       supportDir,
@@ -903,6 +983,7 @@ async function bootstrap(opts) {
         });
       },
     });
+    if (payloadTransaction.migratedPmSandbox) say("✓ 已迁移旧版 PM 产物至持久目录");
     if (previousEnv && previousEnv.length > 0) say("✓ 已保留上一版本地配置（JWT/API Key/模型设置）");
     if (!IS_WIN) {
       // zip/dmg 往返后确保可执行位
@@ -977,6 +1058,7 @@ async function bootstrap(opts) {
   const appPassword = databaseState.credentials.app;
   const gatewayPassword = databaseState.credentials.gateway;
   const desktopConfig = buildDesktopEnvironment(envText, {
+    supportDir,
     runtimeDir: RUNTIME,
     pgPort: PG_PORT,
     serverPort: SERVER_PORT,

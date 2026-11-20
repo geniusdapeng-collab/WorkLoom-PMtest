@@ -53,12 +53,14 @@ export default function DesktopOwnerSetup({ bridge, onCreated, onUnavailable }: 
       <p className="mb-6 text-body text-neutral-300">创建本机工作区和管理员账号。之后使用此邮箱和密码登录。</p>
       <form className="space-y-3" onSubmit={(event) => void submit(event)}>
         {fields.map(({ key, label, ...properties }) => (
-          <label key={key} className="block text-body text-neutral-200">
-            {label}
-            <input {...properties} value={input[key]} disabled={busy} required
+          <div key={key} className="text-body text-neutral-200">
+            <label htmlFor={`owner-${key}`}>{label}</label>
+            <input {...properties} id={`owner-${key}`} value={input[key]} disabled={busy} required
+              aria-describedby={key === "password" ? "owner-password-requirement" : undefined}
               className="mt-1 min-h-11 w-full rounded-lg border border-neutral-600 bg-neutral-900 px-3 text-neutral-100 focus:border-blue-400 focus:outline-none"
               onChange={(event) => setInput((current) => ({ ...current, [key]: event.target.value }))} />
-          </label>
+            {key === "password" && <p id="owner-password-requirement" className="mt-1 text-neutral-300">至少 12 个字符。</p>}
+          </div>
         ))}
         {error && <p role="alert" className="break-words text-body text-red-300">{error}</p>}
         <Button type="submit" className="w-full" variant="primary" disabled={!complete} busy={busy} busyLabel="正在创建…">创建工作区</Button>

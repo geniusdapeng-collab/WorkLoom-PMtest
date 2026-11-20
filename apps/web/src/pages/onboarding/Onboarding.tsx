@@ -10,6 +10,7 @@
  * 设计纪律：每一步都可跳过但状态如实回显；所有写操作经 onboarding.* 端点五元事件留痕。
  */
 import { useEffect, useMemo, useState } from "react";
+import { Link, useSearchParams } from "react-router";
 import CustomizeWizard from "./CustomizeWizard";
 import { ensureDemoLogin, trpc } from "../../lib/trpc";
 import type { OnboardingStatus } from "../../components/SimBanner";
@@ -18,7 +19,7 @@ import { Icon, clientChineseText } from "@workloom/ui";
 import { modelTestReplyText, onboardingStatusSystemText, publicationSystemText } from "./systemText";
 
 const PROVIDERS: Array<{ key: string; label: string; baseUrl: string; model: string }> = [
-  { key: "deepseek", label: "DeepSeek（深度求索）", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat" },
+  { key: "deepseek", label: "DeepSeek（深度求索）", baseUrl: "https://api.deepseek.com", model: "deepseek-flash" },
   { key: "moonshot", label: "Moonshot Kimi", baseUrl: "https://api.moonshot.cn/v1", model: "moonshot-v1-8k" },
   { key: "zhipu", label: "智谱 GLM", baseUrl: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4-flash" },
   { key: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini" },
@@ -71,19 +72,11 @@ export default function Onboarding() {
   const [st, setSt] = useState<OnboardingStatus | null>(null);
   const [step, setStep] = useState(0);
   const [err, setErr] = useState("");
-  // V4：?mode=customize → 定制向导（行业段：隔离编制→上岗考→原子切换）
-  const [mode, setMode] = useState<"standard" | "customize">(() =>
-    new URLSearchParams(window.location.search).get("mode") === "customize" ? "customize" : "standard",
-  );
-  // 监听浏览器返回/前进，保持 mode 与 URL 同步（customize ⇄ 落地向导可互切）
-  useEffect(() => {
-    const onPop = () => setMode(new URLSearchParams(window.location.search).get("mode") === "customize" ? "customize" : "standard");
-    window.addEventListener("popstate", onPop);
-    return () => window.removeEventListener("popstate", onPop);
-  }, []);
-  const goCustomize = () => { setMode("customize"); window.history.pushState({}, "", "/onboarding?mode=customize"); };
-  const goStandard = () => { setMode("standard"); window.history.pushState({}, "", "/onboarding"); };
-  const customizeMode = mode === "customize";
+  const [searchParams, setSearchParams] = useSearchParams();
+  const customizeMode = searchParams.get("mode") === "customize";
+  const modelOnly = !customizeMode && searchParams.get("step") === "model";
+  const fromModelLedger = modelOnly && searchParams.get("from") === "models";
+  const visibleStep = modelOnly ? 1 : step;
 
   // 步骤②表单
   const [prov, setProv] = useState("deepseek");
@@ -91,7 +84,9 @@ export default function Onboarding() {
   const [model, setModel] = useState(PROVIDERS[0]!.model);
   const [apiKey, setApiKey] = useState("");
   const [testing, setTesting] = useState(false);
+  const [verifying, setVerifying] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; reply?: string; latencyMs?: number; error?: string } | null>(null);
+  const [modelNotice, setModelNotice] = useState("");
   const [saving, setSaving] = useState(false);
   const [llmDone, setLlmDone] = useState(false);
 
@@ -129,35 +124,49 @@ export default function Onboarding() {
     return s;
   };
   useEffect(() => {
+    let active = true;
+    setSt(null);
+    setErr("");
+    setStep(0);
+    setApiKey("");
+    setTestResult(null);
+    setModelNotice("");
     void ensureDemoLogin().then(async () => {
-      const [s, draft, front] = await Promise.all([
-        reload(),
+      const s = onboardingStatusSystemText((await trpc.onboarding.status.query()) as OnboardingStatus);
+      const [draft, front] = modelOnly ? [null, null] : await Promise.all([
         trpc.onboarding.wizardDraft.query() as Promise<WizardDraft | null>,
         trpc.onboarding.serviceFrontPublication.query() as Promise<ServiceFrontPublication>,
       ]);
+      if (!active) return;
       const payload = draft?.payload ?? {};
-      setProv(payload.provider ?? "deepseek");
-      setBaseUrl(payload.baseUrl ?? PROVIDERS.find((item) => item.key === (payload.provider ?? "deepseek"))?.baseUrl ?? PROVIDERS[0]!.baseUrl);
-      setModel(payload.model ?? PROVIDERS.find((item) => item.key === (payload.provider ?? "deepseek"))?.model ?? PROVIDERS[0]!.model);
+      const provider = payload.provider || s.llm.provider;
+      const preset = PROVIDERS.find((item) => item.key === provider) ?? (provider === "mock" || !provider ? PROVIDERS[0]! : PROVIDERS.at(-1)!);
+      setProv(preset.key);
+      setBaseUrl(payload.baseUrl || (provider === s.llm.provider && provider !== "mock" ? s.llm.baseUrl : "") || preset.baseUrl);
+      setModel(preset.key === "deepseek" ? preset.model : payload.model || (provider === s.llm.provider ? s.llm.model : "") || preset.model);
+      setSt(s);
+      setLlmDone(s.llm.real);
+      if (modelOnly) return;
       setBizName(payload.businessName ?? s.business?.name ?? s.workspace.name);
       setIndustry(payload.industry ?? s.business?.industry ?? "");
       setNote(payload.note ?? s.business?.note ?? "");
       setSiteUrl(payload.siteUrl ?? "");
       setDocTitle(payload.documentTitle ?? "");
       setTestQ(payload.testQuestion ?? "");
-      setPublication(publicationSystemText(front));
+      setPublication(front && publicationSystemText(front));
       setDraftVersion(draft?.version ?? 0);
       setDraftResponsible(draft?.responsible ?? null);
-      if (s.llm.real) setLlmDone(true);
       const businessReady = Boolean(s.activationGate?.checks.find((check) => check.key === "business")?.ok);
-      if (businessReady) setBizDone(true);
-      if (draft?.status === "completed") { setStep(4); setDone(true); }
+      setBizDone(businessReady);
+      setDone(draft?.status === "completed");
+      if (draft?.status === "completed") setStep(4);
       else if (s.dataMode === "real") setStep(4);
       else if (draft) setStep(Math.max(0, Math.min(4, draft.currentStep)));
       else if (s.llm.real && businessReady) setStep(3);
       else if (s.llm.real) setStep(2);
-    }).catch((error) => setErr(safeOnboardingError(error, "落地向导暂时无法加载，请稍后刷新。")));
-  }, []);
+    }).catch((error) => { if (active) setErr(safeOnboardingError(error, "配置暂时无法加载，请刷新后重试。")); });
+    return () => { active = false; };
+  }, [modelOnly]);
 
   const checks = useMemo(() => {
     if (!st) return [];
@@ -165,8 +174,8 @@ export default function Onboarding() {
       { label: "数据库连接", ok: true, detail: "事件库在线" },
       { label: "事件库规模", ok: st.workspace.events > 0, detail: `${st.workspace.events} 条五元事件（哈希链可验）` },
       { label: "数字团队", ok: st.workspace.agents > 0, detail: `${st.workspace.agents} 名员工 · ${st.workspace.members} 名人类成员 · ${st.workspace.memories} 条组织经验` },
-      { label: "大模型", ok: st.llm.real, detail: st.llm.real ? `${st.llm.provider} · ${st.llm.model}（真实推理且试调凭据有效）` : "内置模拟模型，或当前模型配置没有有效试调凭据" },
-      { label: "数据模式", ok: st.dataMode === "real", detail: st.dataMode === "real" ? "真实经营模式" : "模拟演示数据" },
+      { label: "大模型", ok: st.llm.real, detail: st.llm.real ? `${st.llm.provider} · ${st.llm.model}（连接已验证）` : st.llm.configured ? "已配置 API 连接，等待验证" : "尚未配置 API 连接" },
+      { label: "数据模式", ok: st.dataMode === "real", detail: st.dataMode === "real" ? "真实经营模式" : st.bundle?.isExample ? "模拟演示数据" : "工作区尚未完成正式经营配置" },
     ];
   }, [st]);
 
@@ -246,13 +255,14 @@ export default function Onboarding() {
     const p = PROVIDERS.find((x) => x.key === key)!;
     setBaseUrl(p.baseUrl);
     setModel(p.model);
+    setApiKey("");
     setTestResult(null);
   };
 
   const test = async () => {
-    setTesting(true); setTestResult(null); setErr("");
+    setTesting(true); setTestResult(null); setErr(""); setModelNotice("");
     try {
-      const r = (await trpc.onboarding.testLlm.mutate({ baseUrl, apiKey, model })) as typeof testResult;
+      const r = (await trpc.onboarding.testLlm.mutate({ baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), model: model.trim() })) as typeof testResult;
       setTestResult(r?.ok
         ? { ...r, reply: modelTestReplyText(r.reply) }
         : { ok: false, error: "模型没有返回可验证的连接结果，请检查配置后重试。" });
@@ -261,15 +271,28 @@ export default function Onboarding() {
   };
 
   const saveLlm = async () => {
-    setSaving(true); setErr("");
+    setSaving(true); setErr(""); setModelNotice("");
     try {
-      await trpc.onboarding.saveLlmConfig.mutate({ provider: prov, baseUrl, apiKey, model });
+      await trpc.onboarding.saveLlmConfig.mutate({ provider: prov, baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), model: model.trim() });
+      setApiKey("");
+      setTestResult(null);
       setLlmDone(true);
       await reload();
-      await saveDraft(2);
-      setStep(2);
+      if (modelOnly) setModelNotice("模型连接已验证并保存，可以返回开发场域提交任务。");
+      else { await saveDraft(2); setStep(2); }
     } catch (e) { setErr(safeOnboardingError(e)); }
     finally { setSaving(false); }
+  };
+
+  const verifySavedLlm = async () => {
+    setVerifying(true); setErr(""); setModelNotice(""); setTestResult(null);
+    try {
+      const result = await trpc.onboarding.verifyConfiguredLlm.mutate();
+      await reload();
+      setLlmDone(true);
+      setModelNotice(`已配置的连接通过验证（${result.latencyMs} 毫秒）。`);
+    } catch (error) { setErr(safeOnboardingError(error)); }
+    finally { setVerifying(false); }
   };
 
   const saveBiz = async () => {
@@ -345,27 +368,32 @@ export default function Onboarding() {
   const inputCls = "w-full rounded-lg border border-line bg-card px-3 py-2 text-sm text-ink outline-none placeholder:text-ink3 focus:border-gline";
   const btnCls = "max-w-full whitespace-normal break-words rounded-lg border border-gline bg-gold/10 px-4 py-2 text-center text-sm text-gold transition-colors hover:bg-gold/20 disabled:opacity-40";
 
+  const modelBusy = testing || saving || verifying;
+  const canSubmitModel = Boolean(baseUrl.trim() && model.trim() && (prov !== "deepseek" || apiKey.trim()));
+
   return (
     <div className="min-h-screen bg-[#07070d] px-4 py-8 text-ink">
       <div className="mx-auto max-w-2xl">
         {/* 头 */}
         <div className="mb-4 flex min-w-0 flex-wrap items-center gap-3">
-          <a href="/" className="rounded border border-line px-2.5 py-1 text-body text-ink3 no-underline hover:border-gline">← 返回经营主页</a>
+          <Link to={fromModelLedger ? "/models" : modelOnly ? "/development" : "/"} className="rounded border border-line px-2.5 py-1 text-body text-ink3 no-underline hover:border-gline">
+            {fromModelLedger ? "← 返回模型与成本" : modelOnly ? "← 返回开发场域" : "← 返回经营主页"}
+          </Link>
           <h1 className="bg-gradient-to-r from-[#f0f4f9] to-gold bg-clip-text text-lg font-bold text-transparent">
-            {customizeMode ? "定制我的行业版" : "落地向导 · 接入真实数据"}
+            {modelOnly ? "配置模型服务" : customizeMode ? "定制我的行业版" : "落地向导 · 接入真实数据"}
           </h1>
           {/* 双模式互切：五步落地向导 ⇄ 四步行业定制（行业装配机制 V4） */}
-          {!customizeMode ? (
-            <button onClick={goCustomize} className="ml-auto max-w-full whitespace-normal break-words rounded border border-gline bg-gold/10 px-3 py-1 text-body text-gold no-underline hover:bg-gold/20">
+          {!modelOnly && (!customizeMode ? (
+            <button onClick={() => setSearchParams({ mode: "customize" })} className="ml-auto max-w-full whitespace-normal break-words rounded border border-gline bg-gold/10 px-3 py-1 text-body text-gold no-underline hover:bg-gold/20">
               定制我的行业版 →
             </button>
           ) : (
-            <button onClick={goStandard} className="ml-auto rounded border border-line px-3 py-1 text-body text-ink3 hover:border-gline">
+            <button onClick={() => setSearchParams({})} className="ml-auto rounded border border-line px-3 py-1 text-body text-ink3 hover:border-gline">
               ← 返回落地向导
             </button>
-          )}
+          ))}
         </div>
-        {!customizeMode && (
+        {!customizeMode && !modelOnly && (
           <div className="mb-5 flex min-w-0 flex-wrap items-center gap-2 rounded-lg border border-line bg-card px-3 py-2 text-body text-ink3">
             <span className="min-w-0 flex-1 break-words">
               {draftResponsible
@@ -386,18 +414,18 @@ export default function Onboarding() {
         {/* 标准落地向导（五步）——定制模式下不渲染，避免双向导同屏 */}
         {!customizeMode && <>
         {/* 步骤条 */}
-        <div className="mb-6 grid min-w-0 grid-cols-2 gap-2 sm:grid-cols-5">
+        {!modelOnly && <div className="mb-6 grid min-w-0 grid-cols-2 gap-2 sm:grid-cols-5">
           {STEPS.map((s, i) => (
             <div key={s} className={`flex min-w-0 items-center justify-center gap-1 break-words rounded-lg border px-2 py-2 text-center text-body ${i === step ? "border-gline bg-gold/10 text-gold" : i < step || (i === 1 && llmDone) || (i === 2 && bizDone) ? "border-go/40 text-go" : "border-line text-ink3"}`}>
               {i < step || (i === 1 && llmDone) || (i === 2 && bizDone) ? <Icon name="check" size={14} /> : <span>{i + 1}.</span>}{s}
             </div>
           ))}
-        </div>
+        </div>}
 
         {err && <div role="alert" className="mb-4 max-w-full break-words rounded-lg border border-warn/50 bg-warn/10 px-3 py-2 text-body leading-relaxed text-warn">{err}</div>}
 
         {/* ① 环境自检 */}
-        {step === 0 && (
+        {visibleStep === 0 && (
           <div className="space-y-3 rounded-xl border border-line bg-panel/70 p-5">
             <div className="text-sm font-bold">环境自检 <span className="text-body font-normal text-ink3">（自动完成）</span></div>
             {!st && <div className="text-body text-ink3">自检中……</div>}
@@ -411,7 +439,7 @@ export default function Onboarding() {
             {st && (
               <div className="pt-2 text-right">
                 <button className={`${btnCls} max-w-full whitespace-normal break-words`} onClick={() => void continueAt(st.llm.real ? 2 : 1)}>
-                  {st.llm.real ? "模型已真实化，跳过 →" : "下一步：接入真实大模型 →"}
+                  {st.llm.real ? "下一步：经营主体 →" : "下一步：接入真实大模型 →"}
                 </button>
               </div>
             )}
@@ -419,49 +447,69 @@ export default function Onboarding() {
         )}
 
         {/* ② 真实大模型 */}
-        {step === 1 && (
-          <div className="space-y-4 rounded-xl border border-line bg-panel/70 p-5">
-            <div className="break-words text-sm font-bold">接入真实大模型 <span className="text-body font-normal text-ink3">真实试调通过才会保存；保存即全链生效，无需重启</span></div>
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-              {PROVIDERS.map((p) => (
-                <button key={p.key} onClick={() => pickProvider(p.key)}
-                  className={`rounded-lg border px-3 py-2 text-body ${prov === p.key ? "border-gline bg-gold/10 text-gold" : "border-line text-ink3 hover:border-gline"}`}>
-                  {p.label}
-                </button>
-              ))}
-            </div>
-            <label className="block text-body text-ink3">模型接口地址
-              <input className={`${inputCls} mt-1`} value={baseUrl} onChange={(e) => { setBaseUrl(e.target.value); setTestResult(null); }} placeholder="https://api.deepseek.com/v1" />
-            </label>
-            <label className="block text-body text-ink3">接口密钥 <span className="text-ink3/70">（只落盘到本机环境配置，事件留痕仅记掩码后 4 位）</span>
-              <input className={`${inputCls} mt-1`} type="password" value={apiKey} onChange={(e) => { setApiKey(e.target.value); setTestResult(null); }} placeholder="sk-……" />
-            </label>
-            <label className="block text-body text-ink3">模型
-              <input className={`${inputCls} mt-1`} value={model} onChange={(e) => { setModel(e.target.value); setTestResult(null); }} placeholder="deepseek-chat" />
-            </label>
-            {testResult && (
-              <div className={`break-words rounded-lg border px-3 py-2 text-body ${testResult.ok ? "border-go/50 bg-go/10 text-go" : "border-warn/50 bg-warn/10 text-warn"}`}>
-                {testResult.ok
-                  ? <><Icon name="check" size={15} className="inline" /> 真实试调通过（{testResult.latencyMs} 毫秒）——模型回复：「{clientChineseText(testResult.reply, "模型已返回可验证结果。")}」</>
-                  : <><Icon name="error" size={15} className="inline" /> 试调失败：{testResult.error}</>}
+        {visibleStep === 1 && (
+          <section aria-labelledby="model-connection-heading" aria-busy={modelBusy || (!st && !err)} className="space-y-4 rounded-xl border border-line bg-panel/70 p-5">
+            <h2 id="model-connection-heading" className="break-words text-sm font-bold">接入真实大模型</h2>
+            {!st && <p role="status" className="text-body text-ink3">{err ? "请刷新页面重新读取模型配置。" : "正在读取本机模型配置……"}</p>}
+            {st && <>
+              {st.llm.configured && <div className="flex flex-wrap items-start justify-between gap-3 rounded-lg border border-line bg-card p-3">
+                <div className="min-w-0 text-body">
+                  <p className="break-words font-semibold">{st.llm.model} · {st.llm.real ? "连接已验证" : "已配置连接，尚待验证"}</p>
+                  {st.llm.canVerifyConfigured && <p className="mt-1 text-ink3">验证会向 DeepSeek 发送一条测试请求，无需重新输入密钥。</p>}
+                </div>
+                {st.llm.canVerifyConfigured && <button type="button" className={btnCls} disabled={modelBusy} onClick={() => void verifySavedLlm()}>
+                  {verifying ? "正在验证……" : st.llm.real ? "重新验证已配置连接" : "验证已配置连接"}
+                </button>}
+              </div>}
+              <fieldset disabled={modelBusy} className="min-w-0 space-y-4">
+                <legend className="mb-2 text-body font-semibold">{st.llm.configured ? "更换连接" : "配置新连接"}</legend>
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3" role="group" aria-label="模型提供方">
+                  {PROVIDERS.map((p) => (
+                    <button key={p.key} type="button" aria-pressed={prov === p.key} onClick={() => pickProvider(p.key)}
+                      className={`min-w-0 break-words rounded-lg border px-3 py-2 text-body disabled:opacity-60 ${prov === p.key ? "border-gline bg-gold/10 text-gold" : "border-line text-ink3 hover:border-gline"}`}>
+                      {p.label}
+                    </button>
+                  ))}
+                </div>
+                <label className="block text-body text-ink3">模型接口地址
+                  <input className={`${inputCls} mt-1`} type="url" value={baseUrl} onChange={(e) => { setBaseUrl(e.target.value); setTestResult(null); }} placeholder="https://api.deepseek.com" />
+                </label>
+                <label className="block text-body text-ink3">接口密钥
+                  <input className={`${inputCls} mt-1`} type="password" autoComplete="off" value={apiKey} onChange={(e) => { setApiKey(e.target.value); setTestResult(null); }} placeholder={st.llm.configured ? "更换连接时输入密钥" : "输入 API 密钥"} />
+                </label>
+                <label className="block text-body text-ink3">模型
+                  <input className={`${inputCls} mt-1`} readOnly={prov === "deepseek"} value={model} onChange={(e) => { setModel(e.target.value); setTestResult(null); }} placeholder="填写模型名称" />
+                </label>
+              </fieldset>
+              {testResult && (
+                <div role={testResult.ok ? "status" : "alert"} className={`break-words rounded-lg border px-3 py-2 text-body ${testResult.ok ? "border-go/50 bg-go/10 text-go" : "border-warn/50 bg-warn/10 text-warn"}`}>
+                  {testResult.ok
+                    ? <><Icon name="check" size={15} className="inline" /> 试调通过（{testResult.latencyMs} 毫秒）——「{clientChineseText(testResult.reply, "模型已返回可验证结果。")}」</>
+                    : <><Icon name="error" size={15} className="inline" /> 试调失败：{testResult.error}</>}
+                </div>
+              )}
+              {modelNotice && <p role="status" className="break-words rounded-lg border border-go/50 bg-go/10 px-3 py-2 text-body text-go">{modelNotice}</p>}
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                {modelOnly
+                  ? <Link to="/onboarding" className="break-words text-body text-ink2 underline">打开完整落地向导</Link>
+                  : <button type="button" className="max-w-full break-words text-left text-body text-ink3 underline disabled:opacity-60" disabled={modelBusy || draftBusy} onClick={() => void continueAt(2)}>
+                    {st.llm.real ? "继续填写经营主体" : "稍后配置模型"}
+                  </button>}
+                <div className="flex flex-wrap gap-2">
+                  <button type="button" className={btnCls} disabled={modelBusy || !canSubmitModel} onClick={() => void test()}>
+                    {testing ? "试调中……" : "仅测试连接"}
+                  </button>
+                  <button type="button" className={btnCls} disabled={modelBusy || !canSubmitModel} onClick={() => void saveLlm()}>
+                    {saving ? "正在验证并保存……" : "验证并保存"}
+                  </button>
+                </div>
               </div>
-            )}
-            <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-              <button className="max-w-full break-words text-left text-body text-ink3 underline" onClick={() => void continueAt(2)}>暂用内置模拟模型（只能体验，不能启用正式模式）</button>
-              <div className="flex flex-wrap gap-2">
-                <button className={btnCls} disabled={testing || !baseUrl || !model} onClick={() => void test()}>
-                  {testing ? "试调中……" : "测试连接（真实调用）"}
-                </button>
-                <button className={btnCls} disabled={saving || !testResult?.ok} onClick={() => void saveLlm()}>
-                  {saving ? "保存中……" : "保存并启用 →"}
-                </button>
-              </div>
-            </div>
-          </div>
+            </>}
+          </section>
         )}
 
         {/* ③ 经营主体 */}
-        {step === 2 && (
+        {visibleStep === 2 && (
           <div className="space-y-4 rounded-xl border border-line bg-panel/70 p-5">
             <div className="break-words text-sm font-bold">经营主体 <span className="text-body font-normal text-ink3">写入门店档案，成为数字团队的上下文</span></div>
             <label className="block text-body text-ink3">主体名称
@@ -483,7 +531,7 @@ export default function Onboarding() {
         )}
 
         {/* ④ 启用真实模式 */}
-        {step === 3 && !done && (
+        {visibleStep === 3 && !done && (
           <div className="space-y-4 rounded-xl border border-gline bg-panel/70 p-5">
             <div className="break-words text-sm font-bold text-gold">正式运行服务端门禁</div>
             <p className="break-words text-body leading-relaxed text-ink2">只有以下事实全部通过，服务端才会把数据模式切换为正式；页面跳步或旧的状态标记都不能绕过。</p>
@@ -512,7 +560,7 @@ export default function Onboarding() {
         )}
 
         {/* ⑤ AI 服务前台（可选） */}
-        {step === 4 && !done && (
+        {visibleStep === 4 && !done && (
           <div className="space-y-4 rounded-xl border border-gline bg-panel/70 p-5">
             <div className="text-sm font-bold text-gold">启用面向客户的 AI 服务前台（可选）</div>
             <div className="text-body leading-relaxed text-ink2">
@@ -602,7 +650,7 @@ export default function Onboarding() {
         )}
 
         {/* 完成 */}
-        {done && (
+        {done && !modelOnly && (
           <div className="space-y-4 rounded-xl border border-go/50 bg-go/5 p-6 text-center">
             <Icon name="celebrate" size={28} className="mx-auto text-go" />
             <div className="text-sm font-bold text-go">{st?.dataMode === "real" ? "真实经营模式已启用" : "向导进度已保存"}</div>
