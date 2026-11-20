@@ -1,6 +1,6 @@
 import { Route, Routes, Navigate, Link, useLocation, useParams } from "react-router";
 import { AsyncState } from "@workloom/ui";
-import { isGuest } from "./lib/trpc";
+import { getToken, isGuest } from "./lib/trpc";
 import P1 from "./pages/p1/P1";
 import P2 from "./pages/p2/P2";
 import P9 from "./pages/p9/P9";
@@ -78,7 +78,7 @@ function UiDiagnosticsRoute() {
 
 /** 阶段三路由：页面自包 Bridge（注入真实左右栏）；/dev 矩阵保持壳内平铺 */
 function Shell() {
-  const { pathname } = useLocation();
+  const { pathname, search, hash } = useLocation();
   const railW = useAskRailPadding();
   const [welcomeActive, setWelcomeActive] = useState(false);
   useEffect(() => {
@@ -89,11 +89,15 @@ function Shell() {
   // 非产品路由（开发矩阵/落地向导）不带常驻导航；其余全部页面左侧导航常驻
   const bare = pathname === "/dev" || pathname.startsWith("/onboarding") || pathname === "/login"
     || pathname === "/activate" || pathname === "/invite" || pathname === "/assistant";
+  const localDesktop = typeof window !== "undefined" && Boolean(window.workloomDesktopSetup);
+  if (localDesktop && !bare && !getToken()) {
+    return <Navigate to={`/login?next=${encodeURIComponent(`${pathname}${search}${hash}`)}`} replace />;
+  }
   return (
     <div data-workloom-client="b-pc" data-wl-theme="dark" className="flex min-h-screen min-w-0 max-w-full overflow-x-clip">
       {/* 无导航壳页面（/dev、/login、/activate、/invite…）必须有明确出口：
           这类页面此前只能靠浏览器后退，客户会“进得去出不来”。 */}
-      {bare && pathname !== "/" && pathname !== "/assistant" && (
+      {bare && pathname !== "/" && pathname !== "/assistant" && !(localDesktop && pathname === "/login") && (
         <a
           href="/"
           aria-label="返回经营主页"

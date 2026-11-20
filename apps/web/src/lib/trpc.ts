@@ -88,7 +88,7 @@ export async function ensureGuestSession(): Promise<void> {
   guestSessionPromise = (async () => {
     if (formalLoginsInFlight > 0) return;
     if (await validateStoredSession()) return;
-    if (formalLoginsInFlight > 0 || getToken()) return;
+    if (formalLoginsInFlight > 0 || getToken() || window.workloomDesktopSetup) return;
     const requestRevision = identityRevision;
     const r = await (trpc.accounts.auth as unknown as {
       guestEnter: { mutate: (i: Record<string, never>) => Promise<{ token: string }> };

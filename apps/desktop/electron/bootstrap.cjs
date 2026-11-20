@@ -6,7 +6,7 @@
  *   ② PostgreSQL：initdb（首启）→ pg_ctl 起服 → 角色/建库/vector（desktop-bootstrap-db.mjs）
  *   ③ NATS JetStream：内嵌 nats-server 用户态拉起（缺失降级 memory，不阻断）
  *   ④ 配置：.env.defaults → .env（首启），JWT_SECRET 随机化
- *   ⑤ 引导：migrate + seed-aipm（幂等，.bootstrapped 哨兵）
+ *   ⑤ 引导：migrate（幂等，.bootstrapped 哨兵）
  *   ⑥ 服务：server(8787) + web preview(5173)，健康检查 90s
  *
  * 本文件不依赖 electron——CI 冒烟直接以 Node 运行：
@@ -14,7 +14,7 @@
  * 桌面端由 main.cjs require 并传入 app 路径。
  *
  * 载荷目录约定（scripts/pack-electron-payload.sh 产出，两平台同构）：
- *   payload/runtime/  产品载荷（源码+迁移+种子+扁平 node_modules+web dist+VERSION）
+ *   payload/runtime/  产品载荷（源码+迁移+扁平 node_modules+web dist+VERSION）
  *   payload/node/     Node 24 官方二进制（bin/node 或 node.exe）
  *   payload/pg/       PostgreSQL 17 + pgvector（bin/lib/share 同构；mac 从 Postgres.app 摊平）
  *   payload/nats/     nats-server（可选）
@@ -113,24 +113,6 @@ function killTree(child) {
     if (IS_WIN) spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
     else process.kill(child.pid, "SIGTERM");
   } catch { /* 已退出 */ }
-}
-
-function openExternalUrl(url, {
-  platform = process.platform,
-  spawnCommand = spawn,
-} = {}) {
-  const command = platform === "win32" ? "cmd.exe" : platform === "darwin" ? "open" : "xdg-open";
-  const args = platform === "win32"
-    ? ["/d", "/s", "/c", "start", "", url]
-    : [url];
-  const child = spawnCommand(command, args, {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
-  });
-  child.on?.("error", () => {});
-  child.unref?.();
-  return child;
 }
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
@@ -772,13 +754,12 @@ function installPayloadAtomically({ sourceRoot, supportDir, payloadVer, previous
   };
 }
 
-async function httpOk(url) {
+async function httpOk(url, expectedServerInstance) {
   try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 4000);
-    const r = await fetch(url, { signal: ctrl.signal });
-    clearTimeout(t);
-    return r.ok;
+    const response = await fetch(url, { signal: AbortSignal.timeout(4000), redirect: "error" });
+    if (!response.ok) return false;
+    if (expectedServerInstance) return (await response.json()).instanceId === expectedServerInstance;
+    return true;
   } catch { return false; }
 }
 
@@ -790,7 +771,7 @@ async function httpOk(url) {
  * @param {(msg:string, progress:{phase?:string,percent?:number,etaSeconds?:number})=>void} [opts.onStatus] 状态回调（splash 展示）
  * @param {boolean} [opts.smoke]      冒烟模式：健康检查通过即返回（调用方随后 stop）
  * @param {string} [opts.startPath]   受控产品首屏路由；默认 /，环境 WORKLOOM_START_PATH 可覆盖
- * @returns {Promise<{stop:()=>Promise<void>, webUrl:string}>}
+ * @returns {Promise<{stop:()=>Promise<void>, webUrl:string, requestSetup:(method:string, input?:object)=>Promise<Response>}>}
  */
 async function bootstrap(opts) {
   const { resourcesDir, supportDir } = opts;
@@ -866,10 +847,14 @@ async function bootstrap(opts) {
   if (!payloadVer || payloadVer === "unknown") {
     throw new Error(`载荷版本标记缺失（resources=${resourceRoot}）`);
   }
-  if (fs.existsSync(archiveFile)) {
+  const hasArchive = fs.existsSync(archiveFile);
+  if (hasArchive) {
     const cacheDir = path.join(supportDir, ".payload-cache");
-    const cacheVer = readIf(path.join(cacheDir, "PAYLOAD_VERSION")) || "none";
-    if (cacheVer !== payloadVer || !fs.existsSync(path.join(cacheDir, "runtime", "VERSION"))) {
+    const completion = path.join(cacheDir, ".extraction-complete");
+    const archiveVersion = path.join(cacheDir, "PAYLOAD_VERSION");
+    const runtimeVersion = path.join(cacheDir, "runtime", "VERSION");
+    // The archive can lay down both version files before decompression finishes.
+    if (readIf(completion) !== payloadVer || readIf(archiveVersion) !== payloadVer || readIf(runtimeVersion) !== payloadVer) {
       status(`→ 解压运行时载荷（${payloadVer}）…`, { phase: "payload-unpack", percent: 8, etaSeconds: 140 });
       fs.rmSync(cacheDir, { recursive: true, force: true });
       fs.mkdirSync(cacheDir, { recursive: true });
@@ -884,12 +869,17 @@ async function bootstrap(opts) {
         if (extraction.stagedArchive) fs.rmSync(extraction.stagedArchive, { force: true });
       }
       throwIfAborted();
+      if (readIf(archiveVersion) !== payloadVer || readIf(runtimeVersion) !== payloadVer) {
+        throw new Error(`归档载荷版本不一致：期望 ${payloadVer}`);
+      }
+      atomicWrite(completion, `${payloadVer}\n`, 0o600);
       status("载荷解压完成", { phase: "payload-unpacked", percent: 18, etaSeconds: 105 });
     }
     effResources = cacheDir;
   }
   const installedVer = readIf(path.join(supportDir, "VERSION")) || "none";
-  if (payloadVer !== installedVer) {
+  // Recover an interrupted first boot that had already swapped an incomplete legacy cache.
+  if (payloadVer !== installedVer || (hasArchive && !fs.existsSync(path.join(supportDir, ".bootstrapped")))) {
     status(`→ 装配运行时载荷（${payloadVer}）…`, { phase: "payload-staging", percent: 20, etaSeconds: 100 });
     fs.mkdirSync(supportDir, { recursive: true });
     // runtime 会在升级时整体替换；先保留用户配置，避免 JWT/API Key/模型设置被新版覆盖。
@@ -1008,7 +998,9 @@ async function bootstrap(opts) {
     WORKLOOM_WEB_PORT: String(WEB_PORT),
     WORKLOOM_NATS_PORT: String(NATS_PORT),
   };
-  const serverEnv = { ...desktopEnv, NODE_ENV: "production" };
+  const serverInstance = crypto.randomUUID();
+  const serverEnv = { ...desktopEnv, NODE_ENV: "production", SERVER_HOST: "127.0.0.1", WORKLOOM_PM_DSH_PROFILE: "desktop", SERVER_INSTANCE_ID: serverInstance };
+  const setupToken = crypto.randomBytes(32).toString("hex");
   const runDatabaseHelper = (mode, legacyPasswords = []) => run(NODE_BIN, [DB_HELPER], {
     env: {
       ...desktopEnv,
@@ -1139,50 +1131,25 @@ async function bootstrap(opts) {
     say("⚠ 内嵌 nats-server 未随包——事件总线降级 memory");
   }
 
-  /* ---------- 3. 首启引导：迁移 + 种子（幂等） ---------- */
+  /* ---------- 3. 首启引导：迁移（幂等） ---------- */
   if (!fs.existsSync(bootFlag)) {
     throwIfAborted();
-    checkpoint("database", "正在执行数据库迁移与示例装配", { targetVersion: payloadVer, percent: 70, etaSeconds: 38 });
+    checkpoint("database", "正在执行数据库迁移", { targetVersion: payloadVer, percent: 70, etaSeconds: 38 });
     status("→ 正在升级数据结构…", { phase: "database-migrate", percent: 70, etaSeconds: 38 });
     const mig = run(NODE_BIN, [TSX_CLI, "--env-file=.env", "scripts/migrate.ts"], {
       cwd: RUNTIME, env: serverEnv,
     });
     if (mig.code !== 0) throw new Error(`数据库迁移失败：${(mig.err || mig.out).slice(-400)}`);
     throwIfAborted();
-    // 种子脚本按仓配置（.env.defaults DESKTOP_SEED_SCRIPT；不在 base-sync 同步范围）——
-    // 基座出厂 AI 产品经理包；行业版子仓配自己行业种子（672cf7b 硬编码 hotel 根因）
-    let seedScriptSpec = "scripts/seed-aipm.ts";
-    try {
-      const m = fs.readFileSync(path.join(RUNTIME, ".env.defaults"), "utf-8").match(/^DESKTOP_SEED_SCRIPT=(.+)$/m);
-      if (m) seedScriptSpec = m[1].trim();
-    } catch { /* 缺省即可 */ }
-    const seedScripts = seedScriptSpec.split(",").map((s) => s.trim()).filter(Boolean);
-    if (seedScripts.length === 0) throw new Error("演示数据种子配置为空");
-    for (const [seedIndex, seedScript] of seedScripts.entries()) {
-      throwIfAborted();
-      status("→ 正在装配示例团队与起步数据…", {
-        phase: "example-seed",
-        percent: 78 + Math.floor((seedIndex / seedScripts.length) * 6),
-        etaSeconds: Math.max(18, 30 - seedIndex * 5),
-      });
-      if (!fs.existsSync(path.join(RUNTIME, seedScript))) {
-        throw new Error(`演示数据种子缺失（${seedScript}）`);
-      }
-      const seed = run(NODE_BIN, [TSX_CLI, "--env-file=.env", seedScript], {
-        cwd: RUNTIME, env: serverEnv,
-      });
-      if (seed.code !== 0) throw new Error(`演示数据种子失败（${seedScript}）：${(seed.err || seed.out).slice(-400)}`);
-      throwIfAborted();
-    }
-    fs.writeFileSync(bootFlag, "done");
-    status("示例团队已装配", { phase: "example-ready", percent: 85, etaSeconds: 15 });
+    atomicWrite(bootFlag, "done\n", 0o600);
+    status("生产数据结构已就绪", { phase: "database-ready", percent: 85, etaSeconds: 15 });
   }
 
   /* ---------- 4. 起服务：server(8787) + web preview(5173) ---------- */
   status("→ 启动 WorkLoom 服务…", { phase: "services-start", percent: 88, etaSeconds: 12 });
   checkpoint("services", "正在启动本机服务并执行健康检查", { targetVersion: payloadVer, percent: 88, etaSeconds: 12 });
   const serverProc = spawnLogged(NODE_BIN, [TSX_CLI, `--env-file=${envFile}`, "src/index.ts"],
-    { cwd: path.join(RUNTIME, "apps", "server"), env: serverEnv }, path.join(logDir, "server.log"));
+    { cwd: path.join(RUNTIME, "apps", "server"), env: { ...serverEnv, WORKLOOM_PM_DESKTOP_SETUP_TOKEN: setupToken } }, path.join(logDir, "server.log"));
   children.push(serverProc);
   const webProc = spawnLogged(NODE_BIN, [VITE_JS, "preview", "--host", "127.0.0.1", "--port", String(WEB_PORT), "--strictPort"],
     { cwd: path.join(RUNTIME, "apps", "web"), env: serverEnv }, path.join(logDir, "web.log"));
@@ -1192,7 +1159,8 @@ async function bootstrap(opts) {
   let ok = false;
   for (let i = 0; i < 90 && !ok; i++) {
     throwIfAborted();
-    ok = (await httpOk(`http://127.0.0.1:${SERVER_PORT}/health`)) && (await httpOk(`http://127.0.0.1:${WEB_PORT}/`));
+    if (serverProc.exitCode !== null || webProc.exitCode !== null) throw new Error("本机服务已退出，请检查端口占用和日志");
+    ok = await httpOk(`http://127.0.0.1:${WEB_PORT}/health`, serverInstance);
     if (!ok && i > 0 && i % 5 === 0) {
       const percent = Math.min(99, 90 + Math.floor(i / 10));
       status("→ 正在完成本机服务健康检查…", {
@@ -1217,7 +1185,14 @@ async function bootstrap(opts) {
     releaseBootstrapLock();
     say("== 已停止 ==");
   };
-  return { stop, webUrl };
+  const requestSetup = (method, input) => fetch(`http://127.0.0.1:${SERVER_PORT}/api/pm-desktop/setup`, {
+    method,
+    redirect: "error",
+    signal: AbortSignal.timeout(15000),
+    headers: { authorization: `Bearer ${setupToken}`, "content-type": "application/json" },
+    body: input === undefined ? undefined : JSON.stringify(input),
+  });
+  return { stop, webUrl, requestSetup };
   } catch (error) {
     const rolledBack = Boolean(payloadTransaction);
     try {
@@ -1245,7 +1220,10 @@ async function bootstrap(opts) {
 if (require.main === module) {
   const args = process.argv.slice(2);
   const get = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d; };
-  const smoke = args.includes("--smoke");
+  if (!args.includes("--smoke")) {
+    console.error("独立启动器仅用于桌面验收，请传入 --smoke。日常启动请打开 WorkLoom PMtest 应用。");
+    process.exit(2);
+  }
   const resourcesDir = path.resolve(get("--resources", process.env.WORKLOOM_RESOURCES || "dist-payload"));
   const supportDir = path.resolve(get("--support", process.env.WORKLOOM_SUPPORT || path.join(require("node:os").tmpdir(), "workloom-smoke")));
   const abortController = new AbortController();
@@ -1260,28 +1238,16 @@ if (require.main === module) {
       process.exit(0);
     }
   };
-  // Register before bootstrap: closing an emergency shell during init/migration must enter the
-  // same cancellation cleanup instead of abandoning PG/state changes and a live lock.
+  // Register before bootstrap so cancellation releases owned processes and locks.
   for (const signalName of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     try { process.once(signalName, () => { void shutdown(); }); } catch { /* platform unsupported */ }
   }
-  bootstrap({ resourcesDir, supportDir, smoke, signal: abortController.signal })
+  bootstrap({ resourcesDir, supportDir, smoke: true, signal: abortController.signal })
     .then(async ({ stop, webUrl }) => {
       activeStop = stop;
-      if (abortController.signal.aborted) {
-        await stop();
-        process.exit(0);
-      }
-      if (smoke) {
-        console.log(`== SMOKE 通过：${webUrl} 健康 ==`);
-        await stop();
-        process.exit(0);
-      }
-      console.log(`== WorkLoom 已就绪：${webUrl} ==`);
-      openExternalUrl(webUrl);
-      // 旧 zip 浏览器壳只保留为人工应急回退线；保持父进程存活，直到上方信号处理器
-      // 走所有权复验后的统一 stop。
-      setInterval(() => {}, 2 ** 30);
+      if (!abortController.signal.aborted) console.log(`== SMOKE 通过：${webUrl} 健康 ==`);
+      await stop();
+      process.exit(0);
     })
     .catch(async (e) => {
       if (activeStop) await activeStop();
@@ -1313,7 +1279,6 @@ module.exports = {
   renderStrictPgHba,
   enforceStrictPgHba,
   validateDatabaseHelper,
-  openExternalUrl,
   acquireBootstrapLock,
   tarExtractionPlan,
 };

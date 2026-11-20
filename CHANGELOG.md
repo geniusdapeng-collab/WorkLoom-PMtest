@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0
+
+- 桌面客户端继续使用 WorkLoom 开发场域、导航、DevFabric、任务与产物交互。
+- 桌面研发任务使用 DeepSeek Harness 官方 Desktop profile。既有 PM 研发围栏、逐请求预算、文件核验及产物回执贯穿新执行链。
+- 桌面执行回执记录 profile、会话 ID、模型用量及会话日志摘要。原有 headless 回执继续可以读取。
+- 桌面分发统一使用 Electron 的 DMG 和 NSIS。退役早期 ZIP 与 BAT 浏览器启动器及其打包任务，独立引导命令用于 `--smoke` 验收。
+
 ## 2026-10-30
 
 - Add explicit DeepSeek Search support to the cloud assistant, with persisted

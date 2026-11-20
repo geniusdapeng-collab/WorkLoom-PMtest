@@ -7,7 +7,7 @@
  * 才允许进入载荷，其他产品（包括基座、行业与试验田）一律排除并在装包后复核。
  */
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadProductRuntime } from "./product-runtime.mjs";
@@ -94,6 +94,14 @@ function normalizeArchivePath(value) {
   return normalizeArchiveFilePath(value).toLowerCase();
 }
 
+function isSeedScript(name) {
+  return /^seed[^/]*\.(?:[cm]?[jt]s)$/iu.test(name);
+}
+
+function hasBundleSeedPath(path) {
+  return /^bundles(?:\/[^/]+)*\/seeds(?:\/|$)/u.test(path);
+}
+
 function isForbiddenArchiveEntry(entry, forbiddenRuntimePath) {
   const normalized = normalizeArchivePath(entry);
   const forbidden = normalizeArchivePath(`runtime/${forbiddenRuntimePath}`);
@@ -130,6 +138,33 @@ export function assertRuntimePayloadBoundary(runtimeRoot, policy) {
     throw new Error("载荷产品清单与源策略不一致：SHA-256 不匹配");
   }
 
+  const seedScripts = readdirSync(resolve(resolvedRoot, "scripts")).filter(isSeedScript);
+  if (seedScripts.length > 0) {
+    throw new Error(`正式桌面载荷不得包含示例数据脚本：${seedScripts.join("、")}`);
+  }
+  for (const template of [".env.defaults", ".env.example"]) {
+    const file = resolve(resolvedRoot, template);
+    if (existsSync(file) && /^\s*(?:export\s+)?DESKTOP_SEED_SCRIPT\s*=/mu.test(readFileSync(file, "utf8"))) {
+      throw new Error(`正式桌面载荷配置了示例数据脚本：${template}`);
+    }
+  }
+  const bundles = resolve(resolvedRoot, "bundles");
+  if (existsSync(bundles)) {
+    const paths = readdirSync(bundles, { recursive: true });
+    if (paths.some((entry) => hasBundleSeedPath(normalizeArchivePath(`bundles/${entry}`)))) {
+      throw new Error("正式桌面载荷不得包含行业包示例数据目录");
+    }
+    for (const bundle of readdirSync(bundles, { withFileTypes: true })) {
+      if (!bundle.isDirectory()) continue;
+      const file = resolve(bundles, bundle.name, "bundle.json");
+      if (!existsSync(file)) continue;
+      const manifest = JSON.parse(readFileSync(file, "utf8"));
+      if (manifest.workloom?.provides?.seeds?.length) {
+        throw new Error(`正式桌面行业包仍声明示例数据：${bundle.name}`);
+      }
+    }
+  }
+
   const leaks = policy.forbiddenRuntimePaths.filter((relativePath) => {
     const candidate = resolve(resolvedRoot, ...relativePath.split("/"));
     if (candidate !== resolvedRoot && !candidate.startsWith(`${resolvedRoot}${sep}`)) {
@@ -146,6 +181,15 @@ export function assertArchivePayloadBoundary(entries, policy) {
   const leaks = findForbiddenArchiveEntries(entries, policy);
   if (leaks.length > 0) {
     throw new Error(`平台工程边界违规：归档包含 ${leaks.join("、")}`);
+  }
+  const scriptsPrefix = "runtime/scripts/";
+  const seedScripts = entries.filter((entry) => {
+    const path = normalizeArchivePath(entry);
+    return (path.startsWith(scriptsPrefix) && isSeedScript(path.slice(scriptsPrefix.length)))
+      || (path.startsWith("runtime/") && hasBundleSeedPath(path.slice("runtime/".length)));
+  });
+  if (seedScripts.length > 0) {
+    throw new Error(`正式桌面归档不得包含示例数据脚本：${seedScripts.join("、")}`);
   }
   const archivedFiles = new Set(entries
     .filter((entry) => !/[\\/]$/u.test(String(entry)))

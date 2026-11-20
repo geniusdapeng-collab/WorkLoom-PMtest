@@ -71,7 +71,7 @@ const MODE_TEXT: Record<string, string> = {
 
 /** 未安装行业投影时只展示中性的基座动作，不猜测任何行业。 */
 const BASE_TASK_CARDS = ["查看今日待办", "查看任务进度", "处理待审批事项", "查看运行报告"];
-const BRIEFING_FALLBACK = "昨夜班组运行正常，今日请指示。";
+const BRIEFING_FALLBACK = "暂无可用晨报。";
 
 /* ================= 星野画布 ================= */
 function Starfield({ density = 110 }: { density?: number }) {

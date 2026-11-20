@@ -1,7 +1,7 @@
-# workloom-pm · 能力导览（人类版）
+# workloom-pmtest · 能力导览（人类版）
 
-> WorkLoom PM · AI 产品经理带领 AI 研发团队，从用户意图到真实产物、验证与交付回执
-> 本文件由 `node scripts/generate-capabilities.mjs` 从代码事实**自动生成**（2026-10-29），
+> WorkLoom PMtest · AI 产品经理带领 AI 研发团队，从用户意图到真实产物、验证与交付回执
+> 本文件由 `node scripts/generate-capabilities.mjs` 从代码事实**自动生成**（2026-11-20），
 > 请勿手改——能力变更后重跑生成器即可。Agent 版机器清单见 docs/capability-map.md。
 > 目录可发现、实际能调用、结果已验证是三个不同字段。缺少同提交运行证据时，调用与结果一律显示“未验证”；演示入口不代表客户业务可用。
 

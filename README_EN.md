@@ -1,6 +1,6 @@
 <div align="center">
 
-# WorkLoom PM
+# WorkLoom PMtest
 
 **An AI product manager leads an AI development team from a goal to an executable task graph, real artifacts, independent verification, and traceable delivery receipts.**
 
@@ -13,6 +13,8 @@ You supply the goal and boundaries. The product manager coordinates requirements
 WorkLoom PM is for product owners, founders, and small development teams. It is not a single-purpose writing or coding assistant. It connects **goal clarification, role coordination, restricted execution, quality verification, and release gates** into one AI product-development workflow.
 
 The PC workspace entry is **Development, `/development`**. The PM team view presents goals, task dependencies, execution, and artifacts. The original DevFabric development workspace remains available as another view. Desktop and browser development clients use the same server.
+
+The desktop app retains the WorkLoom interface and navigation. Coding steps that need to work with task files run in the official DeepSeek Harness Desktop profile, with the resulting session, tool, usage, and artifact receipts available through the original WorkLoom workbench. [Desktop runtime integration](docs/DSH-CLIENT-MIGRATION.md)
 
 For actual delivery results, use the source revision, model, samples, and evidence recorded in [PM-EVALUATION.md](docs/PM-EVALUATION.md). Employee definitions, skill files, seeded examples, and historical test badges do not establish a live success rate. This README does not advertise a signed WorkLoom PM installer.
 
@@ -143,8 +145,8 @@ DeepSeek Harness provides a model/tool execution loop and sessions. It is not an
 Requirements: **Node.js 24 or later, the repository's pinned pnpm 10.14.0, PostgreSQL 17, and pgvector**. Use [`package.json`](package.json) and [`pnpm-lock.yaml`](pnpm-lock.yaml); reproduce the lock instead of upgrading dependencies as part of installation.
 
 ```bash
-git clone https://github.com/geniusdapeng-collab/workloom-pm.git
-cd workloom-pm
+git clone https://github.com/geniusdapeng-collab/WorkLoom-PMtest.git
+cd WorkLoom-PMtest
 pnpm install --frozen-lockfile
 cp .env.example .env
 ```
@@ -172,11 +174,11 @@ Inject `DEEPSEEK_API_KEY` into the launch process through your controlled mechan
 pnpm app:dev
 ```
 
-The source launcher reads the root `.env`, applies explicit process overrides, and passes the resolved configuration to the server, Web client, and Electron. Default ports derive from the product manifest offset. For browser development, run `SERVER_PORT=8987 WEB_PORT=5373 pnpm dev` and open `http://localhost:5373/development`; update both process variables when using custom ports. `pnpm app` builds the Web client and opens Electron; `pnpm app:dev` uses HMR. `pnpm app --smoke` checks source services and the Electron main process; it does not replace packaged rendering, signing, or notarization acceptance.
+The source launcher reads the root `.env` and applies explicit process overrides. Default ports derive from the product manifest offset. For browser development, run `SERVER_PORT=9018 WEB_PORT=5404 pnpm dev` and open `http://localhost:5404/development`. `pnpm app` builds the Web client and opens Electron, `pnpm app:dev` uses HMR, and `pnpm app --smoke` checks source services and the Electron main process.
 
-The controlled product manifest sets `desktop.startPath` to `/development` for both source and packaged desktop launches. `WORKLOOM_START_PATH` can explicitly select another safe local route. The original operating home remains accessible from navigation. This product sets `clients.bPc.secretaryAutoScan` to `false`, disabling automatic secretary writes while browsing. Existing inbox items still refresh every 20 seconds, and user-initiated assistant actions remain available.
+The desktop workbench opens at `/development` after the installed app verifies the member session. `WORKLOOM_START_PATH` can select another safe local route. The original operating home remains accessible from navigation. This product sets `clients.bPc.secretaryAutoScan` to `false`, disabling automatic secretary writes while browsing. Existing inbox items still refresh every 20 seconds, and user-initiated assistant actions remain available.
 
-Product identity is `workloom-pm`, desktop appId is `com.workloom.pm`, and port offset is `200`. Packaged defaults are server `8987`, Web `5373`, PostgreSQL `5632`, and NATS `4422`. Source databases use the configured connection strings. Source-client support data defaults to `workloom-pm` under the operating system application-data directory; `WORKLOOM_SUPPORT_DIR` provides an explicit override. The Electron name and shortcuts use the independent product identity.
+Product identity is `workloom-pmtest`, desktop appId is `com.workloom.pmtest`, and port offset is `231`. Packaged defaults are server `9018`, Web `5404`, PostgreSQL `5663`, and NATS `4453`. Source databases use the configured connection strings. Source-client support data defaults to `workloom-pmtest` under the operating system application-data directory, with `WORKLOOM_SUPPORT_DIR` as an override. The installed app initializes an empty local production database on first launch. Create the first workspace with your name, company, workspace name, email address, and a password of at least 12 characters. The app installs roles, fences, and skills from the signed Bundle. Workspace activity produces its own tasks, reports, and documents. Real model tasks use `DEEPSEEK_API_KEY` from the app environment or the generated `runtime/.env` in its support directory, or a verified model connection configured in the app.
 
 Inherited `setup`, `preview:all`, and other industry demonstrations are retained. `preview:all` is an inherited demonstration path; its readiness banner cannot establish real PM delivery. Check its current ports and database configuration before using it alongside an existing IM development instance.
 

@@ -1,8 +1,8 @@
 {
  "schema": "workloom.capabilities/v2",
- "repo": "workloom-pm",
- "description": "WorkLoom PM · AI 产品经理带领 AI 研发团队，从用户意图到真实产物、验证与交付回执",
- "generatedAt": "2026-10-29T03:33:36.498Z",
+ "repo": "workloom-pmtest",
+ "description": "WorkLoom PMtest · AI 产品经理带领 AI 研发团队，从用户意图到真实产物、验证与交付回执",
+ "generatedAt": "2026-11-20T14:09:32.711Z",
  "demoPages": [
   "service-front-b-mobile.html",
   "service-front-b-pc.html",

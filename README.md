@@ -14,6 +14,8 @@ WorkLoom PMtest 面向产品负责人、创业者和小型研发团队。它不�
 
 正式工作入口是 PC 工作台的 **「开发场域」`/development`**：PM 团队视图用于目标、任务图、执行与产物；原有 DevFabric 开发场域保留为可切换的工作模式。桌面客户端与浏览器开发入口共享服务端。
 
+桌面版沿用 WorkLoom 的页面、导航和操作。研发岗位需要读写任务文件时，桌面启动器选择官方 DeepSeek Harness 的 Desktop profile，会话、工具调用、模型用量和产物仍从原 WorkLoom 工作台回读。 [桌面内核接入与验收](docs/DSH-CLIENT-MIGRATION.md)
+
 本仓的交付证据以 [PM-EVALUATION.md](docs/PM-EVALUATION.md) 中标明的源码、模型、样本与实际结果为准。岗位定义、技能文件、演示种子和历史测试徽章都不能代替一次真实交付；本 README 不把它们换算成成功率，也不宣称已有签名安装包。
 
 > **核心承诺：可以展示进度，但不能伪造完成。** “完成”必须对应真实文件、确定性检查、真实模型用量和可回读回执；缺证据、超时、取消、产物漂移或检查失败都保持为未完成。
@@ -172,9 +174,9 @@ pnpm app:dev
 
 源码启动器读取根 `.env`，由显式进程环境覆盖，统一传给 server、Web 与 Electron；默认端口由产品清单偏移派生。浏览器开发使用 `SERVER_PORT=9018 WEB_PORT=5404 pnpm dev`，进入 `http://localhost:5404/development`；自定义端口时同步调整启动进程变量。`pnpm app` 构建 Web 后打开 Electron，`pnpm app:dev` 使用 HMR，`pnpm app --smoke` 只验证源码服务与主进程，不等于安装包渲染或签名验收。
 
-桌面首屏由受控产品清单的 `desktop.startPath` 指向 `/development`，源码与安装包使用同一路由；可用 `WORKLOOM_START_PATH` 显式选择安全的本地路径。原经营首页仍可从导航打开。本产品把 `clients.bPc.secretaryAutoScan` 设为 `false`，停用浏览页面时的秘书自动写入扫描；已有收件箱仍每 20 秒刷新，用户主动发起的助手操作保持可用。
+桌面产品的默认工作台是 `/development`，可用 `WORKLOOM_START_PATH` 显式选择安全的本地路径。安装包先验证正式登录，再进入原 WorkLoom 开发场域。原经营首页仍可从导航打开。本产品把 `clients.bPc.secretaryAutoScan` 设为 `false`，停用浏览页面时的秘书自动写入扫描；已有收件箱仍每 20 秒刷新，用户主动发起的助手操作保持可用。
 
-独立产品身份为 `workloom-pmtest`，桌面 appId 为 `com.workloom.pmtest`，偏移为 `231`。打包默认端口为 server `9018`、web `5404`、PG `5663`、NATS `4453`；源码数据库仍以你配置的连接串为准。源码客户端默认支持目录按系统应用目录下的 `workloom-pmtest` 隔离；可用 `WORKLOOM_SUPPORT_DIR` 显式覆盖。Electron 名称与快捷方式也使用独立产品身份。当前以源码运行。
+独立产品身份为 `workloom-pmtest`，桌面 appId 为 `com.workloom.pmtest`，偏移为 `231`。打包默认端口为 server `9018`、web `5404`、PG `5663`、NATS `4453`；源码数据库仍以你配置的连接串为准。源码客户端默认支持目录按系统应用目录下的 `workloom-pmtest` 隔离；可用 `WORKLOOM_SUPPORT_DIR` 显式覆盖。首次打开安装包会初始化空的本机生产库。填写姓名、企业、工作区、邮箱和至少 12 字符的密码后，应用创建管理员账号，并从签名的行业包安装岗位、围栏和技能。任务、报告和文档由工作区后续真实操作产生。实际模型任务使用启动环境或应用支持目录 `runtime/.env` 中的 `DEEPSEEK_API_KEY`，或经应用配置经验证的模型连接。
 
 `deploy/linux/` 保留上游 Linux 部署资料供查阅，PMtest 的安装、启动、Nginx、备份、恢复检查和数据库初始化入口均已停用。
 

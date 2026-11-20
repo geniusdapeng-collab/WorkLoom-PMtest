@@ -113,18 +113,16 @@ jobs:
           BUNDLE_SIGNING_KEY_ID: ${{ vars.BUNDLE_SIGNING_KEY_ID || 'workloom-release-v1' }}
         run: |
           test -n "$BUNDLE_SIGNING_PRIVATE_KEY" || { echo "❌ 缺少 BUNDLE_SIGNING_PRIVATE_KEY，拒绝生成生产安装包"; exit 1; }
-          pnpm bundle:release
+          pnpm bundle:release --desktop
           test -s build/bundle-trust.json || { echo "❌ 独立 Bundle 公钥环未生成"; exit 1; }
 
       - name: 生成投影、验证并构建 web（无发行密钥）
-        env:
-          VITE_DEMO_WORKSPACE: ai-pm-demo
-          VITE_DEMO_MEMBER: MEM-001
         run: |
           pnpm projections:generate
           grep -q 'WORKLOOM_SAFE_RENDERING' apps/desktop/electron/main.cjs
           grep -q 'WORKLOOM_RENDER_SMOKE' apps/desktop/electron/main.cjs
           grep -q 'previousEnvFile' apps/desktop/electron/bootstrap.cjs
+          grep -q 'WORKLOOM_PM_DSH_PROFILE: "desktop"' apps/desktop/electron/bootstrap.cjs
           grep -q 'validateStoredSession' apps/web/src/lib/trpc.ts
           grep -q 'speakAndWait' apps/web/src/components/MateWelcome.tsx
           grep -q 'data-render-mode="vector2d"' apps/web/src/components/loommate/MateLive2D.tsx
@@ -188,9 +186,9 @@ jobs:
           test -n "$BIN" || { echo "❌ arm64 应用主程序未生成"; exit 1; }
           WORKLOOM_APP_SMOKE=1 WORKLOOM_SUPPORT_DIR=/tmp/wl-app-smoke "$BIN"
           test -f /tmp/wl-app-smoke/.bootstrapped || { echo "❌ 真实应用首启未完成"; exit 1; }
-          WORKLOOM_RENDER_SMOKE=1 WORKLOOM_SUPPORT_DIR=/tmp/wl-render-default "$BIN"
+          node scripts/desktop-render-smoke.mjs "$BIN" /tmp/wl-render-default default
           test -f /tmp/wl-render-default/logs/render-default.json || { echo "❌ 默认渲染探针缺失"; exit 1; }
-          WORKLOOM_RENDER_SMOKE=1 WORKLOOM_SAFE_RENDERING=1 WORKLOOM_SUPPORT_DIR=/tmp/wl-render-safe "$BIN"
+          node scripts/desktop-render-smoke.mjs "$BIN" /tmp/wl-render-safe safe
           test -f /tmp/wl-render-safe/logs/render-safe.json || { echo "❌ 安全渲染探针缺失"; exit 1; }
           echo "✅ 真实 .app 后端 + Live2D + 动态矢量双渲染冒烟通过"
         timeout-minutes: 20
@@ -205,8 +203,16 @@ jobs:
           name: macos-arm64-render-evidence
           if-no-files-found: warn
           path: |
-            /tmp/wl-render-default/logs/render-default.*
-            /tmp/wl-render-safe/logs/render-safe.*
+            /tmp/wl-render-default/logs/first-launch-default.json
+            /tmp/wl-render-default/logs/first-owner-default.json
+            /tmp/wl-render-default/logs/render-default.json
+            /tmp/wl-render-default/logs/render-driver-default.json
+            /tmp/wl-render-default/logs/*-default.png
+            /tmp/wl-render-safe/logs/first-launch-safe.json
+            /tmp/wl-render-safe/logs/first-owner-safe.json
+            /tmp/wl-render-safe/logs/render-safe.json
+            /tmp/wl-render-safe/logs/render-driver-safe.json
+            /tmp/wl-render-safe/logs/*-safe.png
       - name: 装配自包含载荷（darwin-x64）
         run: bash scripts/pack-electron-payload.sh --platform mac --arch x64 --version "$VERSION"
 
@@ -256,6 +262,8 @@ jobs:
           name: desktop-macos-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             /tmp/wl-smoke/logs/*.log
+            /tmp/wl-app-smoke/logs/*
+            /tmp/wl-app-smoke/install-state.json
             /tmp/wl-render-default/logs/*
             /tmp/wl-render-safe/logs/*
           if-no-files-found: warn
@@ -270,8 +278,8 @@ jobs:
           set -euo pipefail
           OUT="$RUNNER_TEMP/desktop-macos"
           mkdir -p "$OUT"
-          ARM_SOURCE="WorkLoom 织元-mac-arm64.dmg"
-          X64_SOURCE="WorkLoom 织元-mac-x64.dmg"
+          ARM_SOURCE="WorkLoom PMtest-mac-arm64.dmg"
+          X64_SOURCE="WorkLoom PMtest-mac-x64.dmg"
           ARM="WorkLoom-mac-arm64.dmg"
           X64="WorkLoom-mac-x64.dmg"
           test "$(find release -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d ' ')" -eq 2
@@ -327,14 +335,11 @@ jobs:
           BUNDLE_SIGNING_KEY_ID: ${{ vars.BUNDLE_SIGNING_KEY_ID || 'workloom-release-v1' }}
         run: |
           test -n "$BUNDLE_SIGNING_PRIVATE_KEY" || { echo "❌ 缺少 BUNDLE_SIGNING_PRIVATE_KEY，拒绝生成生产安装包"; exit 1; }
-          pnpm bundle:release
+          pnpm bundle:release --desktop
           test -s build/bundle-trust.json || { echo "❌ 独立 Bundle 公钥环未生成"; exit 1; }
 
       - name: 生成投影、验证并构建 web（无发行密钥）
         shell: bash
-        env:
-          VITE_DEMO_WORKSPACE: ai-pm-demo
-          VITE_DEMO_MEMBER: MEM-001
         run: |
           pnpm projections:generate
           pnpm product:verify
@@ -402,7 +407,7 @@ jobs:
           fi
           node -e 'const {spawnSync}=require("node:child_process"); const r=spawnSync(process.argv[1],[],{stdio:"inherit",env:{...process.env,WORKLOOM_APP_SMOKE:"1",WORKLOOM_SUPPORT_DIR:process.argv[2]}}); process.exit(r.status ?? 1)' "$EXE" "$APP_SMOKE_ROOT"
           test -f "$APP_SMOKE_ROOT/.bootstrapped" || { echo "❌ 真实应用首启未完成"; exit 1; }
-          node -e 'const {spawnSync}=require("node:child_process"); const r=spawnSync(process.argv[1],[],{stdio:"inherit",env:{...process.env,WORKLOOM_RENDER_SMOKE:"1",WORKLOOM_SUPPORT_DIR:process.argv[2]}}); process.exit(r.status ?? 1)' "$EXE" "$RENDER_SMOKE_ROOT"
+          node scripts/desktop-render-smoke.mjs "$EXE" "$RENDER_SMOKE_ROOT" default
           test -f "$RENDER_SMOKE_ROOT/logs/render-default.json" || { echo "❌ Windows 渲染探针缺失"; exit 1; }
           echo "✅ 真实 Windows 应用后端 + 页面渲染冒烟通过"
         timeout-minutes: 20
@@ -431,7 +436,7 @@ jobs:
           set -euo pipefail
           OUT="$RUNNER_TEMP/desktop-windows"
           mkdir -p "$OUT"
-          SOURCE="WorkLoom 织元-win-x64.exe"
+          SOURCE="WorkLoom PMtest-win-x64.exe"
           TARGET="WorkLoom-win-x64.exe"
           test "$(find release -maxdepth 1 -type f -name '*.exe' | wc -l | tr -d ' ')" -eq 1
           test -f "release/$SOURCE"
@@ -618,9 +623,9 @@ jobs:
             [ "$TARGET_IS_HIGHEST" = "true" ] || { echo "❌ 新桌面版本必须高于所有已公开稳定桌面版"; exit 1; }
             CREATE_STATUS=0
             if [ "$PLATFORM_SIGNING" = "signed" ]; then
-              RELEASE_NOTES="由受保护 desktop-production 环境发布；macOS 双架构与 Windows x64 制品已通过平台签名、公证、自包含载荷、真实首启、渲染冒烟与 sha512/逐字节门禁。"
+              RELEASE_NOTES="由 desktop-production 环境发布。macOS arm64 与 Windows x64 已执行应用首启和渲染冒烟，macOS x64 已执行签名、公证和拆包校验。全部资产均通过 SHA-512 和公开字节回读。"
             else
-              RELEASE_NOTES="由受保护 desktop-production 环境发布；macOS 双架构与 Windows x64 制品已通过自包含载荷、真实首启、渲染冒烟与 sha512/逐字节门禁。因当前没有 Apple Developer ID 与 Windows Authenticode 证书，本版本明确为未签名、未 Apple 公证安装包；macOS 首次打开需按说明解除隔离，Windows 可能显示 SmartScreen 提示。"
+              RELEASE_NOTES="由 desktop-production 环境发布。macOS arm64 与 Windows x64 已执行应用首启和渲染冒烟，macOS x64 已执行拆包校验，全部资产均通过 SHA-512 和公开字节回读。本版本为未签名、未 Apple 公证安装包，Windows 可能显示 SmartScreen 提示。"
             fi
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \

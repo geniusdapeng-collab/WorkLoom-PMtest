@@ -156,6 +156,7 @@ test("Windows package smoke is isolated from the build toolchain and retains all
   assert.match(smoke.run, /SMOKE_ROOT="\$RUNNER_TEMP\/wl-smoke"/u);
   assert.match(smoke.run, /APP_SMOKE_ROOT="\$RUNNER_TEMP\/wl-app-smoke"/u);
   assert.match(smoke.run, /RENDER_SMOKE_ROOT="\$RUNNER_TEMP\/wl-render-default"/u);
+  assert.match(smoke.run, /node scripts\/desktop-render-smoke\.mjs "\$EXE" "\$RENDER_SMOKE_ROOT" default/u);
   assert.doesNotMatch(smoke.run, /\$\{TEMP\}\/wl-/u);
 
   const diagnostics = stepByName("windows", "留存失败诊断（私有 Actions Artifact）");
@@ -163,6 +164,21 @@ test("Windows package smoke is isolated from the build toolchain and retains all
   for (const directory of ["wl-smoke", "wl-app-smoke", "wl-render-default"]) {
     assert.match(evidencePaths, new RegExp(`runner\\.temp \\}\\}/${directory}/logs`, "u"));
     assert.match(evidencePaths, new RegExp(`runner\\.temp \\}\\}/${directory}/install-state\\.json`, "u"));
+  }
+});
+
+test("macOS requires both packaged renderer modes and preserves their receipts", () => {
+  const smoke = stepByName("macos", "拆包验收 + 冒烟（对 .app 内载荷归档跑首启全流程——验证用户拿到的内容）");
+  const evidence = stepByName("macos", "上传渲染验收证据");
+  for (const mode of ["default", "safe"]) {
+    assert.ok(smoke.run.includes(`node scripts/desktop-render-smoke.mjs "$BIN" /tmp/wl-render-${mode} ${mode}`));
+    assert.ok(evidence.with.path.includes(`/tmp/wl-render-${mode}/logs/first-launch-${mode}.json`));
+    assert.ok(evidence.with.path.includes(`/tmp/wl-render-${mode}/logs/first-owner-${mode}.json`));
+    assert.ok(evidence.with.path.includes(`/tmp/wl-render-${mode}/logs/render-driver-${mode}.json`));
+  }
+  for (const platform of ["macos", "windows"]) {
+    const webBuild = stepByName(platform, "生成投影、验证并构建 web（无发行密钥）");
+    assert.doesNotMatch(JSON.stringify(webBuild), /VITE_DEMO_(?:WORKSPACE|MEMBER)/u);
   }
 });
 

@@ -2,13 +2,25 @@
  * Login —— 登录页（PRD §4.1：扫码主通道占位 + 手机验证码 + 邮箱密码 + 注册开通/接受邀请入口）
  * 演示入口（loginAs）仅开发环境展示；生产不出现。
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { Button } from "@workloom/ui";
-import { trpc, setToken, setRefreshToken, ensureDemoLogin, DEV_DEMO_MEMBER, clearGuestFlag } from "../../lib/trpc";
-import { DEMO_WORKSPACE, PRODUCT_NAME } from "../../lib/product";
+import { trpc, getToken, isGuest, setToken, setRefreshToken, ensureDemoLogin, DEV_DEMO_MEMBER, clearGuestFlag } from "../../lib/trpc";
+import { DEMO_WORKSPACE, PRODUCT_NAME, storageKey } from "../../lib/product";
+import DesktopOwnerSetup from "./DesktopOwnerSetup";
 
 type Tab = "code" | "password";
+const WORKSPACE_KEY = storageKey("login-workspace");
+
+function loginDestination(params: URLSearchParams, desktop: boolean): string {
+  const fallback = desktop ? "/development" : "/inbox";
+  const raw = params.get("next") || fallback;
+  const origin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+  const candidate = /^\/(?![/\\])/.test(raw) ? new URL(raw, origin) : null;
+  const url = candidate?.origin === origin && candidate.pathname !== "/login" ? candidate : new URL(fallback, origin);
+  if (params.get("render") === "vector2d") url.searchParams.set("render", "vector2d");
+  return `${url.pathname}${url.search}${url.hash}`;
+}
 
 function safeLoginError(error: unknown, fallback: string): string {
   const message = error instanceof Error ? error.message : "";
@@ -22,9 +34,12 @@ function safeLoginError(error: unknown, fallback: string): string {
 export default function Login() {
   const nav = useNavigate();
   const [params] = useSearchParams();
-  // F-GUEST1：游客进配置引导被拦到这里时，登录成功后送回原目的地
-  const next = params.get("next") || "/inbox";
-  const [tab, setTab] = useState<Tab>("code");
+  const setup = typeof window === "undefined" ? undefined : window.workloomDesktopSetup;
+  const next = loginDestination(params, Boolean(setup));
+  const [setupState, setSetupState] = useState<"loading" | "available" | "login" | "error">(setup ? "loading" : "login");
+  const [setupCheck, setSetupCheck] = useState(0);
+  const [workspaceSlug, setWorkspaceSlug] = useState(() => setup ? localStorage.getItem(WORKSPACE_KEY) ?? "" : DEMO_WORKSPACE);
+  const [tab, setTab] = useState<Tab>(setup ? "password" : "code");
   const [phone, setPhone] = useState("");
   const [code, setCode] = useState("");
   const [devCode, setDevCode] = useState("");
@@ -33,6 +48,25 @@ export default function Login() {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
   const [codeSent, setCodeSent] = useState(false);
+
+  useEffect(() => {
+    if (!setup) return;
+    let cancelled = false;
+    void (async () => {
+      if (getToken() && !isGuest()) {
+        const valid = await trpc.access.me.query().then(() => true, () => false);
+        if (cancelled) return;
+        if (valid) { nav(next, { replace: true }); return; }
+      }
+      try {
+        const status = await setup.status();
+        if (!cancelled) setSetupState("error" in status ? "error" : status.available ? "available" : "login");
+      } catch {
+        if (!cancelled) setSetupState("error");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [nav, next, setup, setupCheck]);
 
   const svc = () => trpc.accounts.auth as unknown as {
     requestCode: { mutate: (i: { channel: "phone"; target: string; purpose: "login" }) => Promise<{ sent: boolean; devCode?: string }> };
@@ -54,8 +88,9 @@ export default function Login() {
     setErr(""); setBusy(true);
     try {
       const r = tab === "code"
-        ? await svc().loginWithCode.mutate({ phone, code, workspaceSlug: DEMO_WORKSPACE })
-        : await svc().loginWithPassword.mutate({ email, password, workspaceSlug: DEMO_WORKSPACE });
+        ? await svc().loginWithCode.mutate({ phone, code, workspaceSlug: workspaceSlug.trim() })
+        : await svc().loginWithPassword.mutate({ email: setup ? email.trim().toLowerCase() : email, password, workspaceSlug: workspaceSlug.trim() });
+      if (setup) localStorage.setItem(WORKSPACE_KEY, workspaceSlug.trim());
       clearGuestFlag(); // 正式身份进场，摘掉游客标记
       setToken(r.accessToken);
       setRefreshToken(r.refreshToken);
@@ -70,25 +105,45 @@ export default function Login() {
     nav(next);
   }
 
+  if (setup && setupState === "available") {
+    return <DesktopOwnerSetup bridge={setup}
+      onUnavailable={() => { setSetupState("login"); setErr("工作区已开通，请输入管理员账号登录。"); }}
+      onCreated={(result) => {
+        localStorage.setItem(WORKSPACE_KEY, result.workspaceSlug);
+        setToken(result.accessToken);
+        setRefreshToken(result.refreshToken);
+        nav(next, { replace: true });
+      }} />;
+  }
+  if (setupState === "loading" || setupState === "error") {
+    return <main className="mx-auto flex min-h-screen w-full max-w-md flex-col justify-center gap-4 px-4 py-10 sm:px-6">
+      {setupState === "loading" ? <p role="status">正在连接本机工作区…</p> : <>
+        <p role="alert">暂时无法读取本机工作区，请重试。</p>
+        <Button variant="primary" onClick={() => { setSetupState("loading"); setSetupCheck((value) => value + 1); }}>重试</Button>
+      </>}
+    </main>;
+  }
+
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-md min-w-0 flex-col justify-center px-4 py-10 sm:px-6">
       {/* 游客浮标会直达本页（F-GUEST1）；登录页也必须给出可见返回出口，不能只靠浏览器后退。 */}
-      <Button className="mb-4 w-fit text-neutral-300 underline" variant="quiet" onClick={() => nav("/")}>← 返回经营首页</Button>
+      {!setup && <Button className="mb-4 w-fit text-neutral-300 underline" variant="quiet" onClick={() => nav("/")}>← 返回经营首页</Button>}
       <h1 className="mb-1 break-words text-2xl font-bold">登录 {PRODUCT_NAME}</h1>
       <p className="mb-6 break-words text-body leading-relaxed text-neutral-300">登录后可查看并切换您有权限访问的工作区。</p>
 
       <div className="mb-4 flex min-w-0 flex-wrap gap-2" role="group" aria-label="登录方式">
         <Button aria-pressed={tab === "code"} variant={tab === "code" ? "primary" : "secondary"} onClick={() => setTab("code")}>手机验证码</Button>
         <Button aria-pressed={tab === "password"} variant={tab === "password" ? "primary" : "secondary"} onClick={() => setTab("password")}>邮箱密码</Button>
-        <Button variant="secondary" disabled title="微信开放平台接入后开放">微信扫码（即将开放）</Button>
+        {!setup && <Button variant="secondary" disabled title="微信开放平台接入后开放">微信扫码（即将开放）</Button>}
       </div>
-
+      <form onSubmit={(event) => { event.preventDefault(); if (!busy) void doLogin(); }}>
+      {setup && <input className={`${inp} mb-3`} aria-label="工作区标识" placeholder="工作区标识" autoComplete="off" maxLength={40} required value={workspaceSlug} onChange={(e) => setWorkspaceSlug(e.target.value)} />}
       {tab === "code" ? (
         <div className="space-y-3">
           <input className={inp} inputMode="tel" autoComplete="tel" aria-label="手机号" placeholder="手机号" value={phone} onChange={(e) => setPhone(e.target.value)} />
           <div className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
             <input className={inp} inputMode="numeric" autoComplete="one-time-code" aria-label="验证码" maxLength={6} placeholder="6 位验证码" value={code} onChange={(e) => setCode(e.target.value)} />
-            <Button variant="primary" disabled={busy || phone.length < 6} onClick={() => void sendCode()}>
+            <Button type="button" variant="primary" disabled={busy || phone.length < 6} onClick={() => void sendCode()}>
               {codeSent ? "重发" : "发送验证码"}
             </Button>
           </div>
@@ -103,14 +158,16 @@ export default function Login() {
 
       {err && <p role="alert" className="mt-3 break-words text-body leading-relaxed text-red-300">{err}</p>}
 
-      <Button className="mt-5 w-full" variant="primary" busy={busy} busyLabel="正在登录…" onClick={() => void doLogin()}>登录</Button>
+      <Button type="submit" className="mt-5 w-full" variant="primary" busy={busy} busyLabel="正在登录…"
+        disabled={Boolean(setup && (!workspaceSlug.trim() || (tab === "code" ? phone.length < 6 || code.length !== 6 : !email.trim() || !password)))}>登录</Button>
+      </form>
 
-      <div className="mt-4 flex min-w-0 flex-wrap justify-between gap-2 text-neutral-300">
+      {!setup && <div className="mt-4 flex min-w-0 flex-wrap justify-between gap-2 text-neutral-300">
         <Button variant="quiet" onClick={() => nav("/activate")}>注册开通</Button>
         <Button variant="quiet" onClick={() => nav("/invite")}>接受成员邀请</Button>
-      </div>
+      </div>}
 
-      {import.meta.env.DEV && (
+      {import.meta.env.DEV && !setup && (
         <Button variant="quiet" className="mt-6 text-neutral-300 underline" onClick={() => void demoEnter()}>
           开发演示：直接进入演示身份（不经过账号）
         </Button>

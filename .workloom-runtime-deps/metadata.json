@@ -32,7 +32,7 @@
     },
     {
       "path": "package.json",
-      "sha256": "8cea1e058543a1ee2bdbe74597de907d5132687bab05bb8ce7d9643fe84fc6dc"
+      "sha256": "0d3b94e8cfd9a2201c7138b5dd269885f0c9949db0973b6b7b4e8543890d2f59"
     },
     {
       "path": "packages/base/package.json",
@@ -72,7 +72,7 @@
     },
     {
       "path": "scripts/payload-policy.mjs",
-      "sha256": "be1035d6c7f1e12f739bbc8e94e97c3aa8a45c2fc38a605537f2eb18916a6118"
+      "sha256": "a5df46fdf94f538d1bc758704b62af4c62bbe0c688b339d17dbb8058299a30c8"
     },
     {
       "path": "scripts/product-runtime.mjs",

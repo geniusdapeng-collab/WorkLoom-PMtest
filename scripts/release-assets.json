@@ -34,10 +34,6 @@
       "sha256": "c78771905c52a8590f6c20cb101bb38ab65bd3046bd6ab8edf4e38efd41dce6f",
       "upstream": "https://github.com/nats-io/nats-server/releases/download/v2.11.4/SHA256SUMS"
     },
-    "embedded-postgres-binaries-windows-amd64-17.2.0.jar": {
-      "sha256": "41a2c287c4ca14691e9af4e6bdd719aca231983fcac8a43d01c99e1bca613859",
-      "upstream": "https://repo1.maven.org/maven2/io/zonky/test/postgres/embedded-postgres-binaries-windows-amd64/17.2.0/embedded-postgres-binaries-windows-amd64-17.2.0.jar.sha256"
-    },
     "postgresql17.17.11.0.nupkg": {
       "sha256": "548a16efbe4db433a42e0dac3d2815035471ecb0c2cc5f362dc603877a8ad4a9",
       "upstream": "https://community.chocolatey.org/api/v2/package/postgresql17/17.11.0"

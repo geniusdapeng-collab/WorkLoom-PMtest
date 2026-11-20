@@ -3,7 +3,7 @@ import {
   createHash, createPrivateKey, createPublicKey, sign as signValue,
   timingSafeEqual, verify as verifyValue,
 } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import YAML from "yaml";
 import {
@@ -19,10 +19,16 @@ import {
 } from "../packages/industry-contract/src/index.ts";
 
 const root = resolve(import.meta.dirname, "..");
-const bundlesRoot = resolve(process.env.BUNDLES_ROOT ?? join(root, "bundles"));
+const sourceBundlesRoot = resolve(process.env.BUNDLES_ROOT ?? join(root, "bundles"));
 const args = new Set(process.argv.slice(2));
 const refreshDigests = args.has("--refresh-digests");
 const releaseMode = args.has("--release");
+const desktopMode = args.has("--desktop");
+const desktopOutput = join(root, "build", "desktop-bundles");
+if (desktopMode && (!refreshDigests || !releaseMode || sourceBundlesRoot === desktopOutput)) {
+  throw new Error("--desktop 必须通过 bundle:release 从独立源目录生成正式桌面行业包");
+}
+const bundlesRoot = desktopMode ? createDesktopProjection(sourceBundlesRoot) : sourceBundlesRoot;
 const readVersion = (path: string): string | null => {
   if (!existsSync(path)) return null;
   try {
@@ -134,6 +140,30 @@ function providedPaths(manifest: BundleManifest): string[] {
     else if (Array.isArray(value)) paths.push(...value);
   }
   return paths;
+}
+
+function createDesktopProjection(sourceRoot: string): string {
+  mkdirSync(dirname(desktopOutput), { recursive: true });
+  const staging = mkdtempSync(join(dirname(desktopOutput), ".desktop-bundles-"));
+  process.once("exit", () => rmSync(staging, { recursive: true, force: true }));
+  for (const entry of readdirSync(sourceRoot, { withFileTypes: true })) {
+    const source = join(sourceRoot, entry.name);
+    if (!entry.isDirectory() || !existsSync(join(source, "bundle.json"))) continue;
+    const manifest = parseBundleManifest(JSON.parse(readFileSync(join(source, "bundle.json"), "utf8")));
+    const seedAssets = new Set(manifest.workloom.provides.seeds);
+    const destination = join(staging, entry.name);
+    cpSync(source, destination, {
+      recursive: true,
+      filter: (file) => {
+        const path = relative(source, file).split(sep);
+        return !path.some((part) => part.toLowerCase() === "seeds") && !seedAssets.has(path.join("/"));
+      },
+    });
+    manifest.workloom.provides.seeds = [];
+    delete manifest.integrity;
+    writeFileSync(join(destination, "bundle.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  }
+  return staging;
 }
 
 function assetDigestsFor(directory: string, manifest: BundleManifest): Record<string, string> {
@@ -467,5 +497,10 @@ if (errors.length) {
   console.error(`❌ 行业包治理门禁失败（${errors.length} 项）`);
   for (const error of errors) console.error(`  · ${error}`);
   process.exit(1);
+}
+if (desktopMode) {
+  if (manifestsByBundleId.size === 0) throw new Error("桌面行业包生成结果为空");
+  rmSync(desktopOutput, { recursive: true, force: true });
+  renameSync(bundlesRoot, desktopOutput);
 }
 console.log(`✅ 行业包契约、兼容范围、资产、导航与完整性门禁通过（base ${baseVersion} / ui ${uiVersion}${releaseMode ? " / 发布验签" : ""}）`);

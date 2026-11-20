@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 import YAML from "yaml";
@@ -122,14 +122,22 @@ test("release writer detector rejects common alternate and newly introduced bypa
   assert.deepEqual(contentsWriteScopes("shadow.yml", unexpectedWriter), ["shadow.yml:<workflow>"]);
 });
 
-test("legacy packers and platform evidence keep read-only repository permissions", () => {
-  for (const name of ["release.yml", "pack-self-contained.yml"]) {
-    const source = readFileSync(new URL(name, workflowsUrl), "utf8");
-    const workflow = YAML.parse(source);
-    assert.deepEqual(workflow.permissions, { contents: "read" });
-    assert.deepEqual(releaseWriteSignals(workflow), []);
-    assert.match(source, /actions\/upload-artifact@[0-9a-f]{40}/u);
+test("desktop packaging exposes only the Electron distribution entry points", () => {
+  const repo = new URL("../", import.meta.url);
+  for (const path of [
+    ".github/workflows/release.yml",
+    ".github/workflows/pack-self-contained.yml",
+    "scripts/pack-macos.sh",
+    "scripts/pack-windows.sh",
+    "apps/desktop/WorkLoom.app/Contents/Info.plist",
+    "apps/desktop/WorkLoom.app/Contents/MacOS/WorkLoom",
+    "apps/desktop/windows/WorkLoom.bat",
+  ]) {
+    assert.equal(existsSync(new URL(path, repo)), false, path);
   }
+});
+
+test("platform evidence keeps read-only repository permissions", () => {
   const safety = readFileSync(new URL("safety-gate.yml", workflowsUrl), "utf8");
   const safetyWorkflow = YAML.parse(safety);
   assert.deepEqual(safetyWorkflow.permissions, { contents: "read" });

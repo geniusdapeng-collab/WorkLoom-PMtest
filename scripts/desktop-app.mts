@@ -352,7 +352,9 @@ async function main() {
 
   // ④ 源码 server 由编排器启动；正式安装包仍由 Electron bootstrap 管理内嵌运行时。
   say(`启动源码 server（:${SERVER_PORT}）…`);
-  run("pnpm", ["-C", "apps/server", DEV ? "dev" : "start"], "server", runtimeEnvironment);
+  run("pnpm", ["-C", "apps/server", DEV ? "dev" : "start"], "server", {
+    ...runtimeEnvironment, WORKLOOM_PM_DSH_PROFILE: "desktop",
+  });
   if (!(await waitHealth(`http://localhost:${SERVER_PORT}/health`, 60))) {
     warn(`server ${SERVER_PORT} 未就绪`); stopAll(1); return;
   }

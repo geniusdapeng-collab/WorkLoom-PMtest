@@ -1,14 +1,14 @@
 # 桌面产品完整性与渲染契约
 
-> 状态：发布门禁级设计；适用于 WorkLoom 基座及全部行业 Bundle。
+> PMtest 桌面发行与渲染验收契约。通用渲染后端沿用 WorkLoom 基座。
 
 ## 1. 产品交付契约
 
 桌面安装包不是网页容器，而是一个完整、离线可启动的 Agent IM 产品。每个正式包必须同时满足：
 
-1. 首次启动进入当前 Bundle 对应的示例工作区，而不是历史缓存中的其他工作区。
-2. 种子数据、岗位编制、技能、首页任务和欢迎话术来自同一个 Bundle 版本。
-3. 首装依次展示：织伴数字人开场、行业能力介绍、团队列队仪式、产品首页。
+1. 首次启动迁移空的本机生产数据库，显示创建工作区表单。已有正式工作区时显示正式登录。
+2. 用户提交表单后，工作区只装配通过验签的岗位、围栏和技能。任务、报告、文档和其它经营记录由后续操作写入。
+3. 正式登录进入开发场域。打开经营首页可体验织伴开场、行业介绍及团队列队。
 4. 数字人必须是持续运动、可眨眼、可做表情和手势、口型跟随语音的完整人物。静态图片不算通过。
 5. 任意时刻只有一条普通语音播放；熔断语音可以明确取消当前语音。页面后台事件不得抢占首装仪式。
 6. 升级保留本机配置和 JWT 密钥，并主动清理已失效的前端会话；不得因升级回到旧内容或黑屏。
@@ -36,7 +36,8 @@
 ## 4. 首装状态机
 
 ```
-bootstrap → session validated → welcome/mate → team/entrance
+bootstrap → workspace setup or member login → development
+operating home → welcome/mate → team/entrance
           → team/dance → team/ribbon → summary modal → product home
 ```
 
@@ -46,8 +47,8 @@ bootstrap → session validated → welcome/mate → team/entrance
 
 每个安装包在上传 Release 前必须在“打包后的可执行文件”上完成：
 
-1. 后端冒烟：解包、数据库初始化、迁移、Bundle 种子、服务健康检查。
-2. 渲染冒烟：真实创建 BrowserWindow，等待 `data-product-ready=true` 和 `data-avatar-ready=true`。
+1. 后端冒烟涵盖解包、数据库初始化、迁移和本机服务健康检查。真实应用通过只读 SQL 核查空库和访问控制，再在原登录界面创建正式工作区。
+2. 渲染冒烟在同一 BrowserWindow 打开经营首页，等待 `data-product-ready=true` 和 `data-avatar-ready=true`。
 3. 双后端冒烟：默认数字人必须得到 `live2d-webgl`；安全模式数字人必须得到 `vector2d`；两者的团队仪式都必须得到独立的动态 `vector2d` 舞台。
 4. 数字人动作检查：模型声明的嘴型/眨眼参数必须真实写入且读取成功；至少完成一次开口、一次完整眨眼和一次已被 MotionManager 接受的手势动作。只检查“canvas 存在”或“人物轻微晃动”不算通过。
 5. 真实状态机检查：验收必须按用户交互依次推进 `enter → intro → system → detail → bridge → exiting → entrance`，禁止用 `setPhase` 等测试钩子直接跳到团队态。
