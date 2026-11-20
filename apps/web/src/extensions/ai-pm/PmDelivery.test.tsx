@@ -59,9 +59,19 @@ describe("产品交付页面的中文边界与原交互", () => {
     await mount();
     expect(button("交给团队执行").disabled).toBe(true);
     expect(host.textContent).toContain("模型待配置"); expect(host.textContent).toContain("还没有任务");
-    expect(host.querySelector('a[href="/onboarding"]')).toBeTruthy();
+    expect(host.textContent).toContain("驱动模型");
+    expect(host.textContent).toContain("尚未配置模型连接");
+    expect(host.querySelector('a[href="/onboarding?step=model"]')?.textContent).toBe("配置模型服务");
     expect(host.querySelector(".wl-textarea")).toBeTruthy(); expect(host.querySelector(".wl-card")).toBeTruthy();
   }, 30_000);
+
+  it("已配置时标明云端 API，保留直接进入模型设置的入口", async () => {
+    await mount();
+    expect(host.querySelector(".pm-model-stat")?.textContent).toContain("API 连接已配置");
+    expect(host.querySelector(".pm-model-stat")?.textContent).not.toContain("内置驱动模型");
+    expect(host.querySelector('.pm-model-stat a[href="/onboarding?step=model"]')).toBeTruthy();
+    expect(button("交给团队执行").disabled).toBe(false);
+  });
 
   it("未知状态、员工和模型均有中文兜底，后端英文错误不泄露", async () => {
     history = [run("unregistered_state")];

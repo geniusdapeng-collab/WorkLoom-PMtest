@@ -87,17 +87,18 @@ function Shell() {
     return () => window.removeEventListener("workloom:welcome", onWelcome);
   }, []);
   // 非产品路由（开发矩阵/落地向导）不带常驻导航；其余全部页面左侧导航常驻
+  const onboarding = pathname === "/onboarding" || pathname === "/onboarding/";
   const bare = pathname === "/dev" || pathname.startsWith("/onboarding") || pathname === "/login"
     || pathname === "/activate" || pathname === "/invite" || pathname === "/assistant";
   const localDesktop = typeof window !== "undefined" && Boolean(window.workloomDesktopSetup);
-  if (localDesktop && !bare && !getToken()) {
+  if (localDesktop && (!bare || onboarding) && !getToken()) {
     return <Navigate to={`/login?next=${encodeURIComponent(`${pathname}${search}${hash}`)}`} replace />;
   }
   return (
     <div data-workloom-client="b-pc" data-wl-theme="dark" className="flex min-h-screen min-w-0 max-w-full overflow-x-clip">
       {/* 无导航壳页面（/dev、/login、/activate、/invite…）必须有明确出口：
           这类页面此前只能靠浏览器后退，客户会“进得去出不来”。 */}
-      {bare && pathname !== "/" && pathname !== "/assistant" && !(localDesktop && pathname === "/login") && (
+      {bare && !onboarding && pathname !== "/" && pathname !== "/assistant" && !(localDesktop && pathname === "/login") && (
         <a
           href="/"
           aria-label="返回经营主页"
@@ -171,7 +172,7 @@ function Shell() {
       <Route path="/invite" element={<InviteAccept />} />
       <Route path="/onboarding" element={
         // F-GUEST1：游客可完整体验系统，进入配置引导（正式开通）才要求登录
-        isGuest() ? <Navigate to="/login?next=/onboarding" replace /> : <Onboarding />
+        isGuest() ? <Navigate to={`/login?next=${encodeURIComponent(`${pathname}${search}${hash}`)}`} replace /> : <Onboarding />
       } />
       <Route path="/dev" element={<UiDiagnosticsRoute />} />
             {INDUSTRY_ROUTE_REGISTRY.routes.map((definition) => (

@@ -63,6 +63,13 @@ function transientDirectories(supportDir) {
   return fs.readdirSync(supportDir).filter((name) => /^\.install-(?:staging|backup)-/.test(name));
 }
 
+function createPmArtifact(sandbox, content) {
+  const artifact = path.join(sandbox, "tenant", "工作区", "run-1", "artifact-objects", "pma-v2-fixture");
+  fs.mkdirSync(path.dirname(artifact), { recursive: true });
+  fs.writeFileSync(artifact, content);
+  return artifact;
+}
+
 describe("桌面载荷原子装配", () => {
   it("源码与安装包启动路径只采用受控本地路由，保留旧产品根路由默认", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "workloom-start-route-"));
@@ -197,6 +204,116 @@ describe("桌面载荷原子装配", () => {
     assert.equal(fs.existsSync(path.join(f.supportDir, ".bootstrapped")), false);
     tx.commit();
     assert.deepEqual(transientDirectories(f.supportDir), []);
+  });
+
+  it("升级先将真实 PM 产物迁出旧 runtime，也保留配置和数据库目录", (t) => {
+    const f = fixture("2.0.0");
+    t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+    const legacy = path.join(f.supportDir, "runtime", "apps", "server", "data", "pm-sandbox");
+    const persistent = path.join(f.supportDir, "pm-sandbox");
+    const payload = Buffer.from([0x00, 0xfe, 0x01, 0xff]);
+    const oldArtifact = createPmArtifact(legacy, payload);
+    const previousEnv = Buffer.from('LLM_MODEL=KEEP\r\nPM_SANDBOX_ROOT="Owner maintained path"\r\n');
+    const pgdata = path.join(f.supportDir, "pgdata");
+    fs.mkdirSync(pgdata);
+    fs.writeFileSync(path.join(pgdata, "PG_VERSION"), "17\n");
+    fs.mkdirSync(persistent); // A previous start may have created an empty destination.
+
+    const tx = installPayloadAtomically({ ...f, payloadVer: "2.0.0", previousEnv });
+    tx.commit();
+    assert.equal(tx.migratedPmSandbox, true);
+    assert.deepEqual(fs.readFileSync(path.join(persistent, path.relative(legacy, oldArtifact))), payload);
+    assert.deepEqual(fs.readFileSync(path.join(f.supportDir, "runtime", ".env")), previousEnv);
+    assert.equal(fs.readFileSync(path.join(pgdata, "PG_VERSION"), "utf8"), "17\n");
+    assert.ok(!fs.existsSync(legacy));
+    assert.deepEqual(transientDirectories(f.supportDir), []);
+  });
+
+  it("实际启动路径换入或验证失败时把产物还给旧运行时，中断后也可重试", async (t) => {
+    const f = fixture("2.0.0");
+    t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+    const legacy = path.join(f.supportDir, "runtime", "apps", "server", "data", "pm-sandbox");
+    const persistent = path.join(f.supportDir, "pm-sandbox");
+    const oldArtifact = createPmArtifact(legacy, "existing PM artifact");
+    const settings = { resourcesDir: f.sourceRoot, supportDir: f.supportDir, smoke: true };
+    await assert.rejects(bootstrap({ ...settings, failAt: "after-stage" }), /安装故障注入：after-stage/u);
+    assert.ok(fs.existsSync(oldArtifact));
+    assert.ok(!fs.existsSync(persistent));
+
+    await assert.rejects(bootstrap({ ...settings, failAt: "after-first-swap" }), /安装故障注入：after-first-swap/u);
+    const relocated = path.join(persistent, path.relative(legacy, oldArtifact));
+    assert.equal(fs.readFileSync(oldArtifact, "utf8"), "existing PM artifact");
+    assert.ok(!fs.existsSync(persistent));
+    assert.equal(fs.readFileSync(path.join(f.supportDir, "VERSION"), "utf8"), "1.0.0\n");
+    assert.ok(!fs.existsSync(path.join(f.supportDir, ".bootstrap-lock")));
+
+    await assert.rejects(bootstrap(settings), /Node 运行时缺失/u);
+    assert.equal(fs.readFileSync(oldArtifact, "utf8"), "existing PM artifact");
+    assert.ok(!fs.existsSync(persistent));
+    // Simulate a process that died immediately after the atomic relocation, before runtime exchange.
+    fs.renameSync(legacy, persistent);
+    const tx = installPayloadAtomically({ ...f, payloadVer: "2.0.0", previousEnv: Buffer.from("JWT_SECRET=keep-me\n") });
+    tx.commit();
+    assert.equal(tx.migratedPmSandbox, false);
+    assert.equal(fs.readFileSync(relocated, "utf8"), "existing PM artifact");
+    assert.equal(fs.readFileSync(path.join(f.supportDir, "runtime", ".env"), "utf8"), "JWT_SECRET=keep-me\n");
+  });
+
+  it("自定义产物目录仍在会被替换的运行时内时保留原配置并停止升级", async (t) => {
+    const f = fixture("2.0.0");
+    t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+    const envFile = path.join(f.supportDir, "runtime", ".env");
+    const contents = 'PM_SANDBOX_ROOT="data/用户 指定目录"\nLLM_MODEL=keep-selection\n';
+    fs.writeFileSync(envFile, contents);
+    const artifact = createPmArtifact(path.join(f.supportDir, "runtime", "apps", "server", "data", "用户 指定目录"), "custom evidence");
+    await assert.rejects(bootstrap({ resourcesDir: f.sourceRoot, supportDir: f.supportDir, smoke: true }), /自定义 PM_SANDBOX_ROOT/u);
+    assert.equal(fs.readFileSync(artifact, "utf8"), "custom evidence");
+    assert.equal(fs.readFileSync(envFile, "utf8"), contents);
+    assert.equal(fs.readFileSync(path.join(f.supportDir, "VERSION"), "utf8"), "1.0.0\n");
+  });
+
+  it("旧目录与持久目录都有内容时两份原件都保留，并停止升级", async (t) => {
+    const f = fixture("2.0.0");
+    t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+    const legacy = createPmArtifact(path.join(f.supportDir, "runtime", "apps", "server", "data", "pm-sandbox"), "legacy bytes");
+    const persistent = createPmArtifact(path.join(f.supportDir, "pm-sandbox"), "persistent bytes");
+    await assert.rejects(bootstrap({ resourcesDir: f.sourceRoot, supportDir: f.supportDir, smoke: true }), /保留两份数据/u);
+    assert.equal(fs.readFileSync(legacy, "utf8"), "legacy bytes");
+    assert.equal(fs.readFileSync(persistent, "utf8"), "persistent bytes");
+    assert.equal(fs.readFileSync(path.join(f.supportDir, "runtime", ".env"), "utf8"), "JWT_SECRET=keep-me\n");
+    assert.deepEqual(transientDirectories(f.supportDir), []);
+  });
+
+  it("升级锁未释放时不迁移动作，不跟随产物目录的联接或符号链接", async (t) => {
+    const f = fixture("2.0.0");
+    t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+    const directory = path.join(f.supportDir, "runtime", "apps", "server", "data");
+    const legacy = path.join(directory, "pm-sandbox");
+    const external = path.join(f.root, "separate-artifacts");
+    const externalArtifact = createPmArtifact(external, "external bytes");
+    fs.mkdirSync(directory, { recursive: true });
+    fs.symlinkSync(external, legacy, process.platform === "win32" ? "junction" : "dir");
+    const options = { resourcesDir: f.sourceRoot, supportDir: f.supportDir, smoke: true };
+    const lock = acquireBootstrapLock(f.supportDir);
+    try { await assert.rejects(bootstrap(options), /WorkLoom 已在启动或运行/u); }
+    finally { lock.release(); }
+    await assert.rejects(bootstrap(options), /不是普通目录/u);
+    assert.equal(fs.readFileSync(externalArtifact, "utf8"), "external bytes");
+    assert.ok(fs.lstatSync(legacy).isSymbolicLink());
+    assert.ok(!fs.existsSync(path.join(f.supportDir, "pm-sandbox")));
+  });
+
+  it("旧配置不可读取时不替换运行时或移动已有产物", async (t) => {
+    const f = fixture("2.0.0");
+    t.after(() => fs.rmSync(f.root, { recursive: true, force: true }));
+    const envFile = path.join(f.supportDir, "runtime", ".env");
+    const artifact = createPmArtifact(path.join(f.supportDir, "runtime", "apps", "server", "data", "pm-sandbox"), "Keep this file");
+    fs.unlinkSync(envFile);
+    fs.mkdirSync(envFile);
+    await assert.rejects(bootstrap({ resourcesDir: f.sourceRoot, supportDir: f.supportDir, smoke: true }), /无法保留本机配置/u);
+    assert.equal(fs.readFileSync(artifact, "utf8"), "Keep this file");
+    assert.equal(fs.readFileSync(path.join(f.supportDir, "VERSION"), "utf8"), "1.0.0\n");
+    assert.ok(fs.statSync(envFile).isDirectory());
   });
 
   it("提交清理故障发生在不可逆边界之后，不会重新开放旧载荷回滚", () => {
@@ -355,6 +472,8 @@ describe("桌面 PostgreSQL 实例归属与端口契约", () => {
 
   it("托管环境只重写数据库与服务端口，保留其他用户配置", () => {
     const scheme = "postgres://";
+    const supportDir = path.join("WorkLoom 用户", "用户 资料");
+    const externalSandbox = path.resolve("WorkLoom 用户", "Owner maintained path").replaceAll("\\", "/");
     const original = [
       `DATABASE_URL=${scheme}postgres:test-only@localhost:5432/workloom`,
       "APP_DB_PASSWORD=test-only",
@@ -364,17 +483,28 @@ describe("桌面 PostgreSQL 实例归属与端口契约", () => {
       "SERVER_PORT=8787",
       "WEB_PORT=5173",
       "LLM_MODEL=keep-user-choice",
+      `PM_SANDBOX_ROOT="${externalSandbox}"`,
       "",
     ].join("\n");
-    const result = buildDesktopEnvironment(original, {
+    const options = {
+      supportDir,
       pgPort: 55432,
       serverPort: 18787,
       webPort: 15173,
       adminPassword: "test-only",
       appPassword: "test-only",
       gatewayPassword: "test-only",
-    });
+    };
+    const result = buildDesktopEnvironment(original, options);
     assert.match(result.text, /^LLM_MODEL=keep-user-choice$/mu);
+    assert.ok(result.text.includes(`PM_SANDBOX_ROOT="${externalSandbox}"\n`));
+    assert.equal(result.values.WORKLOOM_SUPPORT_DIR, path.resolve(supportDir));
+    assert.equal(result.values.PM_SANDBOX_ROOT, undefined);
+    assert.doesNotMatch(result.text, /^WORKLOOM_SUPPORT_DIR=/mu);
+    const explicitLegacyPath = 'PM_SANDBOX_ROOT="data/pm-sandbox"\n';
+    const legacy = buildDesktopEnvironment(explicitLegacyPath, options);
+    assert.equal(legacy.values.PM_SANDBOX_ROOT, path.resolve(supportDir, "pm-sandbox"));
+    assert.ok(legacy.text.includes(explicitLegacyPath));
     assert.match(result.text, /^SERVER_PORT=18787$/mu);
     assert.match(result.text, /^WEB_PORT=15173$/mu);
     for (const key of ["DATABASE_URL", "DATABASE_APP_URL", "DATABASE_GATEWAY_URL"]) {
