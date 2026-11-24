@@ -1,3 +1,23 @@
+# WorkLoom PMtest · PM 研发链路验证
+
+WorkLoom PMtest 是独立的产品经理团队集成与验证项目。它保留 WorkLoom 的开发场域和操作方式，用于核对研发岗位接入 DeepSeek Harness Desktop profile 后，能否把会话、工具调用和文件产物统一回读到工作台。
+
+[English](README_EN.md) · [桌面接入与验收](docs/DSH-CLIENT-MIGRATION.md) · [交付架构](docs/PM-DELIVERY.md) · [评测记录](docs/PM-EVALUATION.md)
+
+## 在这里验证什么
+
+| 环节 | 可以核对的内容 |
+| --- | --- |
+| 目标与计划 | 产品总监如何把目标拆成有依赖的岗位任务，如何记录验收条件 |
+| 桌面研发执行 | 研发岗位如何使用 Desktop profile 和限定工具完成任务文件 |
+| 结果回读 | WorkLoom 工作台如何展示会话、模型用量、产物和确定性检查 |
+| 产品隔离 | PMtest 的独立应用身份、独立工作区配置以及客户端交付边界 |
+
+本地产品的主要入口是桌面工作台的 **开发场域**（`/development`）。源码配置和浏览器开发入口见下方。想核对桌面迁移细节，可先读 [DeepSeek Harness 桌面集成说明](docs/DSH-CLIENT-MIGRATION.md)。想核对任务是否真的完成，可以查看[评测记录](docs/PM-EVALUATION.md)中对应的运行、模型、产物和检查结果。
+
+<details>
+<summary>完整启动、技术说明与原有文档</summary>
+
 <div align="center">
 
 # WorkLoom PMtest
@@ -252,3 +272,6 @@ pnpm runtime:deps:verify
 ## 许可与来源
 
 本仓遵循 [Apache-2.0](LICENSE)。DeepSeek Harness、dsh-im 等 vendored 项目保留各自许可和来源。感谢 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)、[pgvector](https://github.com/pgvector/pgvector) 及 WorkLoom IM 的原始工程基础。
+
+
+</details>

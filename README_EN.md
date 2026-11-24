@@ -1,3 +1,23 @@
+# WorkLoom PMtest · PM workflow integration and validation
+
+WorkLoom PMtest is an independent product for validating the PM team workflow and its desktop integration. Development roles use the DeepSeek Harness Desktop profile. WorkLoom's existing workspace shows the resulting sessions, tool calls, model usage, and artifacts.
+
+[简体中文](README.md) · [Desktop integration](docs/DSH-CLIENT-MIGRATION.md) · [Delivery architecture](docs/PM-DELIVERY.md) · [Evaluation results](docs/PM-EVALUATION.md)
+
+## What to inspect
+
+| Stage | Evidence in the workspace |
+| --- | --- |
+| Planning | Role assignments, task dependencies, and acceptance criteria |
+| Desktop execution | Sessions and restricted tool calls for development tasks |
+| Delivery | Files, artifact hashes, model usage, and check results |
+| Product isolation | PMtest's own application identity and local workspace configuration |
+
+The main desktop view is the **Development Workspace** at `/development`. Expand the instructions below for source setup, development entry points, and verification commands.
+
+<details>
+<summary>Detailed setup, technical notes, and original documentation</summary>
+
 <div align="center">
 
 # WorkLoom PMtest
@@ -230,3 +250,6 @@ The generated capability block in the Chinese README is an inherited source-entr
 ## License and acknowledgements
 
 [Apache-2.0](LICENSE). Vendored projects retain their own licenses and attribution. Thanks to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), [pgvector](https://github.com/pgvector/pgvector), and the original WorkLoom IM engineering foundation.
+
+
+</details>
