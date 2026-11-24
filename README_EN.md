@@ -2,7 +2,7 @@
 
 # WorkLoom PMtest
 
-**An AI product manager leads an AI development team from a goal to an executable task graph, real artifacts, independent verification, and traceable delivery receipts.**
+**Assign development work in a desktop workspace. An AI product manager coordinates the team, and you can inspect the resulting files, checks, and delivery receipts.**
 
 You supply the goal and boundaries. The product manager coordinates requirements, implementation, quality, and delivery. The system reports not only what it did, but also who did it, which material was consumed, which files were produced, which checks ran, and what remains unverified.
 
@@ -207,9 +207,9 @@ Run the 218-case cross-role suite with `pnpm pm:deepseek:218`. It spans 14 role 
 
 Arbitrary internet-scale projects, unapproved production releases, cross-company data aggregation, financial actions, and customer outbound communication are outside the default autonomous scope. A paid model connection does not activate every external connector. Installers still require payload, signing, notarization, and release gates; running from source cannot establish those results.
 
-## Repository and provenance
+## Repository map
 
-This repository is a complete copy of [WorkLoom IM](https://github.com/geniusdapeng-collab/workloom-im), imported from `e5d76398484cac7d8ac50b6c27905765a59fd50f`. Server, three clients, desktop, migrations, every Bundle and skill, vendor code, scripts, tests, and historical documents remain present. PM team delivery is the product focus; the inherited `hotel` and `platform` assets also remain in the tree.
+PM team delivery is the default workflow. The repository map shows how the clients, server, migrations, and industry bundles support that work. The hotel and platform bundles live in their own directories.
 
 | Path | Responsibility |
 |---|---|
